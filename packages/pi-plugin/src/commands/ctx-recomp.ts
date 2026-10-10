@@ -23,6 +23,11 @@ import {
 	signalPiDeferredMaterialization,
 } from "../context-handler";
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	piRawOrdinalOffsetSource,
+	resolvePiOrdinalAlignmentForContext,
+} from "../pi-ordinal-alignment";
 import { createPiHistorianClient } from "../pi-recomp-client-shared";
 import { stagePiRecompMarker } from "../pi-recomp-marker";
 import { isPiRecompInFlight, spawnPiRecompRun } from "../pi-recomp-runner";
@@ -165,6 +170,22 @@ export function registerCtxRecompCommand(
 			}
 
 			confirmationBySession.delete(sessionId);
+			// A partial recomp addresses stored ordinals; refuse it while they
+			// cannot be placed on this branch. A full recomp rebuilds every
+			// compartment from the branch it reads, so it may still run.
+			if (
+				parsed.kind === "partial" &&
+				isPiOrdinalAlignmentUnanchored(
+					resolvePiOrdinalAlignmentForContext(currentDeps.db, sessionId, ctx),
+				)
+			) {
+				sendStatus({
+					title: "/ctx-recomp",
+					text: "## Magic Recomp\n\nThis session's history numbering can't be verified right now, so a partial recomp can't place its range. A full `/ctx-recomp` rebuilds the history from the current branch.",
+					level: "warning",
+				});
+				return;
+			}
 			sendStatus({
 				title: "/ctx-recomp",
 				text:
@@ -178,7 +199,10 @@ export function registerCtxRecompCommand(
 			const fallbackModelId = ctx.model
 				? `${ctx.model.provider}/${ctx.model.id}`
 				: undefined;
-			const snapshot = readPiSessionSnapshot(ctx);
+			const snapshot = readPiSessionSnapshot(
+				ctx,
+				piRawOrdinalOffsetSource(currentDeps.db, sessionId),
+			);
 			const provider = {
 				readMessages: () => snapshot.rawMessages,
 			} satisfies RawMessageProvider;

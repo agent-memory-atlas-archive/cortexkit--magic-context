@@ -41,6 +41,11 @@ import {
 import { ensureProjectRegisteredFromPiDirectory } from "../embedding-bootstrap";
 import { resolvePiUsableContextLimit } from "../pi-context-limit";
 import { runPiHistorian } from "../pi-historian-runner";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	piRawOrdinalOffsetSource,
+	resolvePiOrdinalAlignmentForContext,
+} from "../pi-ordinal-alignment";
 import { isPiRecompInFlight } from "../pi-recomp-runner";
 import {
 	readPiSessionMessagePage,
@@ -212,13 +217,29 @@ export async function runPiWrapup(
 		return "## Magic Wrapup — Skipped\n\nA recomp or upgrade is already running for this session. Wait for it to finish, then try `/ctx-wrapup` again.";
 	}
 
+	const ordinalAlignment = resolvePiOrdinalAlignmentForContext(
+		deps.db,
+		sessionId,
+		ctx,
+	);
+	if (isPiOrdinalAlignmentUnanchored(ordinalAlignment)) {
+		return `## Magic Wrapup — Skipped\n\nThe stored history boundaries no longer match this session branch (${ordinalAlignment.detail}), so a wrapup cannot place new summaries safely.`;
+	}
+	const offsetSource = piRawOrdinalOffsetSource(deps.db, sessionId);
 	const provider = {
-		readMessages: () => readPiSessionMessages(ctx),
+		readMessages: () => readPiSessionMessages(ctx, offsetSource),
 		readMessagePage: (
 			afterOrdinal: number,
 			limit: number,
 			finalWatermark: number,
-		) => readPiSessionMessagePage(ctx, afterOrdinal, limit, finalWatermark),
+		) =>
+			readPiSessionMessagePage(
+				ctx,
+				afterOrdinal,
+				limit,
+				finalWatermark,
+				offsetSource,
+			),
 	};
 	const unregister = setRawMessageProvider(sessionId, provider);
 	let holderId = "";

@@ -6,6 +6,10 @@ import type { PendingPiCompactionMarker } from "@magic-context/core/features/mag
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
 
 export type PiMarkerUpdateOutcome =
 	| { kind: "applied"; firstKeptEntryId: string; compactionId: string }
@@ -69,9 +73,26 @@ export function applyDeferredPiCompactionMarker(
 		}
 
 		const branchEntries = deps.readBranchEntries();
-		const firstKeptEntryId =
-			pending.firstKeptEntryId ??
-			findFirstKeptEntryId(branchEntries, pending.ordinal);
+		let firstKeptEntryId: string | null | undefined = pending.firstKeptEntryId;
+		if (!firstKeptEntryId) {
+			// The pending ordinal is a stored coordinate. Place it on this branch
+			// the same way every raw reader does, and keep the marker waiting while
+			// the stored coordinates cannot be placed at all: trimming the branch
+			// at a guessed position could hide content no summary covers.
+			const alignment = resolvePiOrdinalAlignment(
+				deps.db,
+				sessionId,
+				branchEntries,
+			);
+			if (isPiOrdinalAlignmentUnanchored(alignment)) {
+				return { kind: "waiting-for-entry" };
+			}
+			firstKeptEntryId = findFirstKeptEntryId(
+				branchEntries,
+				pending.ordinal,
+				alignment.offset,
+			);
+		}
 		if (!firstKeptEntryId) {
 			sessionLog(
 				sessionId,

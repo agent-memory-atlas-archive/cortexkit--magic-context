@@ -154,6 +154,10 @@ import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transa
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
 import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
+import {
 	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
 } from "./read-session-pi";
@@ -1327,10 +1331,17 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			let firstKeptEntryId: string | null = null;
 			if (readBranchEntries) {
 				try {
-					firstKeptEntryId = findFirstKeptEntryId(
-						readBranchEntries(),
-						lastNewEnd,
+					const branchEntries = readBranchEntries();
+					const alignment = resolvePiOrdinalAlignment(
+						db,
+						sessionId,
+						branchEntries,
 					);
+					// Leave the marker unresolved (pending) while stored ordinals
+					// cannot be placed on the branch; a later drain resolves it.
+					firstKeptEntryId = isPiOrdinalAlignmentUnanchored(alignment)
+						? null
+						: findFirstKeptEntryId(branchEntries, lastNewEnd, alignment.offset);
 					if (!firstKeptEntryId) {
 						sessionLog(
 							sessionId,
@@ -1889,10 +1900,15 @@ export function buildPiCompactionSummary(
  * that content; leave the marker pending until a safe boundary is available.
  * System slots keep their ordinals but cannot anchor the kept conversation tail;
  * Pi's compaction snapshot preserves their effective state instead.
+ *
+ * `ordinalOffset` places the stored ordinal on this branch when the walk no
+ * longer starts where the stored coordinates were written (see
+ * pi-ordinal-alignment.ts).
  */
 export function findFirstKeptEntryId(
 	entries: readonly unknown[],
 	lastCompactedOrdinal: number,
+	ordinalOffset = 0,
 ): string | null {
 	const target = lastCompactedOrdinal + 1;
 	const afterOrdinal = Number.isNaN(lastCompactedOrdinal)
@@ -1903,6 +1919,7 @@ export function findFirstKeptEntryId(
 		afterOrdinal,
 		Number.MAX_SAFE_INTEGER,
 		Number.MAX_SAFE_INTEGER,
+		ordinalOffset,
 	)) {
 		if (message.ordinal < target || isPiSystemEntry(message)) continue;
 		if (message.id.startsWith(SYNTH_USER_ID_PREFIX)) return null;

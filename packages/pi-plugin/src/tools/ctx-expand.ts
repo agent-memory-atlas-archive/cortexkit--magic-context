@@ -37,6 +37,11 @@ import {
 } from "@magic-context/core/tools/ctx-expand/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	piRawOrdinalOffsetSource,
+	resolvePiOrdinalAlignmentForContext,
+} from "../pi-ordinal-alignment";
 import { readPiSessionMessages } from "../read-session-pi";
 
 const ParamsSchema = Type.Object(
@@ -131,7 +136,11 @@ export function createCtxExpandTool(
 			const unregister = hasRawMessageProvider(sessionId)
 				? () => {}
 				: setRawMessageProvider(sessionId, {
-						readMessages: () => readPiSessionMessages(ctx),
+						readMessages: () =>
+							readPiSessionMessages(
+								ctx,
+								piRawOrdinalOffsetSource(deps.db, sessionId),
+							),
 					});
 
 			try {
@@ -139,13 +148,38 @@ export function createCtxExpandTool(
 				if (mode.kind === "error") {
 					return err(mode.message);
 				}
+				// Tags resolve through message ids, not stored ordinals, so they
+				// expand whatever the alignment below says.
 				if (mode.kind === "tag") {
 					return ok(renderItemByTag(deps.db, sessionId, mode.tag, "text"));
 				}
+				// Message and range ordinals are stored coordinates. When they cannot
+				// be placed on this branch, any branch message shown under them
+				// would be a different message, so expansion is refused.
+				const alignment = resolvePiOrdinalAlignmentForContext(
+					deps.db,
+					sessionId,
+					ctx,
+				);
+				if (isPiOrdinalAlignmentUnanchored(alignment)) {
+					return err(
+						"This session's history numbering can't be verified right now, so message ordinals can't be expanded. Tags (ctx_expand tag=N) still work.",
+					);
+				}
+				// Ordinals 1..offset belong to messages the session's branch no
+				// longer reaches; say so instead of rendering their empty slots.
+				const lostThrough = alignment.offset;
+				const firstAvailable = lostThrough + 1;
 				if (mode.kind === "message") {
+					if (mode.message <= lostThrough) {
+						return ok(
+							`No message at ordinal ${mode.message}: it is no longer in this session's history, which now starts at message ${firstAvailable}.`,
+						);
+					}
 					return ok(renderMessageByOrdinal(sessionId, mode.message));
 				}
-				const { start, end, verbose } = mode;
+				const { end, verbose } = mode;
+				const requestedStart = mode.start;
 
 				// Clamp to the last compartment boundary (parity with OpenCode +
 				// ctx_search): messages after it are the live tail already visible
@@ -155,13 +189,23 @@ export function createCtxExpandTool(
 					deps.db,
 					sessionId,
 				);
-				if (lastCompartmentEnd >= 0 && start > lastCompartmentEnd) {
+				if (lastCompartmentEnd >= 0 && requestedStart > lastCompartmentEnd) {
 					return ok(
-						`Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`,
+						`Range ${requestedStart}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`,
 					);
 				}
 				const effectiveEnd =
 					lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
+				if (effectiveEnd <= lostThrough) {
+					return ok(
+						`No messages found in range ${requestedStart}-${effectiveEnd}: those messages are no longer in this session's history, which now starts at message ${firstAvailable}.`,
+					);
+				}
+				const start = Math.max(requestedStart, firstAvailable);
+				const lostNote =
+					start > requestedStart
+						? `Messages ${requestedStart}-${lostThrough} are no longer in this session's history; showing from ${start}.\n\n`
+						: "";
 
 				// Verbose mode: each message separate, with ids + per-part previews.
 				if (verbose) {
@@ -178,7 +222,7 @@ export function createCtxExpandTool(
 						);
 					}
 					const out = [
-						`Messages ${start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
+						`${lostNote}Messages ${start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
 						"",
 						v.text,
 					];
@@ -207,7 +251,7 @@ export function createCtxExpandTool(
 
 				const lines: string[] = [];
 				lines.push(
-					`Messages ${chunk.startIndex}-${chunk.endIndex} (${chunk.messageCount} messages, ~${chunk.tokenEstimate} tokens):`,
+					`${lostNote}Messages ${chunk.startIndex}-${chunk.endIndex} (${chunk.messageCount} messages, ~${chunk.tokenEstimate} tokens):`,
 				);
 				lines.push("");
 				lines.push(chunk.text);

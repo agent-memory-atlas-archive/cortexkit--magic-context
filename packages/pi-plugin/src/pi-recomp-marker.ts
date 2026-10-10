@@ -10,6 +10,29 @@ import {
 	buildPiCompactionSummary,
 	findFirstKeptEntryId,
 } from "./pi-historian-runner";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
+
+/**
+ * The first kept entry after stored ordinal `lastCompactedOrdinal`, or null
+ * (stage nothing) while the stored ordinals cannot be placed on this branch.
+ */
+function placeFirstKeptEntryId(
+	db: ContextDatabase,
+	sessionId: string,
+	branchEntries: readonly unknown[],
+	lastCompactedOrdinal: number,
+): string | null {
+	const alignment = resolvePiOrdinalAlignment(db, sessionId, branchEntries);
+	if (isPiOrdinalAlignmentUnanchored(alignment)) return null;
+	return findFirstKeptEntryId(
+		branchEntries,
+		lastCompactedOrdinal,
+		alignment.offset,
+	);
+}
 
 /**
  * Advance the Pi native compaction marker to the latest compartment boundary
@@ -51,7 +74,9 @@ export function stagePiRecompMarker(args: {
 
 	let firstKeptEntryId: string | null = null;
 	try {
-		firstKeptEntryId = findFirstKeptEntryId(
+		firstKeptEntryId = placeFirstKeptEntryId(
+			args.db,
+			args.sessionId,
 			args.branchEntries,
 			last.endMessage,
 		);
@@ -98,7 +123,9 @@ export function queueAndApplyPiRecompMarker(args: {
 
 	let firstKeptEntryId: string | null = null;
 	try {
-		firstKeptEntryId = findFirstKeptEntryId(
+		firstKeptEntryId = placeFirstKeptEntryId(
+			args.db,
+			args.sessionId,
 			readBranchEntries(),
 			last.endMessage,
 		);
