@@ -1,6 +1,10 @@
 import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import {
+    type Database,
+    getTagIdentityWriteGeneration,
+    type Statement as PreparedStatement,
+} from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
 import { removePendingOp } from "./storage-ops";
@@ -705,29 +709,164 @@ export function getAllStatusTagTokenTotalsFlat(
 /** Only message tags prove ownership of their own assistant's reasoning group.
  * Tool tags describe the preceding thought, not their tool owner, and parallel
  * tools repeat that estimate. Repeated text tags likewise charge the group once.
+ *
+ * The returned map belongs to the session's cache: read it, never change it.
+ * It stays valid until the next read of this session, which may extend it.
  */
 export function getReasoningTokenEstimatesByMessage(
     db: Database,
     sessionId: string,
     proseRatio: number,
-): Map<string, number> {
-    const rows = db
-        .prepare(
-            `SELECT type, message_id, tool_owner_message_id, reasoning_token_count FROM tags WHERE session_id = ? AND reasoning_token_count IS NOT NULL`,
-        )
-        .all(sessionId) as Array<{
-        type: string;
-        message_id: string;
-        tool_owner_message_id: string | null;
-        reasoning_token_count: number;
-    }>;
-    const totals = new Map<string, number>();
-    for (const row of rows) {
-        if (row.type !== "message") continue;
-        const id = ownerMessageIdForTagRow(row);
-        totals.set(id, Math.max(totals.get(id) ?? 0, row.reasoning_token_count * proseRatio));
+): ReadonlyMap<string, number> {
+    const summary = readTagOwnerSummary(db, sessionId, proseRatio);
+    return summary.reasoningEstimatesByRatio.get(proseRatio) ?? new Map();
+}
+
+/**
+ * Highest tag number per owning message, as the reasoning budget projection
+ * groups tags: a tool tag belongs to its tool owner message (and is skipped
+ * without one), any other tag to the message its content id names.
+ *
+ * The returned map belongs to the session's cache: read it, never change it.
+ * It stays valid until the next read of this session, which may extend it.
+ */
+export function getMaxTagNumberByOwnerMessage(
+    db: Database,
+    sessionId: string,
+): ReadonlyMap<string, number> {
+    return readTagOwnerSummary(db, sessionId).maxTagByOwner;
+}
+
+interface TagOwnerRow {
+    id: number;
+    type: string | null;
+    message_id: string | null;
+    tool_owner_message_id: string | null;
+    tag_number: number;
+    reasoning_token_count: number | null;
+}
+
+/**
+ * Per-session digest of the `tags` columns the reasoning budget reads. A
+ * transform pass used to read every tag of the session for it, twice; this is
+ * kept per connection and extended with the rows appended since the last read.
+ *
+ * It is rebuilt from scratch when anything but an append may have happened:
+ * another connection committed (`data_version` moved), or a statement that can
+ * change or delete an existing tag ran in this process (the generation from
+ * `getTagIdentityWriteGeneration` moved). A prose ratio it has not folded yet
+ * also rebuilds it. Inside an open transaction it is neither used nor stored,
+ * since uncommitted rows can still roll back.
+ */
+interface TagOwnerSummary {
+    dataVersion: number;
+    generation: number;
+    lastRowId: number;
+    maxTagByOwner: Map<string, number>;
+    /** Reasoning estimates per prose ratio, folded exactly as a full read would. */
+    reasoningEstimatesByRatio: Map<number, Map<string, number>>;
+}
+
+const tagOwnerSummaries = new WeakMap<Database, Map<string, TagOwnerSummary>>();
+/** Calibration moves the prose ratio rarely; keep the few most recent. */
+const MAX_CACHED_PROSE_RATIOS = 4;
+let tagOwnerRowsRead = 0;
+
+/** @internal Tag rows the owner summary has read since the last reset. */
+export function getTagOwnerRowsReadForTest(): number {
+    return tagOwnerRowsRead;
+}
+
+/** @internal */
+export function resetTagOwnerRowsReadForTest(): void {
+    tagOwnerRowsRead = 0;
+}
+
+function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow): void {
+    summary.lastRowId = Math.max(summary.lastRowId, row.id);
+    const owner =
+        row.type === "tool"
+            ? typeof row.tool_owner_message_id === "string"
+                ? row.tool_owner_message_id
+                : null
+            : typeof row.message_id === "string"
+              ? contentTagOwnerMessageId(row.message_id)
+              : null;
+    if (owner) {
+        summary.maxTagByOwner.set(
+            owner,
+            Math.max(summary.maxTagByOwner.get(owner) ?? 0, row.tag_number),
+        );
     }
-    return totals;
+    if (row.type !== "message" || row.reasoning_token_count === null) return;
+    const reasoningOwner = ownerMessageIdForTagRow({
+        type: row.type,
+        message_id: row.message_id as string,
+        tool_owner_message_id: row.tool_owner_message_id,
+    });
+    for (const [ratio, estimates] of summary.reasoningEstimatesByRatio) {
+        estimates.set(
+            reasoningOwner,
+            Math.max(estimates.get(reasoningOwner) ?? 0, row.reasoning_token_count * ratio),
+        );
+    }
+}
+
+const TAG_OWNER_COLUMNS =
+    "id, type, message_id, tool_owner_message_id, tag_number, reasoning_token_count";
+
+function readTagOwnerSummary(
+    db: Database,
+    sessionId: string,
+    proseRatio?: number,
+): TagOwnerSummary {
+    const state = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
+    const inTransaction = state.inTransaction === true || state.isTransaction === true;
+    const dataVersion = inTransaction
+        ? -1
+        : ((db.prepare("PRAGMA data_version").get() as { data_version?: number } | null)
+              ?.data_version ?? -1);
+    const generation = getTagIdentityWriteGeneration();
+    const sessions = tagOwnerSummaries.get(db) ?? new Map<string, TagOwnerSummary>();
+    const cached = inTransaction ? undefined : sessions.get(sessionId);
+    if (
+        cached &&
+        cached.dataVersion === dataVersion &&
+        cached.generation === generation &&
+        (proseRatio === undefined || cached.reasoningEstimatesByRatio.has(proseRatio))
+    ) {
+        // Only appends can have happened. `+session_id` keeps SQLite on the
+        // rowid range, so this reads the rows appended since, in any session.
+        const rows = db
+            .prepare(
+                `SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE id > ? AND +session_id = ? ORDER BY id`,
+            )
+            .all(cached.lastRowId, sessionId) as TagOwnerRow[];
+        tagOwnerRowsRead += rows.length;
+        for (const row of rows) foldTagOwnerRow(cached, row);
+        return cached;
+    }
+    const ratios = [...(cached?.reasoningEstimatesByRatio.keys() ?? [])];
+    if (proseRatio !== undefined && !ratios.includes(proseRatio)) ratios.push(proseRatio);
+    const summary: TagOwnerSummary = {
+        dataVersion,
+        generation,
+        lastRowId: 0,
+        maxTagByOwner: new Map(),
+        reasoningEstimatesByRatio: new Map(
+            ratios.slice(-MAX_CACHED_PROSE_RATIOS).map((ratio) => [ratio, new Map()]),
+        ),
+    };
+    const rows = db
+        .prepare(`SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE session_id = ? ORDER BY id`)
+        .all(sessionId) as TagOwnerRow[];
+    tagOwnerRowsRead += rows.length;
+    for (const row of rows) foldTagOwnerRow(summary, row);
+    if (!inTransaction) {
+        sessions.set(sessionId, summary);
+        tagOwnerSummaries.set(db, sessions);
+    }
+    return summary;
 }
 
 /** Bump a tag's input_token_count — the token mirror of `updateTagInputByteSize`. */
