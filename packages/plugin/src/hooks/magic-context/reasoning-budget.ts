@@ -8,17 +8,33 @@ import {
     getReasoningTokenEstimatesByMessage,
     getTagsBySession,
 } from "../../features/magic-context/storage-tags";
+import { readFrozenMergedReasoningParts } from "../../features/magic-context/merged-reasoning-decisions";
 import { resolveModelConfigValue } from "../../shared/prompt-surface";
 import { isRecord } from "../../shared/record-type-guard";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { hasAnthropicReasoning, isInActiveAnthropicTurn } from "./active-anthropic-turn";
 import { estimateTokens } from "./read-session-formatting";
-import { neutralizedReasoningSource } from "./sentinel";
-import {
-    findLatestAssistantReasoningMutationExemptMessage,
-    stripReasoningFromMergedAssistants,
-} from "./strip-content";
+import { neutralizedReasoningSource, makeSentinel } from "./sentinel";
+import { findLatestAssistantReasoningMutationExemptMessage } from "./strip-content";
 import type { MessageLike } from "./tag-messages";
+import { makeSentinel } from "./sentinel";
+
+const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
+
+/** Apply one message's already-decoded frozen part selection. The caller built the map once. */
+function applyFrozenMergedReasoning(
+    message: MessageLike,
+    parts: readonly (string | number)[] | undefined,
+): void {
+    if (!parts) return;
+    for (let index = 0; index < message.parts.length; index += 1) {
+        const part = message.parts[index];
+        if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
+        if (!parts.includes(index) && !(typeof part.id === "string" && parts.includes(part.id)))
+            continue;
+        message.parts[index] = makeSentinel(part);
+    }
+}
 
 /** Read-only historian projection. DB-only/cold-start callers may use tag estimates instead. */
 export function projectOpencodeReasoningBudgetCutoff(
@@ -206,6 +222,17 @@ export function opencodeReasoningBudgetCutoff(args: {
     const assistants = args.messages.filter((message) => message.info.role === "assistant");
     const newest = assistants.at(-1);
     const exempt = findLatestAssistantReasoningMutationExemptMessage(args.messages);
+    const anthropic = args.anthropic ?? hasAnthropicReasoning(args.messages);
+    const messageIndex = new Map<MessageLike, number>();
+    if (anthropic) {
+        args.messages.forEach((message, index) => messageIndex.set(message, index));
+    }
+    // One frozen-part map for the whole cutoff. The cost callback used to rebuild
+    // it once per assistant, which walks every frozen decision again for each
+    // message. The map is keyed by message id, so each cost is a lookup.
+    const frozenParts = args.frozenMergedIds
+        ? readFrozenMergedReasoningParts(args.frozenMergedIds)
+        : undefined;
     return reasoningBudgetCutoff(
         assistants.map((message) => ({
             tag: args.messageTagNumbers.get(message) ?? 0,
@@ -214,15 +241,15 @@ export function opencodeReasoningBudgetCutoff(args: {
                 message === exempt ||
                 isInActiveAnthropicTurn(
                     args.messages,
-                    args.messages.indexOf(message),
-                    args.anthropic ?? hasAnthropicReasoning(args.messages),
+                    messageIndex.get(message) ?? -1,
+                    anthropic,
                 ),
             cost: () => {
                 const costMessage = { ...message, parts: [...message.parts] };
-                if (args.frozenMergedIds)
-                    stripReasoningFromMergedAssistants([costMessage], "anthropic", {
-                        frozenMessageIds: args.frozenMergedIds,
-                    });
+                if (frozenParts) {
+                    const id = typeof message.info.id === "string" ? message.info.id : "";
+                    applyFrozenMergedReasoning(costMessage, frozenParts.get(id));
+                }
                 const visible = reasoningTextAndOpaque(
                     args.countNeutralized
                         ? costMessage.parts.map(neutralizedReasoningSource)

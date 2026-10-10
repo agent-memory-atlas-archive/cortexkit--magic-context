@@ -1,5 +1,6 @@
 import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
+import { readThroughPassCache } from "./pass-input-cache";
 import {
     type ReplayDocument,
     readReplayEnvelope,
@@ -79,6 +80,12 @@ function writeState(doc: ReplayDocument, state: ReasoningRemovalState): void {
  * and one invalid row would fail this read.
  */
 export function getReasoningRemovalState(db: Database, sessionId: string): ReasoningRemovalState {
+    return readThroughPassCache(db, `reasoning-removal:${sessionId}`, "", () =>
+        readReasoningRemovalState(db, sessionId),
+    );
+}
+
+function readReasoningRemovalState(db: Database, sessionId: string): ReasoningRemovalState {
     const doc = readReplayEnvelope(db, sessionId);
     try {
         return parseState(doc, sessionId);

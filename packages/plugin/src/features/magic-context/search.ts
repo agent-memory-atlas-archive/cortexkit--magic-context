@@ -1,5 +1,10 @@
+import { Worker } from "node:worker_threads";
 import { log } from "../../shared/logger";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import {
+    type Database,
+    getSqliteDatabasePath,
+    type Statement as PreparedStatement,
+} from "../../shared/sqlite";
 import {
     loadCompartmentChunkEmbeddingsForSearch,
     type StoredCompartmentChunkEmbedding,
@@ -627,7 +632,86 @@ function contentOnlyMessageQuery(ftsQuery: string): string {
     return ftsQuery.length === 0 ? "" : `content : (${ftsQuery})`;
 }
 
-/** Read all per-probe document frequencies in one SQLite statement. */
+interface ProbeCountCache {
+    version: number;
+    changes: number;
+    counts: Map<string, number>;
+}
+
+const probeCountCaches = new WeakMap<Database, Map<string, ProbeCountCache>>();
+
+function probeCountCacheKey(
+    sessionId: string,
+    cutoff: number | null,
+    dateRange: InclusiveDateRange | null,
+    sessionFirst: boolean,
+): string {
+    return `${sessionId}\0${cutoff ?? "all"}\0${dateRange ? `${dateRange.from}:${dateRange.to}` : "all-dates"}\0${sessionFirst}`;
+}
+
+function cachedProbeMatchCounts(
+    db: Database,
+    sessionId: string,
+    queries: readonly string[],
+    cutoff: number | null,
+    dateRange: InclusiveDateRange | null,
+    sessionFirst: boolean,
+): number[] | null {
+    const stamp = probeCountStamp(db);
+    const cache = probeCountCaches.get(db)?.get(
+        probeCountCacheKey(sessionId, cutoff, dateRange, sessionFirst),
+    );
+    if (!stamp || !cache || cache.version !== stamp.version || cache.changes !== stamp.changes) {
+        return null;
+    }
+    if (queries.some((query) => !cache.counts.has(query))) return null;
+    return queries.map((query) => cache.counts.get(query) ?? 0);
+}
+
+function rememberProbeMatchCounts(
+    db: Database,
+    sessionId: string,
+    queries: readonly string[],
+    counts: readonly number[],
+    cutoff: number | null,
+    dateRange: InclusiveDateRange | null,
+    sessionFirst: boolean,
+): void {
+    const stamp = probeCountStamp(db);
+    if (!stamp) return;
+    let caches = probeCountCaches.get(db);
+    if (!caches) {
+        caches = new Map();
+        probeCountCaches.set(db, caches);
+    }
+    const key = probeCountCacheKey(sessionId, cutoff, dateRange, sessionFirst);
+    const cache = caches.get(key) ?? {
+        version: stamp.version,
+        changes: stamp.changes,
+        counts: new Map<string, number>(),
+    };
+    queries.forEach((query, index) => cache.counts.set(query, counts[index] ?? 0));
+    caches.set(key, cache);
+}
+
+function probeCountStamp(db: Database): { version: number; changes: number } | null {
+    try {
+        return db
+            .prepare(
+                "SELECT total_changes() AS changes, data_version AS version FROM pragma_data_version",
+            )
+            .get() as { version: number; changes: number };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Exact probe document frequencies. A repeated probe on an unchanged corpus is
+ * the same number, so it is remembered for this connection until a write or an
+ * external commit moves the stamp. The first count of a probe is still the
+ * exact statement; later searches of the same term do not walk the session again.
+ */
 function countSessionFtsMatchesBatch(
     db: Database,
     sessionId: string,
@@ -637,35 +721,98 @@ function countSessionFtsMatchesBatch(
     sessionFirst: boolean,
 ): number[] {
     if (ftsQueries.length === 0) return [];
-    const bindings: unknown[] = [];
-    for (const query of ftsQueries) {
-        bindings.push(sessionId, contentOnlyMessageQuery(query));
-        if (dateRange !== null) bindings.push(dateRange.from, dateRange.to);
-        if (cutoff !== null) bindings.push(cutoff);
-    }
-    try {
-        const rows = getBatchedFtsCountStatement(
-            db,
-            ftsQueries.length,
-            cutoff,
-            dateRange,
-            sessionFirst,
-        ).all(...bindings) as BatchedFtsCountRow[];
-        const counts = Array.from({ length: ftsQueries.length }, () => 0);
-        for (const row of rows) {
-            if (
-                typeof row.queryIndex === "number" &&
-                row.queryIndex >= 0 &&
-                row.queryIndex < counts.length &&
-                typeof row.count === "number"
-            ) {
-                counts[row.queryIndex] = row.count;
-            }
+    const stamp = probeCountStamp(db);
+    const cacheKey = probeCountCacheKey(sessionId, cutoff, dateRange, sessionFirst);
+    let caches = probeCountCaches.get(db);
+    let cache = caches?.get(cacheKey);
+    if (
+        !stamp ||
+        !cache ||
+        cache.version !== stamp.version ||
+        cache.changes !== stamp.changes
+    ) {
+        if (!caches) {
+            caches = new Map();
+            probeCountCaches.set(db, caches);
         }
-        return counts;
+        cache = { version: stamp?.version ?? -1, changes: stamp?.changes ?? -1, counts: new Map() };
+        caches.set(cacheKey, cache);
+    }
+    const missing: string[] = [];
+    for (const query of ftsQueries) {
+        if (!cache.counts.has(query)) missing.push(query);
+    }
+    if (missing.length > 0 && stamp) {
+        const bindings: unknown[] = [];
+        for (const query of missing) {
+            bindings.push(sessionId, contentOnlyMessageQuery(query));
+            if (dateRange !== null) bindings.push(dateRange.from, dateRange.to);
+            if (cutoff !== null) bindings.push(cutoff);
+        }
+        try {
+            const rows = getBatchedFtsCountStatement(
+                db,
+                missing.length,
+                cutoff,
+                dateRange,
+                sessionFirst,
+            ).all(...bindings) as BatchedFtsCountRow[];
+            for (const query of missing) cache.counts.set(query, 0);
+            for (const row of rows) {
+                if (
+                    typeof row.queryIndex === "number" &&
+                    row.queryIndex >= 0 &&
+                    row.queryIndex < missing.length &&
+                    typeof row.count === "number"
+                ) {
+                    cache.counts.set(missing[row.queryIndex] as string, row.count);
+                }
+            }
+        } catch {
+            // Malformed FTS syntax that survived sanitization is non-discriminative.
+            for (const query of missing) cache.counts.set(query, 0);
+        }
+    }
+    return ftsQueries.map((query) => cache.counts.get(query) ?? 0);
+}
+
+/**
+ * Run the exact probe-count statement on a worker connection. Returns null when
+ * this database has no file a worker can open, or the worker fails, so the
+ * caller uses the same statement in process. The serving thread waits on the
+ * shared completion flag; the FTS scan runs on the worker.
+ */
+function countProbeMatchesOffThread(
+    db: Database,
+    request: {
+        sessionId: string;
+        queries: readonly string[];
+        cutoff: number | null;
+        dateRange: InclusiveDateRange | null;
+        sessionFirst: boolean;
+    },
+): number[] | null {
+    if (request.queries.length === 0) return [];
+    const path = getSqliteDatabasePath(db);
+    if (!path) return null;
+    const entry = new URL(
+        new URL(import.meta.url).pathname.endsWith(".ts")
+            ? "./message-fts-count-worker.ts"
+            : "./message-fts-count-worker.js",
+        import.meta.url,
+    );
+    const shared = new SharedArrayBuffer((request.queries.length + 1) * 4);
+    const slots = new Int32Array(shared);
+    let worker: Worker | undefined;
+    try {
+        worker = new Worker(entry, { workerData: { path, counts: shared, ...request } });
+        const completed = Atomics.wait(slots, 0, 0, 30_000);
+        if (completed === "timed-out" || Atomics.load(slots, 0) !== 1) return null;
+        return request.queries.map((_, index) => slots[index + 1] ?? 0);
     } catch {
-        // Malformed FTS syntax that survived sanitization is non-discriminative.
-        return Array.from({ length: ftsQueries.length }, () => 0);
+        return null;
+    } finally {
+        void worker?.terminate();
     }
 }
 
@@ -1328,14 +1475,43 @@ function searchMessagesInSnapshot(
         .map((probe) => ({ probe, query: sanitizeFtsQuery(probe) }))
         .filter((entry) => entry.query.length > 0);
     const corpusSize = getIndexedMessageCorpusSize(args.db, args.sessionId, cutoff);
-    const probeCounts = countSessionFtsMatchesBatch(
+    const probeQueries = sanitizedProbes.map((entry) => entry.query);
+    const cachedProbeCounts = cachedProbeMatchCounts(
         args.db,
         args.sessionId,
-        sanitizedProbes.map((entry) => entry.query),
+        probeQueries,
         cutoff,
         args.dateRange,
         sessionFirst,
     );
+    const probeCounts =
+        cachedProbeCounts ??
+        countProbeMatchesOffThread(args.db, {
+            sessionId: args.sessionId,
+            queries: probeQueries,
+            cutoff,
+            dateRange: args.dateRange,
+            sessionFirst,
+        }) ??
+        countSessionFtsMatchesBatch(
+            args.db,
+            args.sessionId,
+            probeQueries,
+            cutoff,
+            args.dateRange,
+            sessionFirst,
+        );
+    if (!cachedProbeCounts) {
+        rememberProbeMatchCounts(
+            args.db,
+            args.sessionId,
+            probeQueries,
+            probeCounts,
+            cutoff,
+            args.dateRange,
+            sessionFirst,
+        );
+    }
     const collectBaseDiagnostics = args.diagnostics !== undefined && cutoff !== null;
     const baseOutcome =
         collectBaseDiagnostics && baseQuery.length > 0
@@ -1354,7 +1530,7 @@ function searchMessagesInSnapshot(
     }
     const searchQueries = [
         ...(!collectBaseDiagnostics && baseQuery.length > 0 ? [baseQuery] : []),
-        ...sanitizedProbes.map((entry) => entry.query),
+        ...probeQueries,
     ];
     const rowsByQuery = runMessageFtsQueriesBatch(
         args.db,
