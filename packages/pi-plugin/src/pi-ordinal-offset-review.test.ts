@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -16,6 +15,7 @@ import * as logger from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
+import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 import { applyDeferredPiCompactionMarker } from "./compaction-marker-manager-pi";
 import {
 	awaitInFlightHistorians,
@@ -170,11 +170,10 @@ function provider(entries: readonly Entry[], offset: number) {
 	};
 }
 
-const dirs: string[] = [];
+const cleanups: Array<() => void> = [];
 afterEach(() => {
 	mock.restore();
-	for (const dir of dirs.splice(0))
-		rmSync(dir, { recursive: true, force: true });
+	for (const cleanup of cleanups.splice(0)) cleanup();
 });
 
 async function withFixture(
@@ -432,8 +431,9 @@ function persistedFixture(sessionId: string): {
 	path: string;
 	complete: Entry[];
 } {
-	const dir = mkdtempSync(join(tmpdir(), "pi-ordinal-review-"));
-	dirs.push(dir);
+	const temp = createTestTempDir("pi-ordinal-review-");
+	cleanups.push(temp.cleanup);
+	const dir = temp.dir;
 	const path = join(dir, "session.jsonl");
 	const prefix = Array.from(
 		{ length: LOST },
