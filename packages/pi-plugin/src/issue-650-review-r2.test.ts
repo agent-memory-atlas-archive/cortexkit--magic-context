@@ -171,10 +171,13 @@ test("review 650 r2 finding: a ctx_reduce result quoting the dropped number must
 		// tool tag numbers"): `§8§` in the ctx_reduce result vetoes the cached
 		// proof, and because a cached array exists the automatic repair is not
 		// offered either.
-		adoptLikeProduction(db, sessionId);
+		const outcome = adoptLikeProduction(db, sessionId);
 		expect(toolRows(db, sessionId)).toEqual([
 			{ tag_number: NEWEST, status: "active", tool_owner_message_id: "real" },
 		]);
+		// Proven by the rendered tags, so no unproven rebuild is declared: the
+		// quoted `§8§` inside the receipt is not a tag position.
+		expect(outcome.rebuilds).toEqual([]);
 	} finally {
 		db.close();
 	}
