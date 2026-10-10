@@ -5818,8 +5818,8 @@ function maybeFireHistorian(args: {
 
 	// Every boundary the historian computes and every compartment it writes is
 	// an ordinal. When the stored ordinals cannot be placed on this branch,
-	// any range it chose would be a guess, so it does not run. The alignment
-	// module logs the numbers once per change.
+	// any range it chose would be a guess, so it does not run.
+	// resolvePiOrdinalAlignment has already logged why.
 	const ordinalAlignment =
 		args.ordinalAlignment ??
 		resolvePiOrdinalAlignmentForContext(db, sessionId, ctx);

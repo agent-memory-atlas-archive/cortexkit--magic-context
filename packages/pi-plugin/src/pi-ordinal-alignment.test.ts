@@ -31,7 +31,7 @@ import { createFakePi, createTestDb, fakeContext } from "./test-utils.test";
 import { createCtxExpandTool } from "./tools/ctx-expand";
 
 /*
- * Fixture shaped like the stuck Pi session behind this module: one
+ * Fixture for a session whose branch walk lost its first entries: one
  * conversation of 90,740 message entries in the session file, of which the
  * branch walk (`getBranch()`) only reaches the last 18,250, because the walk
  * stops at an entry whose parent it cannot find. The stored compartments were
