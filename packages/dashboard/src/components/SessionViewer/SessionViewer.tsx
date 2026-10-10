@@ -1789,7 +1789,24 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                         >
                           {formatHistorianTokens(row.input_tokens, row.output_tokens)}
                         </td>
-                        <td>{row.error ?? "—"}</td>
+                        <td class="historian-error-cell">
+                          <Show when={row.error} fallback="—">
+                            {(error) => (
+                              <span
+                                class="historian-error"
+                                role="img"
+                                aria-label={`Error: ${error()}`}
+                              >
+                                <span class="historian-error-icon" aria-hidden="true">
+                                  !
+                                </span>
+                                <span class="historian-error-card" role="tooltip">
+                                  {error()}
+                                </span>
+                              </span>
+                            )}
+                          </Show>
+                        </td>
                       </tr>
                     )}
                   </For>

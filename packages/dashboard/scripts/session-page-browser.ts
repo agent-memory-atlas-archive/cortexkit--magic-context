@@ -124,12 +124,13 @@ const historianRows = {
       model_id: "gemini-3.8-flash",
       started_at: Date.UTC(2026, 4, 1, 15, 20),
       ended_at: Date.UTC(2026, 4, 1, 15, 22),
-      status: "completed",
+      status: "empty",
       input_tokens: 14_000,
       output_tokens: 900,
       cache_read_tokens: 8_000,
       cache_write_tokens: 400,
-      error: null,
+      error:
+        'pi assistant stopped with reason "length"; tokens={"input":60965,"output":31996,"reasoning":30722,"cache_read":0,"cache_write":0,"max_tokens":32000,"finish_reason":"length"}',
       parent_invocation_id: null,
     },
   ],
@@ -352,6 +353,33 @@ try {
       const historianFilename = join(output, `${theme}-900-${kind}-historian.png`);
       writeFileSync(historianFilename, Buffer.from(historianScreenshot.data, "base64"));
       console.log(`captured ${historianFilename}`);
+      if (kind === "pi") {
+        // A long error must stay a single icon in the row and open as a card
+        // on hover, inside the viewport, instead of widening the table.
+        const iconCenter = await evalPage(`(() => {
+          const table = document.querySelector('.historian-table');
+          const icon = document.querySelector('.historian-error-icon');
+          if (!table || !icon) return null;
+          if (table.scrollWidth > table.clientWidth + 1) return null;
+          const r = icon.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        })()`);
+        if (!iconCenter) throw new Error("Historian error icon is missing or the table overflows");
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: iconCenter.x, y: iconCenter.y }, browserSession);
+        await settle();
+        const cardFits = await evalPage(`(() => {
+          const card = document.querySelector('.historian-error-card');
+          if (!card || getComputedStyle(card).display === 'none') return false;
+          const r = card.getBoundingClientRect();
+          return r.left >= 0 && r.right <= innerWidth && card.textContent.includes('finish_reason');
+        })()`);
+        if (!cardFits) throw new Error("Historian error card did not open inside the viewport on hover");
+        const hoverShot = await send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: false }, browserSession);
+        const hoverFilename = join(output, `${theme}-900-pi-historian-error-hover.png`);
+        writeFileSync(hoverFilename, Buffer.from(hoverShot.data, "base64"));
+        console.log(`captured ${hoverFilename}`);
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 0, y: 0 }, browserSession);
+      }
       if (kind === "opencode") {
         await evalPage("document.querySelector('.section-header .btn.sm').click()");
         await waitFor(".project-detail-body .scroll-area button.card");
