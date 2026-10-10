@@ -1834,7 +1834,9 @@ function piContextHeaderFields(message: unknown): {
  */
 function piAlignmentCheckForEntry(entry: unknown): PiAlignmentCheck | null {
 	if (!isPiContextEmitEligible(entry)) return null;
-	const row = entry as PiAlignmentCheck["entry"] & { timestamp?: unknown };
+	const row = entry as unknown as PiAlignmentCheck["entry"] & {
+		timestamp?: unknown;
+	};
 	const header =
 		row.type === "message"
 			? piContextHeaderFields(row.message)
