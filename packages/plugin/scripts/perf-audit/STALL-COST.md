@@ -65,3 +65,160 @@ between the remembered point and the target.
   posts the request and awaits the reply. A worker that does not report it is
   running within 400 ms, or does not answer within 30 s after that, is replaced
   by the in-process lane, and the fallback is logged and counted.
+
+# Real-store stalls after the stall fixes
+
+After those fixes the host stall profiler on the live OpenCode host
+(`opencode.db` about 39 GB, sessions up to about 160k messages with multi-KB
+message JSON) still showed three Magic Context stalls on the serving thread:
+
+1. 4.7 s (and part of 5.3 s): `countEligibleOrdinals` ← `canonicalOrdinalOf` ←
+   `readRawSessionMessageByIdFromDb` in the incremental message-index job. The
+   whole-prefix recount above runs after nearly every lookup on a busy host,
+   and it reads every earlier message's JSON from a cold file.
+2. About 2 s: `readTagOwnerSummary` ← `getReasoningTokenEstimatesByMessage` ←
+   `projectOpencodeReasoningBudgetCutoff`. The summary was rebuilt (every tag of
+   the session read into JavaScript) whenever another connection had committed
+   anything to `context.db` (`data_version` moved), which on that host is
+   nearly every pass.
+3. About 3 s: `countRawSessionMessageOrdinalsFromDb` under the message-index
+   page reader, the same whole-session JSON count.
+
+## What changed
+
+**Canonical ordinal (stalls 1 and 3).** A canonical ordinal is now an
+index-only `COUNT(*)` over `(session_id, time_created, id) <= target` minus the
+finished compaction summaries at or before the target. Summaries are found
+through a per-connection, per-session set of candidate rows (rows whose
+`summary` flag is set, finished or not), and both parts are evaluated in one
+statement:
+
+- the candidates are re-read by primary key in that statement, so a summary
+  that finishes later, moves in time, changes session or is deleted is counted
+  correctly;
+- new rows are found by rowid: rows above the highest remembered row of the
+  `message` table are read in that same statement. The set remembers the top
+  64 rows (rowid and id). OpenCode's `message` has a text primary key and no
+  AUTOINCREMENT, so SQLite hands a deleted top rowid to the next insert; a
+  remembered row that has gone or now holds another message is passed over for
+  a lower one, and only when none survive is the session scanned again;
+- `countRawSessionMessageOrdinalsFromDb` uses the same path with no bounds.
+
+OpenCode 1.18 has no index on `message.time_updated` (only
+`message_session_time_created_id_idx (session_id, time_created, id)`), and a
+scan of `time_updated` would read every table leaf, which is the cost being
+removed. Rowid plus the candidate re-read is the change signal instead. Its one
+assumption is that a row carries its `summary` flag from its first insert:
+
+- OpenCode v1.18.35 creates the compaction assistant with `summary: true` and no
+  `finish` (`packages/opencode/src/session/compaction.ts:393-418`) and sets
+  `finish` later through the processor; its message projection is
+  `INSERT ... ON CONFLICT(id) DO UPDATE SET data` (`packages/core/src/session/projector.ts:261-272`),
+  which keeps the rowid, session and creation time. `import` inserts with
+  `onConflictDoNothing`. No other v1.18.35 path writes `summary: true`.
+- In this repository the only writer of `message` rows is Magic Context's
+  compaction marker (`compaction-marker.ts`, inject and replace). Its upsert can
+  rewrite an existing row into a summary, so it reports the row through
+  `noteRawSessionSummaryRowWritten` inside the write transaction (tested in
+  `compaction-marker.test.ts`). The CLI doctor's marker repair only sets
+  `time.completed` on rows that are already Magic Context summaries; the clone
+  script inserts new rows. No Rust crate writes `message`.
+
+The residual: an in-place edit by some other writer that turns an ordinary row
+into a finished summary is not seen until `forgetRawSessionSummaryRows` runs for
+the session. The review's randomized differential (seed `0x5d0ee2b3`) made
+exactly that edit in its fourth step; its main variant now rewrites rows that
+were inserted with the flag (finishing and unfinishing them), and the original
+arbitrary edit is kept as its own test that calls `forgetRawSessionSummaryRows`
+after each write, plus a named residual test.
+
+**Off-thread warm-up.** Finding a session's candidates the first time reads
+every message's JSON once. That scan now runs on a worker
+(`raw-ordinal-warmup-worker.ts`, its own read-only connection) and is installed
+on the serving connection. The worker's scan reads the top rows and the
+candidates in one statement, so rows written during or after it lie above its
+top remembered row (or replace it) and are read by the next count. Callers:
+
+- the transform awaits it at the start of every pass (instant once warm), so
+  no stage reached from `experimental.chat.messages.transform` (protected-tail
+  boundary, compartment trigger, module-state sync, chunk reads) scans the
+  session on the serving thread;
+- the incremental index job and reconciliation await it and reschedule when it
+  failed, without reading;
+- the historian runner, `/ctx-recomp`, wrapup and `ctx_expand` await it before
+  their synchronous reads;
+- if the worker fails, the transform pass still runs and a count that needs the
+  scan does it on the serving thread once; the failure is logged at warn level
+  with the session and counted by reason, and the worker is not retried for
+  that session for 5 minutes. A servable turn is never refused for it.
+- sessions of at most 2,000 messages, and in-memory stores, are scanned in
+  place (a few milliseconds warm).
+
+Workers are unreferenced, stopped when the process exits, and time out after
+10 minutes.
+
+**Tag owner summary (stall 2).** After another connection's commit the summary
+is no longer rebuilt. One statement reads the session's tag count and highest
+id (from the `(session_id, message_id)` index, without visiting the table)
+together with the rows above the cached highest id. When the count grew by
+exactly those rows, they are folded in. A delete or a replace changes the count
+and rebuilds. Status and drop-mode writes, on either connection, never reread
+the session. Tool tags written before owners were recorded are remembered and
+re-read by primary key after a foreign commit, because the tool-owner backfill
+that runs when any OpenCode process opens the store gives them owners from
+another process. The `schema_version` is part of the key, so a rebuilt table
+rebuilds the summary.
+
+Residual: another process rewriting a tag's message id, owner, number or
+reasoning count in place, with the session's count and highest id unchanged, is
+not seen until this process makes an identity write or opens a new connection.
+Writers of those columns: the tagger and tag hygiene in the transform (message
+id re-keys, owner adoption, whitespace inerting, reasoning backfill), the
+store-generation rebase fold, and Pi's fallback adoption. All of them write
+only the sessions the same process serves, and this process's own writes move
+its identity-write generation. The CLI (`migrate-session` and `doctor
+repair-db`) does not rewrite tag rows (repair-db replaces the whole file with
+every host stopped), the dashboard has no tag writer, and Rust-mode tags live in
+`store.db` (`mc_tags`). The review test that had another process rewrite
+`tag_number` and `reasoning_token_count` in place is now that named residual
+test. A per-session identity revision would need a schema change, so it waits
+for the migration branch.
+
+## Measurements
+
+Driver: `scripts/perf-audit/stall-ordinal-real.ts`, Linux build host, throwaway
+root `/motor-home/tmp/magic-context/bg_c13b3d23ccad0f64/realistic` (removed
+after the run; the driver refuses live store paths and listed its open database
+files, all under the root). Fixture: OpenCode 1.18 schema, 4.9 GB
+`opencode.db`; one session of 150,000 messages with 3–5 KB message JSON and two
+9 KB parts per message, interleaved with three other sessions of 20,000; a
+finished summary every 1,000th message. `context.db` with 100,000 tags. "Cold"
+means the files' page cache was dropped with `posix_fadvise(DONTNEED)` first
+(`fincore` reported 0 bytes resident).
+
+| Measure | Old | New |
+|---|---|---|
+| Ordinal of the newest message, cold | 24.2 s (13.0 s in an earlier run) | 221–295 ms after another connection appended |
+| Same, warm | 268–303 ms | 7.5–11.7 ms |
+| Message JSON read per lookup after an append | 150,000 rows | 151 rows (1 new row, 150 summaries) |
+| Session count (`countRawSessionMessageOrdinalsFromDb`), warm | (same as the lookup) | 4.6–5.6 ms, 150 rows of JSON |
+| First pass after a restart, cold: longest event-loop block | 13,857 ms (in-thread scan) | 164 ms (scan on the worker, 13.6 s elapsed with the loop free) |
+| Tag summary after another connection appended a tag, cold / warm | full rebuild (76 ms here, 2 s live) | 62–78 ms / 3.0–3.9 ms, 1 row read |
+| Tag summary after another connection's status write, warm | full rebuild | 2.9–4.9 ms, 0 rows read |
+
+The ordinals agreed with the old statement (149,850 at the target, 149,860
+after the appends). The remaining cold cost of a lookup is the index range of
+150k entries and the 150 summary rows' pages.
+
+Work-bound tests: `read-session-raw-indexed-ordinal.test.ts` (JSON rows per
+lookup are the new rows plus the summaries at 2,000 and 20,000 messages with
+2 KB JSON, the count statement uses the covering index, no table scan),
+`storage-tag-owner-summary.test.ts` (one shape check and the appended rows only,
+at 2,000 and 20,000 tags; status writes read nothing), and
+`raw-ordinal-warmup.test.ts` (no scan on the serving connection after a worker
+warm-up; rows written during the scan; failure, backoff and shutdown).
+
+Not changed: the first page of a message-index reconciliation still seeks its
+start with `OFFSET` over the JSON-filtered rows, which reads the prefix's JSON
+once per session after a restart; it runs in the background job, which now
+awaits the warm-up, but it is still a serving-thread read.

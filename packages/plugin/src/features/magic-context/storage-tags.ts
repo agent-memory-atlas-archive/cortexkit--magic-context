@@ -762,7 +762,10 @@ interface TagOwnerRow {
  * from the `(session_id, ...)` index together with the rows above the cached
  * highest id in one statement. When the count grew by exactly the number of
  * new rows, the other connection only appended, and those rows are folded in.
- * Anything else (a delete, an insert below the cached highest id) rebuilds.
+ * A delete, or an insert below the cached highest id (only possible with an
+ * explicit id, since `tags.id` is AUTOINCREMENT), leaves the count short of
+ * that and rebuilds. A delete and an explicit-id insert below the highest id in
+ * the same interval would cancel out; no writer inserts tags with an explicit id.
  *
  * Tool tags written before owners were recorded have no owner and count for
  * no message. Another process can give them one later (the tool-owner backfill

@@ -10,8 +10,8 @@ import type { RawOrdinalWarmupInput, RawOrdinalWarmupReply } from "./raw-ordinal
 const port = parentPort;
 if (!port) throw new Error("raw ordinal warm-up worker requires a parent port");
 const input = workerData as RawOrdinalWarmupInput;
-// Report that the thread runs before loading any module, so the caller's first
-// deadline only has to cover thread start.
+// Report that the thread runs before importing the SQLite and scan modules, so
+// the caller's first deadline only has to cover thread start.
 port.postMessage({ kind: "accepted" } satisfies RawOrdinalWarmupReply);
 const [{ Database }, { scanRawSessionSummaryRows }] = await Promise.all([
     import("../../shared/sqlite"),

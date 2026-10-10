@@ -99,10 +99,10 @@ function clearCompletedIncrementalKeys(sessionId: string): void {
 }
 
 /**
- * Sources backed by the OpenCode store may need an off-thread warm-up before
- * their synchronous reads can count ordinals without scanning the session.
- * `prepare` resolves false when that warm-up failed; the job then retries later
- * instead of reading, so indexing never scans a session on the serving thread.
+ * Sources backed by the OpenCode store provide `prepare`, an off-thread warm-up
+ * after which their synchronous reads count ordinals without scanning the
+ * session. When it resolves false the job retries later instead of reading.
+ * Sources without `prepare` are read directly.
  */
 type PreparedSource = { prepare?: (sessionId: string) => Promise<boolean> };
 
@@ -354,8 +354,8 @@ export function scheduleIncrementalIndex(
         void sourceReady(messageSource, sessionId)
             .then((ready) => {
                 if (ready) return runWithSessionLock(sessionId, indexMessage);
-                // Retry once the warm-up can have recovered; the session's next
-                // reconciliation also covers this message.
+                // Try again after PREPARE_RETRY_MS. A later reconciliation of the
+                // session also indexes this message.
                 setTimeout(
                     () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
                     PREPARE_RETRY_MS,

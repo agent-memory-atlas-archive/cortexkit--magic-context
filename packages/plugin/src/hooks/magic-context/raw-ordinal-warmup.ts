@@ -6,8 +6,8 @@
  * Finding them the first time means reading every message's JSON once, which
  * takes seconds on a large, cold OpenCode store. This module does that scan on
  * a worker thread with its own read-only connection and installs the result on
- * the serving connection, so the serving thread only ever reads the rows added
- * since.
+ * the serving connection. Counts on the serving thread then read only the rows
+ * added after the worker's scan.
  *
  * Callers on the transform path await {@link prewarmRawSessionOrdinalsForDb}
  * before their synchronous counts. Background callers (message indexing)
@@ -37,7 +37,11 @@ export type RawOrdinalWarmupReply =
     | { kind: "scan"; scan: RawSessionSummaryScan }
     | { kind: "error"; error: string };
 
-/** "warm": counts of the session no longer scan it. "failed": the worker could not provide the scan. */
+/**
+ * "warm": the session's counts no longer need a full scan (possibly because it
+ * was scanned on the calling thread). "failed": the off-thread scan could not
+ * be completed or installed.
+ */
 export type RawOrdinalWarmupOutcome = "warm" | "failed";
 
 export type RawOrdinalWarmupFailureReason =
@@ -163,13 +167,15 @@ function runWorker(
 /**
  * Make the next canonical count of `sessionId` on `db` free of a full scan.
  *
- * Already warm: returns at once. A store without a usable `message` table, an
- * in-memory store, or a session of at most `inThreadMaxRows` messages: scanned
- * here, which is bounded. Otherwise a worker scans the session and the result is
- * installed on `db`; rows written while it ran are picked up by the next count.
- * Concurrent calls for one session share one worker. "failed" means the worker
- * could not run or answer; it is logged, counted by reason, and not retried for
- * that session for FAILURE_BACKOFF_MS.
+ * Already warm: returns at once. A store whose `message` table cannot be
+ * queried returns "warm" without scanning (there is nothing to count). An
+ * in-memory store, or a session of at most `inThreadMaxRows` messages, is
+ * scanned on this thread, which is bounded. Otherwise a worker scans the
+ * session and the result is installed on `db`; rows written while it ran are
+ * picked up by the next count. Concurrent calls for one store and session share
+ * one worker. "failed" means the scan failed or its result could not be
+ * installed; it is logged and counted by reason, and apart from a superseded
+ * scan it is not retried for that store and session for FAILURE_BACKOFF_MS.
  */
 export function prewarmRawSessionOrdinalsForDb(
     db: Database,

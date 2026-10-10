@@ -595,12 +595,13 @@ readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
 readRawSessionMessages.prepare = prepareRawSessionOrdinals;
 
 /**
- * Wait, without blocking the serving thread, until canonical ordinal counts of
- * a session read only what changed since the last count instead of scanning
- * the whole session (see raw-ordinal-warmup.ts). Resolves false when the
- * off-thread scan failed; a later count then scans on the calling thread, so
- * background callers should reschedule instead of reading. Sessions served by
- * a registered raw-message provider, or without an OpenCode store, need nothing.
+ * Prepare a session's canonical ordinal counts without blocking the serving
+ * thread: the one full scan for its compaction summaries runs on a worker (see
+ * raw-ordinal-warmup.ts), after which counts read only the rows added since.
+ * Resolves false when that off-thread scan failed; a later count then scans on
+ * the calling thread, so background callers should reschedule instead of
+ * reading. Sessions served by a registered raw-message provider, or without an
+ * OpenCode store, need nothing.
  */
 export async function prepareRawSessionOrdinals(sessionId: string): Promise<boolean> {
     if (sessionProviders.get(sessionId)?.provider) return true;
