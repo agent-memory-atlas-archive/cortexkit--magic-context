@@ -397,6 +397,27 @@ describe("Pi ordinal alignment: stored ordinals ahead of the branch walk", () =>
 			const lost = await expand(branch, { start: 1_001, end: 1_100 });
 			expect(lost).not.toContain("question");
 			expect(lost).not.toContain("answer");
+			// Every mode says plainly that those messages are gone.
+			const gone = "no longer in this session's history";
+			expect(lost).toBe(
+				`No messages found in range 1001-1100: those messages are ${gone}, which now starts at message ${LOST_ORDINALS + 1}.`,
+			);
+			expect(
+				await expand(branch, { start: 1_001, end: 1_100, verbose: true }),
+			).toBe(lost);
+			expect(await expand(branch, { message: 1_001 })).toBe(
+				`No message at ordinal 1001: it is ${gone}, which now starts at message ${LOST_ORDINALS + 1}.`,
+			);
+			// A range that straddles the break shows the reachable part and says
+			// which messages are gone.
+			const straddle = await expand(branch, {
+				start: LOST_ORDINALS - 1,
+				end: LOST_ORDINALS + 2,
+			});
+			expect(straddle).toStartWith(
+				`Messages ${LOST_ORDINALS - 1}-${LOST_ORDINALS} are ${gone}; showing from ${LOST_ORDINALS + 1}.`,
+			);
+			expect(straddle).toContain(`question ${LOST_TURNS}`);
 		} finally {
 			clearPiOrdinalAlignmentSession(sessionId);
 			closeQuietly(db);
