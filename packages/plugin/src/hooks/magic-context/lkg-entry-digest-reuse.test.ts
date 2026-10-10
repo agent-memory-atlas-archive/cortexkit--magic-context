@@ -1,10 +1,14 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import {
     captureSlot,
     getLkgDigestsComputedForTest,
+    type LkgContentField,
     lkgContentDigest,
+    lkgContentDigestFromFields,
+    lkgContentFields,
     noteEntry,
     resetLkgSlotsForTest,
 } from "./lkg-slot";
@@ -55,8 +59,33 @@ function hashesForNextPass(sessionLength: number, appended: number): number {
     return hashed;
 }
 
+/** The digest as it was computed before: three hash updates per token. */
+function frozenDigest(fields: readonly LkgContentField[]): string {
+    const hash = createHash("sha256");
+    for (const field of fields) {
+        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
+        hash.update(`${typeof field}:${value.length}:`)
+            .update(value)
+            .update("\0");
+    }
+    return hash.digest("base64url");
+}
+
 describe("LKG entry digests", () => {
     beforeEach(() => resetLkgSlotsForTest());
+
+    it("hashes the joined token text to the same digest as per-token updates", () => {
+        const values: unknown[] = [
+            { info: { id: "m", role: "user" }, parts: [{ type: "text", text: "plain" }] },
+            { text: "pair \ud83d\ude00 and lone \ud83d", tail: "\ude00 lone low", n: -0, f: 1.5 },
+            { nested: [null, true, false, 0, "", [], {}], key: "a\u0000b", utf: "çé日本" },
+            ["\ud800", "\udfff", "x\ud800", "\udc00x"],
+        ];
+        for (const value of values) {
+            const fields = lkgContentFields(value)!;
+            expect(lkgContentDigestFromFields(fields)).toBe(frozenDigest(fields));
+        }
+    });
 
     it("hashes only the messages added since the last pass, however long the prefix", () => {
         // 25,000 is past the shared digest memo's 20,000-entry bound, where every
@@ -74,6 +103,25 @@ describe("LKG entry digests", () => {
         const note = noteEntry("edited", second);
         expect(getLkgDigestsComputedForTest() - before).toBe(1);
         expect(note?.entryContentDigests).toEqual(second.map((entry) => lkgContentDigest(entry)!));
+    });
+
+    it("hashes again when only a value's type changes", () => {
+        const typed = (value: unknown) =>
+            ({
+                info: { id: "typed", role: "user" },
+                parts: [{ type: "text", n: value }],
+            }) as unknown as MessageLike;
+        anchorAt("typed", [typed(1)], 0);
+        noteEntry("typed", [typed(1)]);
+        for (const value of ["1", true, "true", 1]) {
+            const before = getLkgDigestsComputedForTest();
+            const note = noteEntry("typed", [typed(value)]);
+            expect({ value, hashed: getLkgDigestsComputedForTest() - before }).toEqual({
+                value,
+                hashed: 1,
+            });
+            expect(note?.entryContentDigests).toEqual([lkgContentDigest(typed(value))!]);
+        }
     });
 
     it("reuses digests when the head of the array is trimmed", () => {
