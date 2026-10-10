@@ -4405,6 +4405,63 @@ describe("executed m[0] hard-fold folds the execute pass in", () => {
         });
     }
 
+    it("consumes an OpenCode flush on a hard fold and replays the next defer byte-identically", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "oc-fold-flush-defer";
+        materializeBaseline(sessionId);
+        insertTag(db, sessionId, "drop-call", "tool", 1000, 1, 0, "bash", 0, "drop-owner");
+        padRecentToolSkeletonWindow(sessionId, 1);
+        queuePendingOp(db, sessionId, 1, "drop");
+        const pendingMaterializationSessions = new Set([sessionId]);
+        const lines: string[] = [];
+        const log = spyOn(loggerModule, "sessionLog").mockImplementation((_id, ...values) => {
+            lines.push(values.join(" "));
+        });
+        const pass = async () => {
+            const message = makeToolMessage("drop-owner");
+            const messages = [
+                message,
+                {
+                    info: { id: "live-user", role: "user" },
+                    parts: [{ type: "text", text: "retained tail" }],
+                } as MessageLike,
+            ];
+            const targets = new Map([[1, makeDropTarget(message)]]);
+            applyFlushedStatuses(sessionId, db, targets, getTagsBySession(db, sessionId));
+            const result = await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    targets,
+                    pendingMaterializationSessions,
+                    resolvedProviderID: "anthropic",
+                    m0M1: {
+                        projectPath: FOLD_PROJECT,
+                        projectDirectory: FOLD_PROJECT,
+                        historyBudgetTokens: 98_000,
+                        hardSignals: { ...BASE_HARD, modelKey: "anthropic/sonnet" },
+                    },
+                }),
+            );
+            return { result, wire: JSON.stringify(messages) };
+        };
+        try {
+            const fold = await pass();
+            expect(fold.result.materialized).toBe(true);
+            expect(lines).toContain(
+                "heuristics WILL RUN — reason=explicit_flush, context=20.0%, turn=null",
+            );
+            expect(getPendingOps(db, sessionId)).toHaveLength(0);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+            lines.length = 0;
+            const defer = await pass();
+            expect(defer.result.materialized).toBe(false);
+            expect(lines).toContain("heuristics WILL NOT RUN — reason=scheduler_defer");
+            expect(defer.wire).toBe(fold.wire);
+        } finally {
+            log.mockRestore();
+        }
+    });
+
     it("review regression: executed fold must retire the held historian row it actually trims", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);

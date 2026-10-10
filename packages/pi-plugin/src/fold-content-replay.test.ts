@@ -8,9 +8,11 @@ import {
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	clearCachedM0M1,
+	getPendingOps,
 	getSourceContents,
 	getTagsBySession,
 	insertTag,
+	queuePendingOp,
 	updateCavemanDepth,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
@@ -18,6 +20,8 @@ import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-cont
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import {
 	clearContextHandlerSession,
+	__test as contextHandlerInternals,
+	hasPendingMaterialization,
 	registerPiContextHandler,
 	signalPiPendingMaterialization,
 } from "./context-handler";
@@ -39,6 +43,101 @@ function sha256(value: string): string {
 }
 
 describe("Pi fold content replay", () => {
+	it("consumes a flush on a hard fold and replays the next defer byte-identically", async () => {
+		const db = createTestDb();
+		const sessionId = "pi-fold-flush-defer";
+		const fake = createFakePi();
+		const lines: string[] = [];
+		const restoreObserver =
+			contextHandlerInternals.setPendingDecisionLogObserverForTests((line) =>
+				lines.push(line),
+			);
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTags: 0,
+			heuristics: {},
+			injection: { injectionBudgetTokens: 10_000 },
+		});
+		const handler = fake.handlers.get("context") as (
+			e: { messages: unknown[] },
+			ctx: unknown,
+		) => Promise<{ messages: unknown[] }>;
+		const raw = [
+			userMessage("covered request", 1),
+			assistantMessage("covered answer", 2),
+			userMessage("retained request", 3),
+			assistantMessage("retained answer", 4),
+			userMessage("live tail", 5),
+		];
+		const ids = ["old", "end", "retained", "ack", "tail"];
+		let modelId = "claude-opus-4-1";
+		const pass = async () => {
+			const messages = structuredClone(raw);
+			return handler(
+				{ messages },
+				{
+					...fakeContext(sessionId, process.cwd(), ids, messages as never),
+					model: { provider: "anthropic", id: modelId, contextWindow: 100_000 },
+				},
+			);
+		};
+		try {
+			appendCompartments(db, sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "old",
+					endMessageId: "end",
+					title: "Covered history",
+					content: "U: covered request\nA: covered answer",
+				},
+			]);
+			await pass();
+			// A model change folds an already served prefix; the flush must ride that fold once.
+			const tag = getTagsBySession(db, sessionId).find(
+				(candidate) => candidate.messageId === "retained:p0",
+			);
+			if (!tag) throw new Error("Missing retained request tag");
+			queuePendingOp(db, sessionId, tag.tagNumber, "drop");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				cacheTtl: "59m",
+				lastContextPercentage: 20,
+				lastInputTokens: 20_000,
+			});
+			modelId = "claude-sonnet-4";
+			signalPiPendingMaterialization(sessionId);
+			lines.length = 0;
+			const fold = await pass();
+			expect(
+				lines.filter((line) => line.includes("heuristics WILL RUN")),
+			).toEqual([expect.stringContaining("reason=m0_hard_fold")]);
+			expect(hasPendingMaterialization(sessionId)).toBe(false);
+			expect(getPendingOps(db, sessionId)).toHaveLength(0);
+			expect(
+				getTagsBySession(db, sessionId).find(
+					(row) => row.tagNumber === tag.tagNumber,
+				)?.status,
+			).toBe("dropped");
+			updateSessionMeta(db, sessionId, {
+				lastResponseTime: Date.now(),
+				lastContextPercentage: 20,
+				lastInputTokens: 20_000,
+			});
+			lines.length = 0;
+			const defer = await pass();
+			expect(lines).toContain(
+				"heuristics WILL NOT RUN — reason=scheduler_defer",
+			);
+			expect(digest(defer.messages)).toBe(digest(fold.messages));
+		} finally {
+			restoreObserver();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("does not discover a reminder strip on defer without a frozen decision", async () => {
 		const db = createTestDb();
 		const sessionId = "pi-reminder-no-ride";
