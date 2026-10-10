@@ -1,10 +1,11 @@
 /**
- * Issue 650, third round: no tag-identity conflict may refuse more than one
- * turn. These tests cover what the second review's pinned findings
- * (issue-650-review-r2.test.ts) do not reach directly: the position-independent
- * fallback id itself, the re-key of rows an older build stored under the
- * index-bearing form, a message recurrence after its repair, and a decision
- * ledger too full to record a repair.
+ * Pi tag identity (GitHub issue 650): no tag-identity conflict may refuse more
+ * than one turn. These tests cover the position-independent fallback id given
+ * to messages without a real entry id, the re-key of rows an older build
+ * stored under the index-bearing `pi-msg-<index>-…` id, a duplicate message
+ * identity that comes back after its one repair, and a session decision
+ * ledger (session_meta's bounded list of durable Pi decisions) too full to
+ * record a repair.
  */
 import { afterEach, expect, test } from "bun:test";
 import {
@@ -126,7 +127,8 @@ test("issue 650 r3: a row an older build stored under an index-bearing id moves 
 		capturePiServedArray(sessionId, [userMessage("§42§ Context notes", 5)], {
 			servedTagNumbers: [42],
 		});
-		// Now it sits at index 0: under the index form it would be a new id.
+		// The note now sits at index 0, so an index-bearing id would differ from
+		// the stored `pi-msg-1-…` one; the content-based id does not.
 		const served = await serveNote(db, sessionId, [note, hello]);
 		expect(served).toContain("§42§ Context notes: build is green");
 		const rows = db
@@ -136,7 +138,7 @@ test("issue 650 r3: a row an older build stored under an index-bearing id moves 
 			.all(sessionId) as { tag_number: number; message_id: string }[];
 		expect(rows).toHaveLength(1);
 		expect(isPiContentFallbackId(rows[0]!.message_id)).toBe(true);
-		// And it stays there on the next pass.
+		// The next pass serves the note with the same number again.
 		expect(await serveNote(db, sessionId, [note, hello])).toBe(served);
 	} finally {
 		db.close();
@@ -193,7 +195,8 @@ test("issue 650 r3: a message duplicate that recurs after its repair is served w
 		capturePiServedArray(sessionId, [], { servedTagNumbers: [20, 440] });
 		clearPiServedArraySession(sessionId);
 		expect(adoptReal(db, sessionId, fingerprint).rebuilds).toHaveLength(1);
-		// A faulty writer brings the same identity back under another number.
+		// Another row for the same message part appears under a third number
+		// (a writer that should not exist, as in the guard tests).
 		seedMessageRow(db, sessionId, "pi-msg-3-7-user:p0", 600, fingerprint);
 		capturePiServedArray(sessionId, [], { servedTagNumbers: [600] });
 		clearPiServedArraySession(sessionId);

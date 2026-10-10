@@ -2956,7 +2956,10 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 	}
 }
 
-/** Thrown inside a fold's savepoint to undo a repair whose rebuild record could not be written. */
+/**
+ * Thrown inside the savepoint that merges duplicate tag rows, to undo a repair
+ * whose pending-rebuild record could not be written.
+ */
 class PiIdentityRebuildUnrecorded extends Error {}
 
 interface AdoptPiFallbackTagsOptions {
@@ -3320,8 +3323,8 @@ function adoptPiFallbackTags(
 			const decision = canonical.length
 				? plan(collisionRows, repairKey, [], served, cachedSurvivor)
 				: { rebuilding: undefined };
-			// A recurrence after its repair: leave both rows; this pass serves the
-			// target's own number as tagging finds it.
+			// The duplicate came back after its one repair: leave the fallback row
+			// and the target's row as they are; tagging serves the target's row.
 			if (decision === null) continue;
 			const rebuilding = decision.rebuilding;
 			if (
@@ -3486,7 +3489,8 @@ function adoptPiFallbackTags(
 					sessionId,
 					fingerprint,
 				).filter((c) => isPiIndexFallbackId(piFallbackBaseId(c.messageId)));
-				// Oldest first, so a later duplicate folds into the earlier re-key.
+				// Oldest first: the first old row is re-keyed, and any later old row
+				// for the same message is then merged into it (proven or repaired).
 				legacy.sort((left, right) => left.tagNumber - right.tagNumber);
 				for (const base of new Set(
 					legacy.map((c) => piFallbackBaseId(c.messageId)),
@@ -3549,8 +3553,8 @@ function adoptPiFallbackTags(
 								served,
 								cachedSurvivor,
 							);
-				// A recurrence after its repair: leave both rows; this pass serves the
-				// owner's own number as tagging finds it.
+				// The duplicate came back after its one repair: leave the fallback-owner
+				// row and the current owner's row; tagging serves the current owner's.
 				if (decision === null) continue;
 				const rebuilding = decision.rebuilding;
 				if (
