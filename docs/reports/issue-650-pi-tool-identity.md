@@ -1,5 +1,12 @@
 # issue 650: Pi tool identity regression and byte-safe recovery
 
+Historical record for commit `9ce293ec`. The independent review found that the
+reporter's realistic last-served state is **154 active**, not cached 8 dropped.
+The later resolution preserves 154, requeues the losing drop, and supports a
+one-shot declared rebuild when bytes are missing. See
+`issue-650-review-resolution.md`; the original conditional fixtures below do not
+establish recovery of the realistic reporter state.
+
 ## Reproduction and cause
 
 The deterministic reproduction uses a **real Pi SDK session**, a localhost

@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as embedding from "@magic-context/core/features/magic-context/memory/embedding";
 import * as projectIdentity from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getAutoSearchHintDecisions } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
 import {
 	adoptPiFallbackMessageTag,
 	PiTagIdentityConflictError,
@@ -377,26 +378,22 @@ test("r2: same-connection revision change discovers a historical fallback drop",
 		});
 		restore = () => spy.mockRestore();
 		const next = [structuredClone(historical), userMessage("tail", 2)];
-		// The local revision change must discover the dropped alias. Refuse
-		// instead of changing the active message already returned to Pi.
-		await expect(
-			handler(
-				{ messages: next },
-				fakeContext(sessionId, process.cwd(), ["history", "tail"], next),
-			),
-		).rejects.toBeInstanceOf(PiTagIdentityConflictError);
+		// The changed local revision must discover the dropped alias, preserving
+		// active bytes now and leaving the drop queued for a later execute.
+		const result = await handler(
+			{ messages: next },
+			fakeContext(sessionId, process.cwd(), ["history", "tail"], next),
+		);
 		expect(inserted).toBe(true);
-		expect(textOf(first.messages[0])).toBe("§1§ historical text");
+		expect(textOf(result.messages[0])).toBe("§1§ historical text");
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([1]);
 		expect(
 			db
 				.prepare(
-					"SELECT tag_number,status FROM tags WHERE session_id=? ORDER BY tag_number",
+					"SELECT tag_number,status FROM tags WHERE session_id=? AND tag_number IN (1,9) ORDER BY tag_number",
 				)
 				.all(sessionId),
-		).toEqual([
-			{ tag_number: 1, status: "active" },
-			{ tag_number: 9, status: "dropped" },
-		]);
+		).toEqual([{ tag_number: 1, status: "active" }]);
 	} finally {
 		restore?.();
 		clearContextHandlerSession(sessionId);

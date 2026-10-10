@@ -7,7 +7,7 @@ import {
 } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
-import { removePendingOp } from "./storage-ops";
+import { queuePendingOp, removePendingOp } from "./storage-ops";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -1926,13 +1926,18 @@ function selectPiTagSurvivor<T extends { tagNumber: number; status: string }>(
     servedTagNumbers: ReadonlySet<number>,
     cachedSurvivor: number | undefined,
     kind: "tool" | "message",
+    rebuildingSurvivor?: number,
 ): T {
     const served = rows.filter((row) => servedTagNumbers.has(row.tagNumber));
     const cached =
         cachedSurvivor === undefined
             ? undefined
             : rows.find((row) => row.tagNumber === cachedSurvivor);
-    if ((cachedSurvivor !== undefined && !cached) || (served.length !== 1 && !cached)) {
+    const rebuilding = rows.find((row) => row.tagNumber === rebuildingSurvivor);
+    if (
+        (cachedSurvivor !== undefined && !cached) ||
+        (served.length !== 1 && !cached && !rebuilding)
+    ) {
         throw new PiTagIdentityConflictError(
             served.length > 1
                 ? `Conflicting served Pi ${kind} tag numbers; no byte-safe cached survivor is proven`
@@ -1940,19 +1945,23 @@ function selectPiTagSurvivor<T extends { tagNumber: number; status: string }>(
             kind,
         );
     }
-    const kept = cached ?? served[0];
+    const kept = cached ?? rebuilding ?? served[0];
     if (!kept) throw new PiTagIdentityConflictError("no served survivor is proven", kind);
-    if (
-        (cached || served.length) &&
-        kept.status !== "dropped" &&
-        rows.some((row) => row.tagNumber !== kept.tagNumber && row.status === "dropped")
-    ) {
-        throw new PiTagIdentityConflictError(
-            `a duplicate's dropped status would change the served ${kind} bytes`,
-            kind,
-        );
-    }
     return kept;
+}
+
+function foldPiIdentityDuplicate(
+    db: Database,
+    sessionId: string,
+    kept: PiFallbackFoldTagRow,
+    duplicate: PiFallbackFoldTagRow,
+): void {
+    const owesDrop = kept.status !== "dropped" && duplicate.status === "dropped";
+    // Keep the status already shown for this number. A dropped duplicate's
+    // removal must not turn the active result into a dropped placeholder now;
+    // queue that drop for a later pass permitted to edit managed history.
+    foldDuplicateIntoSurvivor(db, sessionId, kept, duplicate, true, false);
+    if (owesDrop) queuePendingOp(db, sessionId, kept.tagNumber, "drop");
 }
 
 export function getPiMessageTagCandidates(db: Database, sessionId: string, messageId: string) {
@@ -1977,6 +1986,7 @@ export function adoptPiFallbackToolOwnerTag(
     newOwnerMessageId: string,
     servedTagNumbers: ReadonlySet<number> = new Set(),
     cachedSurvivor?: number,
+    rebuildingSurvivor?: number,
 ): PiFallbackTagAdoptionResult {
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
@@ -2014,9 +2024,10 @@ export function adoptPiFallbackToolOwnerTag(
         servedTagNumbers,
         cachedSurvivor,
         "tool",
+        rebuildingSurvivor,
     );
     if (kept.tagNumber === survivor.tagNumber) {
-        foldDuplicateIntoSurvivor(db, sessionId, survivor, existing);
+        foldPiIdentityDuplicate(db, sessionId, survivor, existing);
         db.prepare(
             "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",
         ).run(newOwnerMessageId, sessionId, tagNumber);
@@ -2024,7 +2035,7 @@ export function adoptPiFallbackToolOwnerTag(
     }
     // The existing real-owner row's number was proved by returned bytes or the
     // served-number ledger, so it survives even if the fallback was allocated first.
-    foldDuplicateIntoSurvivor(db, sessionId, existing, survivor);
+    foldPiIdentityDuplicate(db, sessionId, existing, survivor);
     return {
         action: "folded",
         tagNumber: existing.tagNumber,
@@ -2040,6 +2051,7 @@ export function adoptPiFallbackMessageTag(
     newRealMessageId: string,
     servedTagNumbers: ReadonlySet<number> = new Set(),
     cachedSurvivor?: number,
+    rebuildingSurvivor?: number,
 ): PiFallbackTagAdoptionResult {
     if (oldFallbackMessageId.startsWith(WHITESPACE_ASSISTANT_INERT_MESSAGE_PREFIX)) {
         return { action: "skipped" };
@@ -2080,11 +2092,12 @@ export function adoptPiFallbackMessageTag(
         servedTagNumbers,
         cachedSurvivor,
         "message",
+        rebuildingSurvivor,
     );
     const deletedTagNumbers: number[] = [];
     for (const duplicate of [survivor, ...duplicates]) {
         if (duplicate.tagNumber === realSurvivor.tagNumber) continue;
-        foldDuplicateIntoSurvivor(db, sessionId, realSurvivor, duplicate);
+        foldPiIdentityDuplicate(db, sessionId, realSurvivor, duplicate);
         deletedTagNumbers.push(duplicate.tagNumber);
     }
     if (realSurvivor.tagNumber === tagNumber) {

@@ -3,7 +3,11 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 
 const PREFIX = "pi-content-replay-v1:";
 export const PI_CONTENT_DECISION_LIMIT = 4096;
-export type PiContentDecisionKind = "reminder-strip" | "seam-temporal-strip";
+export type PiContentDecisionKind =
+    | "reminder-strip"
+    | "seam-temporal-strip"
+    | "tag-identity-repair-once"
+    | "tag-identity-repair-pending";
 
 export function encodePiContentDecision(kind: PiContentDecisionKind, messageId: string): string {
     return PREFIX + JSON.stringify([kind, messageId]);
@@ -16,7 +20,10 @@ export function decodePiContentDecision(value: string): [PiContentDecisionKind, 
         if (
             Array.isArray(pair) &&
             pair.length === 2 &&
-            (pair[0] === "reminder-strip" || pair[0] === "seam-temporal-strip") &&
+            (pair[0] === "reminder-strip" ||
+                pair[0] === "seam-temporal-strip" ||
+                pair[0] === "tag-identity-repair-once" ||
+                pair[0] === "tag-identity-repair-pending") &&
             typeof pair[1] === "string" &&
             pair[1].length > 0
         )
@@ -80,6 +87,8 @@ export function freezePiContentDecision(
                         const decision = decodePiContentDecision(value);
                         return (
                             !decision ||
+                            decision[0] === "tag-identity-repair-once" ||
+                            decision[0] === "tag-identity-repair-pending" ||
                             !!(decision[0] === "seam-temporal-strip"
                                 ? ownsMessage.get(sessionId, `${decision[1]}:p`, `${decision[1]}:q`)
                                 : ownsTag.get(sessionId, decision[1]))

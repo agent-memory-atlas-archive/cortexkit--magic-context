@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
 import {
 	adoptPiFallbackToolOwnerTag,
 	insertTag,
@@ -389,21 +390,21 @@ test("issue 650: a dropped duplicate must not change served active survivor byte
 			0,
 			"pi-msg-0-20-assistant",
 		);
-		const before = db.prepare("SELECT * FROM tags ORDER BY tag_number").all();
-		expect(() =>
-			adoptPiFallbackToolOwnerTag(
-				db,
-				"status-guard",
-				154,
-				"call",
-				"pi-msg-0-20-assistant",
-				"real",
-				new Set([154]),
-			),
-		).toThrow(PiTagIdentityConflictError);
-		expect(db.prepare("SELECT * FROM tags ORDER BY tag_number").all()).toEqual(
-			before,
+		adoptPiFallbackToolOwnerTag(
+			db,
+			"status-guard",
+			154,
+			"call",
+			"pi-msg-0-20-assistant",
+			"real",
+			new Set([154]),
 		);
+		expect(db.prepare("SELECT tag_number,status FROM tags").all()).toEqual([
+			{ tag_number: 154, status: "active" },
+		]);
+		expect(getPendingOps(db, "status-guard").map((op) => op.tagId)).toEqual([
+			154,
+		]);
 	} finally {
 		db.close();
 	}

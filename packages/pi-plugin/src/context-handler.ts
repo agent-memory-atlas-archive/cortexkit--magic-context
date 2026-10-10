@@ -250,6 +250,7 @@ import type { ModelInput } from "@magic-context/core/shared/model-resolution";
 import { isSaneLimit } from "@magic-context/core/shared/models-dev-cache";
 import {
 	guardSqliteTransformPass,
+	type Statement as PreparedStatement,
 	withAsyncPrivilegedWriter,
 	withoutSqliteTransformPass,
 	withSqliteBackgroundWriter,
@@ -367,10 +368,19 @@ import {
 	PiDegradedPassError,
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
+import {
+	acknowledgePiIdentityRebuilds,
+	claimPiIdentityRepair,
+	PI_TAG_IDENTITY_REPAIR_REASON,
+	type PiIdentityRebuild,
+	queuePiIdentityRebuild,
+	readPiIdentityRebuilds,
+} from "./pi-tag-identity-repair";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
 	piAssistantToolIdentity,
 	piCachedToolSurvivor,
+	readPiServedCachedArray,
 } from "./pi-tool-identity";
 import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
@@ -2706,27 +2716,85 @@ function parsePiFallbackToolOwnerId(
 	return { timestamp, role: match[2] ?? "" };
 }
 
+const piToolGuardStatements = new WeakMap<ContextDatabase, PreparedStatement>();
+const piToolGuardVersionStatements = new WeakMap<
+	ContextDatabase,
+	PreparedStatement
+>();
+const piToolGuardFallbackStatements = new WeakMap<
+	ContextDatabase,
+	PreparedStatement
+>();
+const piToolGuardCallIds = new WeakMap<
+	ContextDatabase,
+	Map<string, { version: number; ids: Set<string> }>
+>();
+function fallbackPiToolCallIds(
+	db: ContextDatabase,
+	sessionId: string,
+): Set<string> {
+	let statement = piToolGuardVersionStatements.get(db);
+	if (!statement) {
+		statement = db.prepare(
+			"SELECT tags_version AS version FROM session_meta WHERE session_id = ?",
+		);
+		piToolGuardVersionStatements.set(db, statement);
+	}
+	const version =
+		(statement.get(sessionId) as { version: number } | undefined)?.version ?? 0;
+	let sessions = piToolGuardCallIds.get(db);
+	if (!sessions) {
+		sessions = new Map();
+		piToolGuardCallIds.set(db, sessions);
+	}
+	const cached = sessions.get(sessionId);
+	if (cached?.version === version) return cached.ids;
+	let fallbackStatement = piToolGuardFallbackStatements.get(db);
+	if (!fallbackStatement) {
+		fallbackStatement = db.prepare(
+			"SELECT DISTINCT message_id AS callId FROM tags WHERE session_id = ? AND type = 'tool' AND tool_owner_message_id LIKE 'pi-msg-%'",
+		);
+		piToolGuardFallbackStatements.set(db, fallbackStatement);
+	}
+	const ids = new Set(
+		(fallbackStatement.all(sessionId) as { callId: string }[]).map(
+			(row) => row.callId,
+		),
+	);
+	if (!sessions.has(sessionId) && sessions.size >= MAX_TRACKED_SESSIONS)
+		sessions.delete(sessions.keys().next().value as string);
+	sessions.set(sessionId, { version, ids });
+	return ids;
+}
+
 function guardPiToolAllocations(
 	db: ContextDatabase,
 	sessionId: string,
 	messages: readonly PiAgentMessage[],
 	resolveId: (msg: unknown, index: number) => string | undefined,
+	tagger?: Tagger,
 ): void {
-	const hasFallback = hasPersistedPiFallbackToolOwnerTags(db, sessionId);
+	const fallbackCalls = fallbackPiToolCallIds(db, sessionId);
 	for (let index = 0; index < messages.length; index++) {
 		const message = messages[index];
 		if (message?.role !== "assistant" || !Array.isArray(message.content))
 			continue;
 		const owner = resolveId(message, index);
 		if (!owner) continue;
-		if (!owner.startsWith("pi-msg-") && !hasFallback) continue;
 		for (const part of message.content) {
 			if (part.type !== "toolCall") continue;
-			const rows = db
-				.prepare(
+			if (tagger?.getToolTag(sessionId, part.id, owner) !== undefined) continue;
+			// A temporary owner with no timestamp cannot be matched to an assistant
+			// entry. Only a tool with that same call id needs its ambiguity check.
+			if (!owner.startsWith("pi-msg-") && !fallbackCalls.has(part.id)) continue;
+			let statement = piToolGuardStatements.get(db);
+			if (!statement) {
+				statement = db.prepare(
 					"SELECT tool_owner_message_id AS owner FROM tags WHERE session_id = ? AND type = 'tool' AND message_id = ? AND tool_owner_message_id IS NOT NULL",
-				)
-				.all(sessionId, part.id) as { owner: string }[];
+				);
+				piToolGuardStatements.set(db, statement);
+			}
+			const rows = statement.all(sessionId, part.id) as { owner: string }[];
 			if (rows.some((row) => row.owner === owner)) continue;
 			// A temporary assistant id can mean the same persisted call was moved
 			// or edited by another extension. Until its timestamp proves a distinct
@@ -2804,6 +2872,7 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 }
 
 interface AdoptPiFallbackTagsOptions {
+	allowUnprovenRebuild?: boolean;
 	messages?: readonly PiAgentMessage[];
 	resolveStableId?: (msg: unknown, index: number) => string | undefined;
 	hasFallbackMessageTags?: boolean;
@@ -2928,7 +2997,56 @@ function adoptPiFallbackTags(
 	tagger: Tagger,
 	fingerprintById: ReadonlyMap<string, string>,
 	options: AdoptPiFallbackTagsOptions = {},
-): void {
+): { protectedTagNumbers: Set<number>; rebuilds: PiIdentityRebuild[] } {
+	const pendingRebuilds = readPiIdentityRebuilds(db, sessionId);
+	const outcome = {
+		protectedTagNumbers: new Set<number>(
+			pendingRebuilds.map((repair) => repair.kept),
+		),
+		rebuilds: pendingRebuilds,
+	};
+	const claimed = new Set<string>();
+	const newRebuilds: PiIdentityRebuild[] = [];
+	const plan = (
+		rows: readonly { tagNumber: number }[],
+		key: string,
+		kind: "tool" | "message",
+		served: ReadonlySet<number>,
+		cached: number | undefined,
+	) => {
+		if (!claimed.has(key)) {
+			claimPiIdentityRepair(db, sessionId, key, kind);
+			claimed.add(key);
+		}
+		const needsProof =
+			cached === undefined &&
+			rows.filter((row) => served.has(row.tagNumber)).length !== 1;
+		const body =
+			needsProof && options.allowUnprovenRebuild
+				? readPiServedCachedArray(sessionId)
+				: undefined;
+		return needsProof && options.allowUnprovenRebuild && !body?.messages.length
+			? Math.max(...rows.map((row) => row.tagNumber))
+			: undefined;
+	};
+	const folded = (
+		adoption: ReturnType<typeof adoptPiFallbackMessageTag>,
+		key: string,
+		kind: "tool" | "message",
+		rebuilding: number | undefined,
+	) => {
+		if (adoption.action !== "folded") return;
+		outcome.protectedTagNumbers.add(adoption.tagNumber);
+		if (rebuilding === undefined) return;
+		const repair = {
+			key,
+			kept: adoption.tagNumber,
+			removed: adoption.deletedTagNumbers,
+			kind,
+		};
+		queuePiIdentityRebuild(db, sessionId, repair);
+		newRebuilds.push(repair);
+	};
 	// Prepare message identities and SQL bind lists before taking the writer.
 	// Another connection can add a synthetic tag while this work runs, so validate
 	// the discovery revision after BEGIN; never trust an earlier negative read.
@@ -2939,7 +3057,7 @@ function adoptPiFallbackTags(
 			? buildPiToolOwnerMap(options.messages, options.resolveStableId)
 			: null;
 	if (!batches.length && !ownerMap?.size && !options.rebuildFingerprints)
-		return;
+		return outcome;
 	const revision = () => readPiAdoptionRevision(db);
 	const beforeDiscovery = revision();
 	// Discover candidates without blocking writers and prepare their target ids.
@@ -3067,10 +3185,15 @@ function adoptPiFallbackTags(
 								collisionRows,
 							)
 						: undefined;
+					const repairKey = JSON.stringify(["message", realContentId]);
+					const rebuilding = canonical.length
+						? plan(collisionRows, repairKey, "message", served, cachedSurvivor)
+						: undefined;
 					if (
 						canonical.length &&
 						!collisionRows.some((row) => served.has(row.tagNumber)) &&
-						cachedSurvivor === undefined
+						cachedSurvivor === undefined &&
+						rebuilding === undefined
 					) {
 						throw new PiTagIdentityConflictError(
 							"duplicate message identities have no proven served-byte survivor",
@@ -3085,7 +3208,9 @@ function adoptPiFallbackTags(
 						realContentId,
 						served,
 						cachedSurvivor,
+						rebuilding,
 					);
+					folded(adoption, repairKey, "message", rebuilding);
 					if (adoption.action !== "skipped") {
 						// Drop stale fallback and collision aliases, then bind the survivor
 						// under the real key so the same-pass exact lookup hits it.
@@ -3128,11 +3253,23 @@ function adoptPiFallbackTags(
 									existingNumber,
 								]),
 							);
+				const repairKey = JSON.stringify(["tool", realOwnerId, row.callId]);
+				const rebuilding =
+					existingNumber === null
+						? undefined
+						: plan(
+								[{ tagNumber: row.tagNumber }, { tagNumber: existingNumber }],
+								repairKey,
+								"tool",
+								served,
+								cachedSurvivor,
+							);
 				if (
 					existingNumber !== null &&
 					!served.has(existingNumber) &&
 					!served.has(row.tagNumber) &&
-					cachedSurvivor === undefined
+					cachedSurvivor === undefined &&
+					rebuilding === undefined
 				) {
 					throw new PiTagIdentityConflictError(
 						"duplicate tool identities have no proven served-byte survivor",
@@ -3149,7 +3286,9 @@ function adoptPiFallbackTags(
 						? new Set([cachedSurvivor])
 						: served,
 					cachedSurvivor,
+					rebuilding,
 				);
+				folded(adoption, repairKey, "tool", rebuilding);
 				if (adoption.action !== "skipped") {
 					tagger.unbindToolTag(sessionId, row.toolOwnerMessageId, row.callId);
 					if (adoption.action === "folded") {
@@ -3179,6 +3318,15 @@ function adoptPiFallbackTags(
 			}
 		}
 	});
+	if (newRebuilds.length) {
+		outcome.rebuilds = readPiIdentityRebuilds(db, sessionId);
+		sessionLog(
+			sessionId,
+			`tag identity repair without last-served evidence: session=${sessionId} kept=${newRebuilds.map((repair) => repair.kept).join(",")} removed=${newRebuilds.flatMap((repair) => repair.removed).join(",")}`,
+		);
+	}
+	outcome.rebuilds = readPiIdentityRebuilds(db, sessionId);
+	return outcome;
 }
 
 interface PiHistorianStateSnapshot {
@@ -4508,6 +4656,7 @@ export function registerPiContextHandler(
 				}),
 			);
 			logTransformTiming(sessionId, "runPipeline", tRunPipeline);
+			if (result.identityRebuilt) schedulerDecision = "execute";
 			const postPipelineStart = performance.now();
 			const tTransformDecision = performance.now();
 			// Replace the reuse window only after a successful pass. An id absent from
@@ -5190,6 +5339,8 @@ export function registerPiContextHandler(
 					serializedOutput,
 					assertCurrentPass: budget.assertOutcome,
 				});
+			if (!budget.sideTurn && result.identityRebuilt)
+				acknowledgePiIdentityRebuilds(options.db, sessionId);
 			if (!budget.sideTurn)
 				captureOpencodeReasoningBudgetStatus(
 					sessionId,
@@ -6514,6 +6665,7 @@ interface PiChannelBaselineSnapshot {
 }
 
 interface RunPipelineResult {
+	identityRebuilt?: boolean;
 	messages: unknown[];
 	servedTagNumbers?: ReadonlySet<number>;
 	/** Whether heuristic cleanup actually ran on this pass. */
@@ -7207,7 +7359,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				publishedM1RefreshedThisPass ||
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
-	const isCacheBustingPass = hasReclaimRide(rideSignals);
+	let isCacheBustingPass = hasReclaimRide(rideSignals);
 	if (args.temporalAwareness && isCacheBustingPass) {
 		temporalDecisions = freezeTemporalDecisions(
 			args.db,
@@ -7224,7 +7376,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			recordFirstApplicationWireEdit(true);
 		}
 	}
-	const publishedWorkDrainAllowed = isCacheBustingPass;
+	let publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
 		args.protectedTokens !== undefined;
@@ -7287,12 +7439,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			: undefined,
 	);
 	args.assertCurrentPass?.();
-	adoptPiFallbackTags(
+	const identityAdoption = adoptPiFallbackTags(
 		args.db,
 		args.sessionId,
 		args.tagger,
 		entryFingerprintByMessageId,
 		{
+			allowUnprovenRebuild: true,
 			messages: args.messages as PiAgentMessage[],
 			resolveStableId: stableIdResolver,
 			hasFallbackMessageTags,
@@ -7317,11 +7470,28 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				: undefined,
 		},
 	);
+	const identityRebuild = identityAdoption.rebuilds.length > 0;
+	if (identityRebuild) {
+		args.schedulerDecision = "execute";
+		isCacheBustingPass = true;
+		publishedWorkDrainAllowed = true;
+		if (piM0State) {
+			clearM0M1PiCache(args.db, args.sessionId, PI_TAG_IDENTITY_REPAIR_REASON);
+			piM0State.preparedPrefix = undefined;
+			piM0State.freezePrefixForPass = false;
+			injectionPassSnapshot = createPiM0M1PassSnapshot({
+				db: args.db,
+				sessionId: args.sessionId,
+				compactionOff: false,
+			});
+		}
+	}
 	guardPiToolAllocations(
 		args.db,
 		args.sessionId,
 		args.messages as PiAgentMessage[],
 		stableIdResolver,
+		args.tagger,
 	);
 	guardPiMessageAllocations(
 		args.db,
@@ -7429,15 +7599,36 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			}
 		}
 	}
-	const newTargets = protectNewTagMutations(
-		mutationView.map((message) => ({
-			info: message.info,
-			parts: message.parts,
-		})),
-		targets,
-		protectedThinkingProxies,
-		args.reasoningClearing?.prefixBound === true,
+	const newTargets = new Map(
+		protectNewTagMutations(
+			mutationView.map((message) => ({
+				info: message.info,
+				parts: message.parts,
+			})),
+			targets,
+			protectedThinkingProxies,
+			args.reasoningClearing?.prefixBound === true,
+		),
 	);
+	for (const number of identityAdoption.protectedTagNumbers) {
+		const target = newTargets.get(number);
+		if (!target) continue;
+		// A drop recovered from the deleted tag remains queued. This request must
+		// keep the active bytes already returned; a later execute may change them.
+		newTargets.set(number, {
+			...target,
+			thinkingDropProtected: true,
+			thinkingRewriteProtected: true,
+			canDrop: () => false,
+			drop: () => "incomplete",
+			truncate: () => "incomplete",
+			skeletonReal: () => "incomplete",
+			skeletonStripped: () => "incomplete",
+			editMarker: () => "incomplete",
+			editMarkerStripped: () => "incomplete",
+			setContent: () => false,
+		});
+	}
 	if (thinkingRecovery.restore) {
 		transcript.commit();
 		restoreOriginals = captureOriginalTurn(
@@ -7563,6 +7754,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		getActiveTagsBySession(args.db, args.sessionId),
 		args.protectedTools,
 	);
+	for (const number of identityAdoption.protectedTagNumbers)
+		protectedToolTags.add(number);
 	const protectionWindowForPass = getProtectionWindowForSession(
 		args.db,
 		args.sessionId,
@@ -7624,6 +7817,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						? []
 						: protectedTagNumbersForPass),
 					...protectedToolTags,
+					...identityAdoption.protectedTagNumbers,
 				]),
 				pendingOperationTags,
 				pendingOps,
@@ -8812,16 +9006,20 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			}
 		}
 	}
-	const materializeReason = injectionResult?.m0Reason ?? null;
+	const materializeReason = identityRebuild
+		? PI_TAG_IDENTITY_REPAIR_REASON
+		: (injectionResult?.m0Reason ?? null);
 	const bustedThisPass =
+		identityRebuild ||
 		firstRenderBust ||
 		pendingOpsDidMutate ||
 		heuristicOrReasoningDidMutate ||
 		autoReclaimDidMutateThisPass ||
 		materialized ||
 		historyWasConsumedThisPass;
-	const calibrationBustReason =
-		materialized || firstRenderBust
+	const calibrationBustReason = identityRebuild
+		? PI_TAG_IDENTITY_REPAIR_REASON
+		: materialized || firstRenderBust
 			? "fold"
 			: args.forceMaterialization
 				? "force"
@@ -8902,9 +9100,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	return {
 		messages: outputMessages,
+		identityRebuilt: identityRebuild,
 		servedTagNumbers,
 		heuristicsExecuted,
-		executedWorkThisPass,
+		executedWorkThisPass: executedWorkThisPass || identityRebuild,
 		historyInjected: injectionResult?.injected ?? false,
 		syntheticLeadingCount: injectionResult?.syntheticLeadingCount ?? 0,
 		heuristicsResult,

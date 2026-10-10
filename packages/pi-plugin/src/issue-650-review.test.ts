@@ -2,12 +2,12 @@
  * Review probes for Pi tool-tag identity: one tool call must never carry two
  * different §N§ tag numbers, and repairing a duplicate (one row on the real
  * assistant entry, one on a temporary `pi-msg-` owner) must keep exactly the
- * number and status the model was last served. Tests marked `test.failing`
- * assert the behaviour these probes expect and currently fail. Each one is paired with a passing test that pins the
- * current behaviour, so the expected failure cannot pass for an unrelated reason
- * such as a broken fixture.
+ * number and status the model was last served. The former finding assertions
+ * are now normal regression tests for status-preserving recovery and
+ * accurate message refusal; their partner tests preserve the byte-safety checks.
  */
 import { afterEach, expect, test } from "bun:test";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
 import {
 	adoptPiFallbackMessageTag,
 	adoptPiFallbackToolOwnerTag,
@@ -199,30 +199,21 @@ test("review 650: storage survivor matrix never changes the last-served number o
 						if (typeof lastServed === "number") {
 							expect(after[0]?.tag_number, key).toBe(lastServed);
 							expect(after[0]?.status, key).toBe(statusOf[lastServed]);
+							if (
+								statusOf[lastServed] === "active" &&
+								(fallbackStatus === "dropped" || realStatus === "dropped")
+							)
+								expect(
+									getPendingOps(db, sessionId).map((op) => op.tagId),
+									key,
+								).toEqual([lastServed]);
 						}
 					} finally {
 						db.close();
 					}
 				}
-	// No combination changed the last-served number or status. These are the
-	// combinations that refuse even though a safe repair exists: keep the
-	// last-served row as it is, delete the duplicate without copying its dropped
-	// status, and the served array stays identical. Each one is an active
-	// last-served row whose duplicate is dropped.
-	expect(refusedWithByteSafeFold.sort()).toEqual(
-		[
-			"fallback=active real=dropped served=[154] cached=-",
-			"fallback=active real=dropped served=[] cached=154",
-			"fallback=active real=dropped served=[154] cached=154",
-			"fallback=active real=dropped served=[8] cached=154",
-			"fallback=active real=dropped served=[8,154] cached=154",
-			"fallback=dropped real=active served=[8] cached=-",
-			"fallback=dropped real=active served=[] cached=8",
-			"fallback=dropped real=active served=[154] cached=8",
-			"fallback=dropped real=active served=[8] cached=8",
-			"fallback=dropped real=active served=[8,154] cached=8",
-		].sort(),
-	);
+	// Every proven survivor retains its number and status; losing drops remain queued.
+	expect(refusedWithByteSafeFold).toEqual([]);
 });
 
 // How the reported duplicate arises: tag 8 (real assistant owner) was served as
@@ -237,7 +228,7 @@ function reporterCachedBytes(): PiMessage[] {
 	];
 }
 
-test("review 650: realistic reporter state — cached bytes prove 154 active, and adoption still refuses", () => {
+test("review 650: realistic reporter state — cached 154 stays active and the losing drop is queued", () => {
 	const db = createTestDb();
 	const sessionId = session("reporter-cached-154");
 	try {
@@ -249,24 +240,19 @@ test("review 650: realistic reporter state — cached bytes prove 154 active, an
 				{ tagNumber: FALLBACK, status: "active" },
 			]),
 		).toBe(FALLBACK);
-		const before = toolRows(db, sessionId);
-		let thrown: unknown;
-		try {
-			adoptRealOwner(db, sessionId);
-		} catch (error) {
-			thrown = error;
-		}
-		expect(thrown).toBeInstanceOf(PiTagIdentityConflictError);
-		expect((thrown as Error).message).toContain(
-			"a duplicate's dropped status would change the served tool bytes",
-		);
-		expect(toolRows(db, sessionId)).toEqual(before);
+		adoptRealOwner(db, sessionId);
+		expect(toolRows(db, sessionId)).toEqual([
+			{ tag_number: FALLBACK, status: "active", tool_owner_message_id: "real" },
+		]);
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([
+			FALLBACK,
+		]);
 	} finally {
 		db.close();
 	}
 });
 
-test.failing("review 650 finding: realistic reporter state should self-repair to the served 154 active row", () => {
+test("review 650 finding: realistic reporter state should self-repair to the served 154 active row", () => {
 	const db = createTestDb();
 	const sessionId = session("reporter-cached-154-repair");
 	try {
@@ -281,7 +267,7 @@ test.failing("review 650 finding: realistic reporter state should self-repair to
 	}
 });
 
-test("review 650: reporter state after a restart without an LKG (the logged lkg_miss) refuses", () => {
+test("review 650: low-level adoption without a declared rebuild refuses absent LKG evidence", () => {
 	const db = createTestDb();
 	const sessionId = session("reporter-no-lkg");
 	try {
@@ -524,7 +510,15 @@ test("review 650: the real context handler refuses a tool identity conflict with
 			40,
 			"pi-msg-1-20-assistant",
 		);
-		capturePiServedArray(sessionId, [], { servedTagNumbers: [REAL, FALLBACK] });
+		serveCached(
+			sessionId,
+			[
+				assistantToolCall("call", "codemode", {}, 20),
+				toolResultMessage("call", "[dropped §8§]", 21),
+				userMessage("quoted §154§", 22),
+			],
+			[REAL, FALLBACK],
+		);
 		registerPiContextHandler(
 			{
 				...fake.pi,
@@ -598,7 +592,7 @@ function seedMessageConflict(db: Database, sessionId: string): void {
 	insertTag(db, sessionId, "pi-msg-0-5-user:p0", "message", 233, 440);
 }
 
-test("review 650: a served message-tag conflict (issue comment 2) is still not an identity refusal", () => {
+test("review 650: a served message-tag conflict (issue comment 2) has an accurate identity refusal", () => {
 	const db = createTestDb();
 	try {
 		seedMessageConflict(db, "650-review-message");
@@ -615,19 +609,17 @@ test("review 650: a served message-tag conflict (issue comment 2) is still not a
 		} catch (error) {
 			thrown = error;
 		}
-		expect((thrown as Error).message).toBe(
-			"Conflicting served Pi message tag numbers; refusing identity adoption",
+		expect((thrown as Error).message).toContain(
+			"message-tag identity conflict",
 		);
-		// The context handler wraps every failure that is not a typed identity
-		// conflict in PiStorageBusyError, so the user again sees "storage is busy;
-		// send your message again".
-		expect(findPiTagIdentityConflict(thrown)).toBeUndefined();
+		expect((thrown as Error).message).not.toContain("storage is busy");
+		expect(findPiTagIdentityConflict(thrown)).toBeDefined();
 	} finally {
 		db.close();
 	}
 });
 
-test.failing("review 650 finding: a served message-tag conflict should refuse as an identity conflict", () => {
+test("review 650 finding: a served message-tag conflict should refuse as an identity conflict", () => {
 	const db = createTestDb();
 	try {
 		seedMessageConflict(db, "650-review-message-typed");
@@ -684,7 +676,7 @@ test("review 650: the collision fixtures' original unserved shape now refuses in
 	}
 });
 
-test("review 650: the accounting fixture's original status shape (served real active, dropped fallback) now refuses", () => {
+test("review 650: the accounting fixture's served real active row retains its status and queues the losing drop", () => {
 	const db = createTestDb();
 	const sessionId = session("fixture-dropped-fallback");
 	try {
@@ -709,16 +701,14 @@ test("review 650: the accounting fixture's original status shape (served real ac
 				servedTagNumbers: [20],
 			},
 		);
-		const before = toolRows(db, sessionId);
-		expect(() =>
-			__test.adoptPiFallbackTags(db, sessionId, createTagger(), new Map(), {
-				messages: [assistantToolCall("call", "Read", {}, 10)],
-				resolveStableId: () => "real",
-			}),
-		).toThrow(
-			"a duplicate's dropped status would change the served tool bytes",
-		);
-		expect(toolRows(db, sessionId)).toEqual(before);
+		__test.adoptPiFallbackTags(db, sessionId, createTagger(), new Map(), {
+			messages: [assistantToolCall("call", "Read", {}, 10)],
+			resolveStableId: () => "real",
+		});
+		expect(toolRows(db, sessionId)).toEqual([
+			{ tag_number: 20, status: "active", tool_owner_message_id: "real" },
+		]);
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([20]);
 	} finally {
 		db.close();
 	}

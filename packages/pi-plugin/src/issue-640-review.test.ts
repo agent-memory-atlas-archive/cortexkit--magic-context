@@ -6,7 +6,7 @@ import {
 	getOrCreateSessionMeta,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
-import { PiTagIdentityConflictError } from "@magic-context/core/features/magic-context/storage-tags";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -164,26 +164,22 @@ test("review: adoption discovers a racing drop for an already-served historical 
 		});
 		restore = () => spy.mockRestore();
 		const raw = [structuredClone(historical), userMessage("new tail", 2)];
-		// Re-discovery must still observe the sibling's drop, but adopting it
-		// cannot rewrite an already-returned active message into dropped bytes.
-		await expect(
-			handler(
-				{ messages: raw },
-				fakeContext(sessionId, dir, ["historical", "tail"], raw),
-			),
-		).rejects.toBeInstanceOf(PiTagIdentityConflictError);
+		// Re-discovery carries the sibling's drop as queued debt while preserving
+		// the already-returned active representation on this repair pass.
+		const result = await handler(
+			{ messages: raw },
+			fakeContext(sessionId, dir, ["historical", "tail"], raw),
+		);
 		expect(inserted).toBe(true);
-		expect(textOf(first.messages[0])).toBe("§1§ historical text");
+		expect(textOf(result.messages[0])).toBe("§1§ historical text");
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([1]);
 		expect(
 			db
 				.prepare(
-					"SELECT tag_number,status FROM tags WHERE session_id=? ORDER BY tag_number",
+					"SELECT tag_number,status FROM tags WHERE session_id=? AND tag_number IN (1,9) ORDER BY tag_number",
 				)
 				.all(sessionId),
-		).toEqual([
-			{ tag_number: 1, status: "active" },
-			{ tag_number: 9, status: "dropped" },
-		]);
+		).toEqual([{ tag_number: 1, status: "active" }]);
 	} finally {
 		restore?.();
 		clearContextHandlerSession(sessionId);

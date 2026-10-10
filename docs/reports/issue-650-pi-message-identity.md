@@ -1,5 +1,10 @@
 # issue 650: ordinary message-tag follow-up
 
+Historical record of the message extension. The later review resolution adds
+status-preserving drop debt and one-shot declared rebuilds without cached bytes;
+it supersedes the former refuse-on-status-change contract described below. See
+`issue-650-review-resolution.md` for the current behavior and policy choice.
+
 This extends the earlier repair for tool-call tag identities (commit `9ce293ec`)
 to the ordinary-user-message recurrence reported in issue 650 comment 2. The reported
 pair is an active real-entry `:p0` tag 20, with a queued drop, and an active
