@@ -486,6 +486,7 @@ export const __test = {
 	buildEntryFingerprintMap,
 	readPiEntryFingerprintCount: () => piEntryFingerprintCount,
 	resolvePiEventEntryIds,
+	readPiEntryAlignmentLaneCounts: () => ({ ...piEntryAlignmentLaneCounts }),
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
 	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
@@ -830,6 +831,8 @@ interface PiBranchEntryLookup {
 	alignmentChecks: Map<string, PiAlignmentCheck>;
 	/** How many emitted entries share each header key. */
 	alignmentHeaderCounts: Map<string, number>;
+	/** The entry with each header key; meaningful only where the count is 1. */
+	alignmentEntryIdByHeader: Map<string, string>;
 }
 
 /**
@@ -1912,34 +1915,162 @@ function findPiAlignmentMismatch(
 		// Slots Pi fills without an entry (the compaction summary and its system
 		// snapshot) stay unresolved either way.
 		if (id === undefined) continue;
-		const check = lookup.alignmentChecks.get(id);
-		const header = piContextHeaderFields(messages[index]);
-		if (
-			!check ||
-			!header ||
-			header.role !== check.role ||
-			!Object.is(header.timestamp, check.timestamp) ||
-			header.responseId !== check.responseId ||
-			header.toolCallId !== check.toolCallId
-		)
-			return index;
-		if (
-			(lookup.alignmentHeaderCounts.get(check.headerKey) ?? 0) > 1 &&
-			!piAlignedContentMatches(check, messages[index])
-		)
-			return index;
+		if (!piAlignedPositionMatches(lookup, id, messages[index])) return index;
 	}
 	return -1;
 }
 
+/** One position of findPiAlignmentMismatch: header, plus content where shared. */
+function piAlignedPositionMatches(
+	lookup: PiBranchEntryLookup,
+	id: string,
+	message: unknown,
+): boolean {
+	const check = lookup.alignmentChecks.get(id);
+	const header = piContextHeaderFields(message);
+	if (
+		!check ||
+		!header ||
+		header.role !== check.role ||
+		!Object.is(header.timestamp, check.timestamp) ||
+		header.responseId !== check.responseId ||
+		header.toolCallId !== check.toolCallId
+	)
+		return false;
+	return (
+		(lookup.alignmentHeaderCounts.get(check.headerKey) ?? 0) <= 1 ||
+		piAlignedContentMatches(check, message)
+	);
+}
+
+/**
+ * Entry ids for an event that cannot be aligned position by position, for
+ * example because another extension added a message or Pi left one out.
+ *
+ * Messages whose header belongs to exactly one emitted entry are anchors.
+ * Anchors must appear in projection order and each entry at most once;
+ * otherwise this returns null and the caller matches every message by content
+ * fingerprint instead. Between consecutive anchors (and before the first and
+ * after the last), a run of messages as long as the projected run it faces
+ * is aligned position by position, each position passing the same check as
+ * the positional lane. That keeps the real ids of messages only their
+ * position can identify, such as identical text sent twice in one
+ * millisecond, so a pass on this lane tags them exactly as an aligned pass
+ * does. Messages still unresolved are then matched one by one by content
+ * fingerprint, as in collectMessageEntryIdsByRef.
+ */
+function anchorPiEventEntryIds(
+	lookup: PiBranchEntryLookup,
+	aligned: readonly (string | undefined)[],
+	messages: readonly unknown[],
+): (string | undefined)[] | null {
+	const projectionIndex = new Map<string, number>();
+	for (let index = 0; index < aligned.length; index += 1) {
+		const id = aligned[index];
+		if (id !== undefined) projectionIndex.set(id, index);
+	}
+	const result: (string | undefined)[] = new Array(messages.length).fill(
+		undefined,
+	);
+	const used = new Set<string>();
+	const anchors: { message: number; projection: number }[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const header = piContextHeaderFields(messages[index]);
+		if (!header) continue;
+		const key = JSON.stringify([
+			header.responseId,
+			header.timestamp,
+			header.role,
+			header.toolCallId,
+		]);
+		if (lookup.alignmentHeaderCounts.get(key) !== 1) continue;
+		const id = lookup.alignmentEntryIdByHeader.get(key);
+		const position = id === undefined ? undefined : projectionIndex.get(id);
+		if (id === undefined || position === undefined) continue;
+		const previous = anchors.at(-1);
+		if (used.has(id) || (previous && position <= previous.projection))
+			return null;
+		anchors.push({ message: index, projection: position });
+		used.add(id);
+		result[index] = id;
+	}
+	const fillRun = (
+		messageStart: number,
+		messageEnd: number,
+		projectionStart: number,
+		projectionEnd: number,
+	) => {
+		if (messageEnd - messageStart !== projectionEnd - projectionStart) return;
+		for (let offset = 0; offset < messageEnd - messageStart; offset += 1) {
+			const id = aligned[projectionStart + offset];
+			const message = messages[messageStart + offset];
+			if (
+				id !== undefined &&
+				!used.has(id) &&
+				piAlignedPositionMatches(lookup, id, message)
+			) {
+				result[messageStart + offset] = id;
+				used.add(id);
+			}
+		}
+	};
+	let previousMessage = -1;
+	let previousProjection = -1;
+	for (const anchor of anchors) {
+		fillRun(
+			previousMessage + 1,
+			anchor.message,
+			previousProjection + 1,
+			anchor.projection,
+		);
+		previousMessage = anchor.message;
+		previousProjection = anchor.projection;
+	}
+	fillRun(
+		previousMessage + 1,
+		messages.length,
+		previousProjection + 1,
+		aligned.length,
+	);
+	for (let index = 0; index < messages.length; index += 1) {
+		if (result[index] !== undefined) continue;
+		const message = messages[index];
+		if (!message || typeof message !== "object") continue;
+		const byRef = lookup.entryIdByMessageRef.get(message);
+		if (byRef !== undefined && !used.has(byRef)) {
+			result[index] = byRef;
+			used.add(byRef);
+			continue;
+		}
+		const fingerprint = piMessageEntryFingerprint(message);
+		const bucket = fingerprint
+			? lookup.entryIdsByFingerprint.get(fingerprint)
+			: undefined;
+		// Same rule as collectMessageEntryIdsByRef: only a fingerprint that names
+		// exactly one entry, and only once.
+		const id = bucket?.length === 1 ? bucket[0] : undefined;
+		if (id !== undefined && !used.has(id)) {
+			result[index] = id;
+			used.add(id);
+		}
+	}
+	return result;
+}
+
 const piAlignmentMismatchLoggedSessions = new Set<string>();
+
+// Passes that could not use the positional lane, by the lane that resolved
+// them. Read only by tests that check which lane a pass took.
+const piEntryAlignmentLaneCounts = { anchored: 0, fingerprint: 0 };
 
 /**
  * Entry id for each event message. Pi builds the context from the branch
  * projection, so an event with the projection's length normally lines up
  * position by position; that lane is used only after every position passes
- * findPiAlignmentMismatch. Otherwise each message is matched by content
- * fingerprint in collectMessageEntryIdsByRef, leaving ambiguous ones unresolved.
+ * findPiAlignmentMismatch. Otherwise anchorPiEventEntryIds aligns the runs
+ * between messages it can identify by header, and only if those anchors are
+ * out of order is every message matched by content fingerprint in
+ * collectMessageEntryIdsByRef, leaving ambiguous ones unresolved.
  */
 function resolvePiEventEntryIds(
 	ctx: ExtensionContext,
@@ -1967,6 +2098,12 @@ function resolvePiEventEntryIds(
 			);
 		}
 	}
+	const anchored = anchorPiEventEntryIds(lookup, aligned, messages);
+	if (anchored) {
+		piEntryAlignmentLaneCounts.anchored += 1;
+		return anchored;
+	}
+	piEntryAlignmentLaneCounts.fingerprint += 1;
 	return collectMessageEntryIdsByRef(ctx, messages, sessionId, branchEntries);
 }
 
@@ -1978,6 +2115,10 @@ function addPiBranchEntryToLookup(
 	const check = piAlignmentCheckForEntry(entry);
 	if (check) {
 		lookup.alignmentChecks.set((entry as { id: string }).id, check);
+		lookup.alignmentEntryIdByHeader.set(
+			check.headerKey,
+			(entry as { id: string }).id,
+		);
 		lookup.alignmentHeaderCounts.set(
 			check.headerKey,
 			(lookup.alignmentHeaderCounts.get(check.headerKey) ?? 0) + 1,
@@ -2026,6 +2167,12 @@ function buildPiAlignedEntryIds(entries: readonly unknown[]): {
  * Entry ids for the messages a Pi 0.87+ `context` handler receives: the
  * compaction-aware projection with every system-role message removed. The
  * compaction summary keeps its unresolved slot; its system snapshot does not.
+ *
+ * Pi 0.87.1 also applies `context_edit` entries found in that projection
+ * (session-manager.js buildSessionProjection): the last edit for a target
+ * wins, and a null replacement drops the target's messages. Pi appends such an
+ * omission before every automatic retry and overflow recovery, so ignoring it
+ * leaves this list one longer than the event until the next compaction.
  */
 function buildPiAlignedVisibleEntryIds(
 	entries: readonly unknown[],
@@ -2039,28 +2186,55 @@ function buildPiAlignedVisibleEntryIds(
 			break;
 		}
 	}
-	const visible = (entry: unknown): entry is { id: string } =>
-		isPiContextEmitEligible(entry) && !isPiSystemMessageEntry(entry);
-	if (compactionIndex < 0) {
-		return entries.filter(visible).map((entry) => entry.id);
-	}
-	const firstKeptEntryId = (
-		entries[compactionIndex] as { firstKeptEntryId?: unknown }
-	).firstKeptEntryId;
-	const ids: (string | undefined)[] = [undefined];
-	if (typeof firstKeptEntryId === "string") {
+	// The entries Pi projects, in order (buildContextEntries).
+	const context: unknown[] = [];
+	if (compactionIndex >= 0) {
+		const compaction = entries[compactionIndex];
+		context.push(compaction);
+		const firstKeptEntryId = (compaction as { firstKeptEntryId?: unknown })
+			.firstKeptEntryId;
 		let foundFirstKept = false;
 		for (let index = 0; index < compactionIndex; index += 1) {
 			const entry = entries[index];
-			if ((entry as { id?: unknown } | undefined)?.id === firstKeptEntryId) {
+			if (
+				typeof firstKeptEntryId === "string" &&
+				(entry as { id?: unknown } | undefined)?.id === firstKeptEntryId
+			) {
 				foundFirstKept = true;
 			}
-			if (foundFirstKept && visible(entry)) ids.push(entry.id);
+			if (foundFirstKept) context.push(entry);
 		}
 	}
 	for (let index = compactionIndex + 1; index < entries.length; index += 1) {
-		const entry = entries[index];
-		if (visible(entry)) ids.push(entry.id);
+		context.push(entries[index]);
+	}
+	const omitted = new Map<string, boolean>();
+	for (const entry of context) {
+		const edit = entry as
+			| { type?: unknown; targetId?: unknown; replacement?: unknown }
+			| undefined;
+		if (edit?.type !== "context_edit" || typeof edit.targetId !== "string")
+			continue;
+		omitted.set(edit.targetId, edit.replacement === null);
+	}
+	const ids: (string | undefined)[] = [];
+	if (compactionIndex >= 0) {
+		const compactionId = (entries[compactionIndex] as { id?: unknown }).id;
+		if (typeof compactionId !== "string" || omitted.get(compactionId) !== true)
+			ids.push(undefined);
+	}
+	for (
+		let index = compactionIndex >= 0 ? 1 : 0;
+		index < context.length;
+		index += 1
+	) {
+		const entry = context[index];
+		if (
+			isPiContextEmitEligible(entry) &&
+			!isPiSystemMessageEntry(entry) &&
+			omitted.get(entry.id) !== true
+		)
+			ids.push(entry.id);
 	}
 	return ids;
 }
@@ -2173,6 +2347,7 @@ function getPiBranchEntryLookup(
 		alignedVisibleEntryIds: aligned.visible,
 		alignmentChecks: new Map(),
 		alignmentHeaderCounts: new Map(),
+		alignmentEntryIdByHeader: new Map(),
 	};
 	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
 	piBranchLookupByProjection.set(entries, lookup);
@@ -2285,11 +2460,13 @@ function readPiBranchEntriesForContext(
 
 		if (cached && cachedAncestorIndex === cached.entries.length - 1) {
 			const entries = [...cached.entries, ...suffix];
+			// A compaction re-bases the projection and a `context_edit` can remove
+			// an earlier entry from it; neither can be applied by appending.
 			if (
-				suffix.some(
-					(entry) =>
-						(entry as { type?: unknown } | undefined)?.type === "compaction",
-				)
+				suffix.some((entry) => {
+					const type = (entry as { type?: unknown } | undefined)?.type;
+					return type === "compaction" || type === "context_edit";
+				})
 			) {
 				return installProjection(leafId, entries);
 			}
@@ -2593,6 +2770,59 @@ function readAdoptablePiFallbackFingerprints(
 	return found;
 }
 
+function piFallbackBaseId(messageId: string): string {
+	return /^(.*):p\d+$/.exec(messageId)?.[1] ?? messageId;
+}
+
+/**
+ * Pair several fallback messages that share one fingerprint with the real ids
+ * now carrying it, so that their tags (and any dropped status) move to the
+ * right messages instead of being re-created.
+ *
+ * Identical messages stamped in the same millisecond share a fingerprint. When
+ * every pass resolved them by fingerprint, they were tagged under index-based
+ * `pi-msg-<index>-…` ids, and a compaction that shifted the indexes tagged them
+ * again under new ones. The pair that was served last holds the highest tag
+ * numbers, and within one pass the index order is the message order. So the
+ * N newest bases, ordered by index, map to the N real ids ordered by position.
+ * Returns null for every real id when that cannot be established: fewer than
+ * two real ids, a real id with no position, fewer bases than real ids, or a
+ * base without a distinct index.
+ */
+function pairPiFallbackBases(
+	realIds: readonly string[],
+	candidates: readonly { tagNumber: number; messageId: string }[],
+	realIdPositions: () => ReadonlyMap<string, number> | undefined,
+): Map<string, string | null> {
+	const pairs = new Map<string, string | null>(
+		realIds.map((id) => [id, null] as const),
+	);
+	if (realIds.length < 2) return pairs;
+	const positions = realIdPositions();
+	if (!positions || realIds.some((id) => !positions.has(id))) return pairs;
+	const newestTag = new Map<string, number>();
+	for (const c of candidates) {
+		const base = piFallbackBaseId(c.messageId);
+		newestTag.set(base, Math.max(newestTag.get(base) ?? 0, c.tagNumber));
+	}
+	if (newestTag.size < realIds.length) return pairs;
+	const chosen = [...newestTag.entries()]
+		.sort((left, right) => right[1] - left[1])
+		.slice(0, realIds.length)
+		.map(([base]) => ({ base, index: /^pi-msg-(\d+)-/.exec(base)?.[1] }));
+	if (chosen.some((entry) => entry.index === undefined)) return pairs;
+	chosen.sort((left, right) => Number(left.index) - Number(right.index));
+	if (new Set(chosen.map((entry) => entry.index)).size !== chosen.length)
+		return pairs;
+	const ordered = [...realIds].sort(
+		(left, right) => (positions.get(left) ?? 0) - (positions.get(right) ?? 0),
+	);
+	for (let index = 0; index < ordered.length; index += 1) {
+		pairs.set(ordered[index] as string, chosen[index]?.base ?? null);
+	}
+	return pairs;
+}
+
 /**
  * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids.
  * Match message tags by raw content fingerprint and tool tags by their owning
@@ -2674,6 +2904,19 @@ function adoptPiFallbackTags(
 				targets.push(
 					...targetsFor([...adoptable].filter((fp) => !discovered.has(fp))),
 				);
+			const pairedBaseByRealId = new Map<string, string | null>();
+			let positions: Map<string, number> | undefined;
+			const realIdPositions = (): Map<string, number> | undefined => {
+				if (positions) return positions;
+				const { messages, resolveStableId } = options;
+				if (!messages || !resolveStableId) return undefined;
+				positions = new Map();
+				for (let index = 0; index < messages.length; index += 1) {
+					const id = resolveStableId(messages[index], index);
+					if (id !== undefined && !positions.has(id)) positions.set(id, index);
+				}
+				return positions;
+			};
 			for (const [realMessageId, fingerprint] of targets) {
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
@@ -2687,16 +2930,30 @@ function adoptPiFallbackTags(
 				if (candidates.length === 0) continue;
 				// Group candidates by their fallback message base id (strip the :pN
 				// suffix). A unique base means exactly one fallback message carried this
-				// fingerprint → safe to adopt; duplicates (same fingerprint on >1
-				// fallback message) are ambiguous → skip, let tagTranscript allocate
-				// fresh.
-				const baseIds = new Set<string>();
-				for (const c of candidates) {
-					const m = /^(.*):p\d+$/.exec(c.messageId);
-					baseIds.add(m ? m[1] : c.messageId);
+				// fingerprint → safe to adopt. Several bases are ambiguous unless
+				// pairPiFallbackBases can match them to this pass's real ids in order;
+				// otherwise skip and let tagTranscript allocate fresh.
+				const baseIds = new Set(
+					candidates.map((c) => piFallbackBaseId(c.messageId)),
+				);
+				let base: string | undefined;
+				if (baseIds.size === 1) base = [...baseIds][0];
+				else {
+					if (!pairedBaseByRealId.has(realMessageId)) {
+						for (const [id, paired] of pairPiFallbackBases(
+							(realIdsByFingerprint.get(fingerprint) ?? []).filter(
+								(id) => !id.startsWith("pi-msg-"),
+							),
+							candidates,
+							realIdPositions,
+						))
+							pairedBaseByRealId.set(id, paired);
+					}
+					base = pairedBaseByRealId.get(realMessageId) ?? undefined;
 				}
-				if (baseIds.size !== 1) continue;
+				if (base === undefined) continue;
 				for (const c of candidates) {
+					if (piFallbackBaseId(c.messageId) !== base) continue;
 					const ordinalMatch = /:p(\d+)$/.exec(c.messageId);
 					if (!ordinalMatch) continue;
 					const realContentId = `${realMessageId}:p${ordinalMatch[1]}`;

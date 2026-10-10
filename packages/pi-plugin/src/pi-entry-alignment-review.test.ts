@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, setSystemTime, test } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildSessionContext } from "pi-coding-agent-087";
 import {
@@ -9,10 +9,10 @@ import {
 import { createFakePi, createTestDb } from "./test-utils.test";
 
 // Pi entry-id resolution: the visible-only positional lane with per-position
-// header checks, and the header filter on fallback-tag adoption. Each
-// `test.failing` names a property the code does not yet hold; its partner
-// directly below is the closest case that does hold, so a reader can see the
-// boundary. docs/reports/pi-entry-alignment-review.md describes each case.
+// header checks, and the header filter on fallback-tag adoption. The review
+// (docs/reports/pi-entry-alignment-review.md) wrote its two findings as
+// `test.failing`; both now hold and run as ordinary tests, each with the
+// closest neighbouring case as its partner directly below.
 
 type Entry = Record<string, unknown> & {
 	id: string;
@@ -206,15 +206,15 @@ async function tagsAcrossExtraMessagePass(
 describe("Pi entry alignment review: lane alternation", () => {
 	afterEach(() => setSystemTime());
 
-	// Two messages whose content fingerprints collide resolve to their real
-	// entry ids on the positional lane but stay unresolved on the fingerprint
-	// lane, where they are tagged under index-based `pi-msg-*` ids. A pass whose
-	// length differs from the projection (here, one extra message another
-	// extension appended) takes the fingerprint lane, so each switch between
-	// lanes serves different `§N§` tags on both messages (3,4 then 6,7 then 3,4).
-	// The distinct-pair partner below checks that messages with unique
-	// fingerprints keep their tags across the same passes.
-	test.failing("keeps the served tags of two identical same-millisecond messages when another extension appends a message on one pass", async () => {
+	// Two messages whose content fingerprints collide can only be identified
+	// by position. A pass whose length differs from the projection (here, one
+	// extra message another extension appended) cannot use the positional lane;
+	// it used to match every message by fingerprint, leave the pair unresolved
+	// and tag it under index-based `pi-msg-*` ids, serving different `§N§` tags
+	// on each lane switch (3,4 then 6,7 then 3,4). The header-anchored lane now
+	// keeps their real ids. The distinct-pair partner below checks that
+	// messages with unique fingerprints keep their tags across the same passes.
+	it("keeps the served tags of two identical same-millisecond messages when another extension appends a message on one pass", async () => {
 		const tags = await tagsAcrossExtraMessagePass(
 			"alignment-review-identical-pair",
 			true,
@@ -279,10 +279,10 @@ describe("Pi entry alignment review: context_edit omissions", () => {
 	// Pi 0.87.1 appends a `context_edit` entry with a null
 	// replacement to drop a failed attempt from the model context before every
 	// automatic retry (agent-session.js _omitRecoveryAttempt). The visible
-	// projection does not apply those entries, so its length exceeds the event
-	// by one for as long as the omitted entry is in the retained range, and
-	// every such pass hashes every message on the fingerprint lane.
-	test.failing("uses the positional lane after Pi omits a failed attempt with a context_edit entry", () => {
+	// projection applies those entries; before it did, its length exceeded the
+	// event by one for as long as the omitted entry was in the retained range,
+	// and every such pass hashed every message on the fingerprint lane.
+	it("uses the positional lane after Pi omits a failed attempt with a context_edit entry", () => {
 		const { s, visibleIds } = sessionWithOmittedAttempt(true);
 		try {
 			const { ids, hashed } = resolveTwice("alignment-review-omitted", s);
@@ -304,12 +304,23 @@ describe("Pi entry alignment review: context_edit omissions", () => {
 		}
 	});
 
-	it("still resolves every id through the fingerprint lane after the omission", () => {
+	// Before context_edit omissions were applied to the projection, this test
+	// pinned that the omission forced the fingerprint lane with correct ids.
+	// The omitted session now aligns positionally (test above), so the
+	// off-lane case is reached with one extra message from another extension.
+	it("still resolves every id off the positional lane after the omission", () => {
 		const { s, visibleIds } = sessionWithOmittedAttempt(true);
 		try {
-			const { ids, hashed } = resolveTwice("alignment-review-omitted-ids", s);
-			expect(ids).toEqual(visibleIds);
-			expect(hashed).toBeGreaterThanOrEqual(visibleIds.length);
+			const messages = s.event();
+			messages.push({
+				role: "custom",
+				customType: "reminder",
+				content: [{ type: "text", text: "Remember the style guide." }],
+				display: false,
+				timestamp: s.clock + 1,
+			});
+			const ids = resolveOnce("alignment-review-omitted-ids", s, messages);
+			expect(ids).toEqual([...visibleIds, undefined]);
 		} finally {
 			clearContextHandlerSession("alignment-review-omitted-ids");
 		}
