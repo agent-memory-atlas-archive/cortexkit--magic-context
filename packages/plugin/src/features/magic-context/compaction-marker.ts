@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { noteRawSessionSummaryRowWritten } from "../../hooks/magic-context/read-session-raw";
 import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
@@ -643,6 +644,9 @@ export function injectCompactionMarker(
                      time_updated = excluded.time_updated,
                      data = excluded.data`,
             ).run(summaryMsgId, args.sessionId, boundaryTime + 1, boundaryTime + 1, summaryMsgData);
+            // The upsert can turn an existing row into a summary in place, which the
+            // canonical ordinal count does not detect by itself.
+            noteRawSessionSummaryRowWritten(args.sessionId, summaryMsgId);
 
             db.prepare(
                 `INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)

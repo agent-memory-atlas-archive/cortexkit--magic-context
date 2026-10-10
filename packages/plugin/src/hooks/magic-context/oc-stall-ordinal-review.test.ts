@@ -9,6 +9,7 @@ import { encodeOpenCodeMessagesToCk, resolveOrdinalsForModule } from "./module-w
 import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
 import {
     forgetRawSessionOrdinalWatermark,
+    forgetRawSessionSummaryRows,
     readRawSessionMessageByIdFromDb,
     readRawSessionMessageOrdinalByIdFromDb,
     readRawSessionMessageOrdinalPageFromDb,
@@ -171,7 +172,23 @@ function externalPrefixWrite(reopen: boolean): void {
     }
 }
 
-function randomizedDifferential(invalidate: boolean): void {
+type DifferentialEdit = "candidate-summary" | "arbitrary-summary";
+
+/**
+ * Random inserts, deletes, moved timestamps and summary rewrites, each checked
+ * against the old whole-session count.
+ *
+ * `candidate-summary` rewrites only rows that were inserted with the `summary`
+ * flag (OpenCode creates its compaction assistant that way and sets `finish`
+ * later), alternating them between finished and unfinished. The counts must
+ * match after every write with no help.
+ *
+ * `arbitrary-summary` is the review's original step: it rewrites any row,
+ * including an ordinary one, into a finished summary in place. No OpenCode
+ * writer does that, and the indexed count does not detect it by itself, so this
+ * variant must call `forgetRawSessionSummaryRows` after each write.
+ */
+function randomizedDifferential(invalidate: boolean, edit: DifferentialEdit): void {
     const db = new Database(":memory:");
     let seed = 0x5d0ee2b3;
     const random = () => {
@@ -202,7 +219,15 @@ function randomizedDifferential(invalidate: boolean): void {
             const victim = ids[random() % ids.length];
             switch (step % 4) {
                 case 0:
-                    insert(db, `insert-${step}`, random() % 12);
+                    // The candidate variant inserts an open summary every other time.
+                    insert(
+                        db,
+                        `insert-${step}`,
+                        random() % 12,
+                        edit === "candidate-summary" && step % 8 === 0
+                            ? { role: "assistant", summary: true }
+                            : { role: "user" },
+                    );
                     break;
                 case 1:
                     db.prepare("DELETE FROM message WHERE id = ?").run(victim);
@@ -213,14 +238,41 @@ function randomizedDifferential(invalidate: boolean): void {
                         victim,
                     );
                     break;
-                case 3:
+                case 3: {
+                    if (edit === "arbitrary-summary") {
+                        db.prepare("UPDATE message SET data = ? WHERE id = ?").run(
+                            JSON.stringify({ role: "assistant", summary: true, finish: "stop" }),
+                            victim,
+                        );
+                        break;
+                    }
+                    const summaries = (
+                        db
+                            .prepare(
+                                "SELECT id, data FROM message WHERE session_id = ? AND json_extract(data, '$.summary') = 1 ORDER BY id",
+                            )
+                            .all(SESSION) as Array<{ id: string; data: string }>
+                    ).map((row) => ({
+                        id: row.id,
+                        finished: JSON.parse(row.data).finish === "stop",
+                    }));
+                    const target = summaries[random() % Math.max(1, summaries.length)];
+                    if (!target) break;
                     db.prepare("UPDATE message SET data = ? WHERE id = ?").run(
-                        JSON.stringify({ role: "assistant", summary: true, finish: "stop" }),
-                        victim,
+                        JSON.stringify(
+                            target.finished
+                                ? { role: "assistant", summary: true, finish: "length" }
+                                : { role: "assistant", summary: true, finish: "stop" },
+                        ),
+                        target.id,
                     );
                     break;
+                }
             }
-            if (invalidate) forgetRawSessionOrdinalWatermark(SESSION);
+            if (invalidate) {
+                forgetRawSessionOrdinalWatermark(SESSION);
+                forgetRawSessionSummaryRows(SESSION);
+            }
             const candidates = ["tail", `insert-${step - (step % 4)}`];
             for (const id of candidates) {
                 const info = db.prepare("SELECT data FROM message WHERE id = ?").get(id) as {
@@ -240,11 +292,36 @@ function randomizedDifferential(invalidate: boolean): void {
     }
 }
 
-test("randomized differential: mixed prefix writes must preserve the old whole-session count", () => {
-    randomizedDifferential(false);
+test("randomized differential: mixed prefix writes and summary rewrites preserve the old whole-session count", () => {
+    randomizedDifferential(false, "candidate-summary");
 });
 test("randomized differential: invalidating each write matches the old whole-session count", () => {
-    randomizedDifferential(true);
+    randomizedDifferential(true, "candidate-summary");
+});
+test("randomized differential: the original arbitrary in-place summary edit matches once summary rows are forgotten", () => {
+    randomizedDifferential(true, "arbitrary-summary");
+});
+
+test("residual: an ordinary row rewritten in place into a finished summary is only seen after forgetRawSessionSummaryRows", () => {
+    const db = new Database(":memory:");
+    try {
+        db.exec(OPENCODE1_MESSAGE_PART_SCHEMA);
+        insert(db, "a", 10);
+        insert(db, "b", 20);
+        insert(db, "c", 30);
+        expectOldOrdinal(db, "c");
+        db.prepare("UPDATE message SET data = ? WHERE id = 'a'").run(
+            JSON.stringify({ role: "assistant", summary: true, finish: "stop" }),
+        );
+        // Documented gap: no OpenCode writer gives an existing ordinary row the
+        // summary flag, and the indexed count does not look for it.
+        expect(readRawSessionMessageByIdFromDb(db, SESSION, "c")?.ordinal).toBe(3);
+        expect(oldOrdinal(db, "c")).toBe(2);
+        forgetRawSessionSummaryRows(SESSION);
+        expectOldOrdinal(db, "c");
+    } finally {
+        db.close();
+    }
 });
 
 test("malformed earlier rows now consume an ordinal rather than throwing in the point lookup", async () => {

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readRawSessionMessageOrdinalByIdFromDb } from "../../hooks/magic-context/read-session-raw";
 import * as logger from "../../shared/logger";
 import { Database, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -364,6 +365,31 @@ describe("injectCompactionMarker", () => {
         } finally {
             clock.mockRestore();
             logged.mockRestore();
+        }
+    });
+    it("makes an in-place summary rewrite visible to canonical ordinals on other connections", () => {
+        const dataHome = useTempDataHome("marker-inject-ordinal-");
+        const db = createOpenCodeDb(dataHome);
+        insertMessage(db, "msg_user", "user", 100);
+        // A stale earlier write left the marker's deterministic summary id as an
+        // ordinary row; the marker upsert rewrites that row in place.
+        const summaryId = generateMessageId(101, 1n, "ses-1\0msg_user\0summary-message");
+        insertMessage(db, summaryId, "assistant", 101, { finish: "stop" });
+        insertMessage(db, "msg_later", "user", 200);
+        expect(readRawSessionMessageOrdinalByIdFromDb(db, "ses-1", "msg_later")).toBe(3);
+        const marker = injectCompactionMarker({
+            sessionId: "ses-1",
+            endOrdinal: 1,
+            endMessageId: "msg_user",
+            summaryText: "summary placeholder",
+            directory: dataHome,
+            resolvedBoundary: { id: "msg_user", timeCreated: 100 },
+        });
+        expect(marker?.summaryMessageId).toBe(summaryId);
+        try {
+            expect(readRawSessionMessageOrdinalByIdFromDb(db, "ses-1", "msg_later")).toBe(2);
+        } finally {
+            closeQuietly(db);
         }
     });
     it("writes a completed summary timestamp for OpenCode 2 conversion", () => {
