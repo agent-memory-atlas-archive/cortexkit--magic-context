@@ -145,6 +145,12 @@ export function getPiLastServedDigest(
 	}
 }
 
+/** Keep returned bytes as identity evidence even when a changed input shape prevents replay. */
+export function getPiLastServedArray(sessionId: string): string | undefined {
+	const previous = previousBySession.get(sessionId);
+	return previous ? `[${previous.serializedMessages.join(",")}]` : undefined;
+}
+
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }

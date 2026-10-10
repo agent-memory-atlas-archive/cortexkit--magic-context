@@ -14,6 +14,7 @@ const env: Record<string, string> = {
 	PI_SKIP_VERSION_CHECK: "1",
 	ISSUE_650_HOST: process.env.ISSUE_650_HOST!,
 	ISSUE_650_CODEMODE: process.env.ISSUE_650_CODEMODE ?? "0",
+	ISSUE_650_MESSAGE: process.env.ISSUE_650_MESSAGE ?? "0",
 };
 for (const key of [
 	"XDG_DATA_HOME",
@@ -30,26 +31,30 @@ env.OPENCODE_DB = join(root, "opencode.db");
 const mock = new MockProvider();
 const { baseURL } = await mock.start();
 env.ISSUE_650_MOCK = baseURL;
-mock.enqueue({
-	content: [
-		{
-			type: "tool_use",
-			id: "call650",
-			name: env.ISSUE_650_CODEMODE === "1" ? "codemode" : "bash",
-			input:
-				env.ISSUE_650_CODEMODE === "1"
-					? {
-							code: 'console.log(await tools.bash({command: "printf probe650"}))',
-						}
-					: { command: "printf probe650" },
-		},
-	],
-	stop_reason: "tool_use",
-	usage: { input_tokens: 100, output_tokens: 10 },
-});
+if (env.ISSUE_650_MESSAGE !== "1")
+	mock.enqueue({
+		content: [
+			{
+				type: "tool_use",
+				id: "call650",
+				name: env.ISSUE_650_CODEMODE === "1" ? "codemode" : "bash",
+				input:
+					env.ISSUE_650_CODEMODE === "1"
+						? {
+								code: 'console.log(await tools.bash({command: "printf probe650"}))',
+							}
+						: { command: "printf probe650" },
+			},
+		],
+		stop_reason: "tool_use",
+		usage: { input_tokens: 100, output_tokens: 10 },
+	});
 mock.setDefault({
 	text: "done",
-	usage: { input_tokens: 100, output_tokens: 10 },
+	usage: {
+		input_tokens: env.ISSUE_650_MESSAGE === "1" ? 178473 : 100,
+		output_tokens: 10,
+	},
 });
 const child = Bun.spawn(["node", resolve(process.argv[2]!)], {
 	cwd: root,

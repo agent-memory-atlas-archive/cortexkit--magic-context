@@ -6,6 +6,7 @@ import {
 	getOrCreateSessionMeta,
 	updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
+import { PiTagIdentityConflictError } from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -163,19 +164,26 @@ test("review: adoption discovers a racing drop for an already-served historical 
 		});
 		restore = () => spy.mockRestore();
 		const raw = [structuredClone(historical), userMessage("new tail", 2)];
-		const result = await handler(
-			{ messages: raw },
-			fakeContext(sessionId, dir, ["historical", "tail"], raw),
-		);
+		// Re-discovery must still observe the sibling's drop, but adopting it
+		// cannot rewrite an already-returned active message into dropped bytes.
+		await expect(
+			handler(
+				{ messages: raw },
+				fakeContext(sessionId, dir, ["historical", "tail"], raw),
+			),
+		).rejects.toBeInstanceOf(PiTagIdentityConflictError);
 		expect(inserted).toBe(true);
-		expect(textOf(result.messages[0])).toBe("[dropped §1§]");
+		expect(textOf(first.messages[0])).toBe("§1§ historical text");
 		expect(
 			db
 				.prepare(
-					"SELECT message_id FROM tags WHERE session_id=? AND message_id LIKE 'pi-msg-%'",
+					"SELECT tag_number,status FROM tags WHERE session_id=? ORDER BY tag_number",
 				)
 				.all(sessionId),
-		).toHaveLength(0);
+		).toEqual([
+			{ tag_number: 1, status: "active" },
+			{ tag_number: 9, status: "dropped" },
+		]);
 	} finally {
 		restore?.();
 		clearContextHandlerSession(sessionId);

@@ -131,6 +131,7 @@ import { getNativeReplayState } from "@magic-context/core/features/magic-context
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
 	findPiTagIdentityConflict,
+	getPiMessageTagCandidates,
 	getToolTagNumberByOwner,
 	hasPiFallbackMessageTags as hasPersistedPiFallbackMessageTags,
 	hasPiFallbackToolOwnerTags as hasPersistedPiFallbackToolOwnerTags,
@@ -253,7 +254,6 @@ import {
 	withoutSqliteTransformPass,
 	withSqliteBackgroundWriter,
 } from "@magic-context/core/shared/sqlite";
-import { stableStringify } from "@magic-context/core/shared/stable-json";
 import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner";
 import {
 	TEXT_TAG_IDENTITY_MARKER,
@@ -338,6 +338,10 @@ import {
 	resolvePiLkgOutputEntryIds,
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
+import {
+	piCachedMessageSurvivor,
+	piMessageEntryFingerprint as fingerprintPiMessage,
+} from "./pi-message-identity";
 import {
 	clearPiOrdinalAlignmentSession,
 	isPiOrdinalAlignmentUnanchored,
@@ -498,6 +502,7 @@ export const __test = {
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
 	guardPiToolAllocations,
+	guardPiMessageAllocations,
 	buildEntryFingerprintMap,
 	readPiEntryFingerprintCount: () => piEntryFingerprintCount,
 	resolvePiEventEntryIds,
@@ -2376,7 +2381,14 @@ function getPiBranchEntryLookup(
 		alignmentEntryIdByHeader: new Map(),
 		entryIdsByToolIdentity: new Map(),
 	};
-	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
+	// SessionManager.getBranch() still includes messages cut by compaction.
+	// alignedEntryIds names only entries that Pi emits in the retained context;
+	// indexing older copies would make an identical retained message ambiguous.
+	const visibleIds = new Set(lookup.alignedEntryIds);
+	for (const entry of entries) {
+		if (visibleIds.has((entry as { id?: string } | null)?.id))
+			addPiBranchEntryToLookup(lookup, entry);
+	}
 	piBranchLookupByProjection.set(entries, lookup);
 	return lookup;
 }
@@ -2603,28 +2615,7 @@ let piEntryFingerprintCount = 0;
 
 function piMessageEntryFingerprint(message: unknown): string | null {
 	piEntryFingerprintCount += 1;
-	if (!message || typeof message !== "object") return null;
-	const record = message as {
-		responseId?: unknown;
-		timestamp?: unknown;
-		role?: unknown;
-		toolCallId?: unknown;
-		content?: unknown;
-	};
-	if (typeof record.role !== "string") return null;
-	const contentHash = crypto
-		.createHash("sha256")
-		.update(stableStringify(record.content))
-		.digest("hex");
-	return JSON.stringify([
-		typeof record.responseId === "string" ? record.responseId : null,
-		typeof record.timestamp === "number" || typeof record.timestamp === "string"
-			? record.timestamp
-			: null,
-		record.role,
-		typeof record.toolCallId === "string" ? record.toolCallId : null,
-		contentHash,
-	]);
+	return fingerprintPiMessage(message);
 }
 
 /**
@@ -2756,6 +2747,33 @@ function guardPiToolAllocations(
 					"the tool call's existing owner cannot be safely resolved; no second tag was allocated",
 				);
 			}
+		}
+	}
+}
+
+function guardPiMessageAllocations(
+	db: ContextDatabase,
+	sessionId: string,
+	fingerprints: ReadonlyMap<string, string>,
+): void {
+	const hasFallback = hasPersistedPiFallbackMessageTags(db, sessionId);
+	for (const [id, fingerprint] of fingerprints) {
+		if (!id.startsWith("pi-msg-") && !hasFallback) continue;
+		const rows = db
+			.prepare(
+				"SELECT message_id AS id FROM tags WHERE session_id = ? AND type = 'message' AND entry_fingerprint = ?",
+			)
+			.all(sessionId, fingerprint) as { id: string }[];
+		if (rows.some((row) => row.id.replace(/:p\d+$/, "") === id)) continue;
+		if (
+			rows.some(
+				(row) => id.startsWith("pi-msg-") || row.id.startsWith("pi-msg-"),
+			)
+		) {
+			throw new PiTagIdentityConflictError(
+				"the message's existing entry cannot be safely resolved; no second tag was allocated",
+				"message",
+			);
 		}
 	}
 }
@@ -2994,6 +3012,7 @@ function adoptPiFallbackTags(
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
 				if (realMessageId.startsWith("pi-msg-")) continue;
+				if (realIdsByFingerprint.get(fingerprint)?.length !== 1) continue;
 				if (!adoptable.has(fingerprint)) continue;
 				const candidates = findAdoptableFallbackTags(
 					db,
@@ -3030,13 +3049,42 @@ function adoptPiFallbackTags(
 					const ordinalMatch = /:p(\d+)$/.exec(c.messageId);
 					if (!ordinalMatch) continue;
 					const realContentId = `${realMessageId}:p${ordinalMatch[1]}`;
+					const served = getPiServedTagNumbers(sessionId);
+					const canonical = getPiMessageTagCandidates(
+						db,
+						sessionId,
+						realContentId,
+					);
+					const collisionRows = [
+						...getTagsByNumbers(db, sessionId, [c.tagNumber]),
+						...canonical,
+					];
+					const cachedSurvivor = canonical.length
+						? piCachedMessageSurvivor(
+								sessionId,
+								fingerprint,
+								Number(ordinalMatch[1]),
+								collisionRows,
+							)
+						: undefined;
+					if (
+						canonical.length &&
+						!collisionRows.some((row) => served.has(row.tagNumber)) &&
+						cachedSurvivor === undefined
+					) {
+						throw new PiTagIdentityConflictError(
+							"duplicate message identities have no proven served-byte survivor",
+							"message",
+						);
+					}
 					const adoption = adoptPiFallbackMessageTag(
 						db,
 						sessionId,
 						c.tagNumber,
 						c.messageId,
 						realContentId,
-						getPiServedTagNumbers(sessionId),
+						served,
+						cachedSurvivor,
 					);
 					if (adoption.action !== "skipped") {
 						// Drop stale fallback and collision aliases, then bind the survivor
@@ -7274,6 +7322,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.sessionId,
 		args.messages as PiAgentMessage[],
 		stableIdResolver,
+	);
+	guardPiMessageAllocations(
+		args.db,
+		args.sessionId,
+		entryFingerprintByMessageId,
 	);
 	logTransformTiming(
 		args.sessionId,

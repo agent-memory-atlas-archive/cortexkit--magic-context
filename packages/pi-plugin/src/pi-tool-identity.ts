@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { getSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
-import { getPiLastServedDigest } from "./served-array-ledger";
+import {
+	getPiLastServedArray,
+	getPiLastServedDigest,
+} from "./served-array-ledger";
 
 function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object"
@@ -47,24 +50,9 @@ export function piCachedToolSurvivor(
 	timestamp: number,
 	rows: readonly { tagNumber: number; status: string }[],
 ): number | undefined {
-	const slot = getSlot(sessionId);
-	if (
-		!slot ||
-		createHash("sha256").update(slot.jsonPrefix).digest("hex") !==
-			getPiLastServedDigest(sessionId)
-	)
-		return;
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(slot.jsonPrefix);
-	} catch {
-		return;
-	}
-	if (!Array.isArray(parsed)) return;
-	const messages = parsed.flatMap((m) => {
-		const r = record(m);
-		return r ? [r] : [];
-	});
+	const cached = readPiServedCachedArray(sessionId);
+	if (!cached) return;
+	const { jsonPrefix, messages } = cached;
 	const owners = messages.filter(
 		(m) =>
 			m.role === "assistant" &&
@@ -80,7 +68,7 @@ export function piCachedToolSurvivor(
 	)
 		return;
 	const present = rows.filter((row) =>
-		slot.jsonPrefix.includes(`§${row.tagNumber}§`),
+		jsonPrefix.includes(`§${row.tagNumber}§`),
 	);
 	const winner = present[0];
 	if (present.length !== 1 || !winner) return;
@@ -102,4 +90,33 @@ export function piCachedToolSurvivor(
 	)
 		return;
 	return number;
+}
+
+export function readPiServedCachedArray(
+	sessionId: string,
+): { jsonPrefix: string; messages: Record<string, unknown>[] } | undefined {
+	// A reshaped input can invalidate last-known-good (LKG) replay without
+	// discarding the exact array returned to Pi. After process restart, accept a
+	// saved LKG only when its digest matches the last returned-array record.
+	const memory = getPiLastServedArray(sessionId);
+	const slot = memory === undefined ? getSlot(sessionId) : undefined;
+	const jsonPrefix = memory ?? slot?.jsonPrefix;
+	if (
+		jsonPrefix === undefined ||
+		createHash("sha256").update(jsonPrefix).digest("hex") !==
+			getPiLastServedDigest(sessionId)
+	)
+		return;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(jsonPrefix);
+	} catch {
+		return;
+	}
+	if (!Array.isArray(parsed)) return;
+	const messages = parsed.flatMap((m) => {
+		const r = record(m);
+		return r ? [r] : [];
+	});
+	return { jsonPrefix, messages };
 }
