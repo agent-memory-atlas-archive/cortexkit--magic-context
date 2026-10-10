@@ -340,8 +340,8 @@ import {
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import {
-	piCachedMessageSurvivor,
 	piMessageEntryFingerprint as fingerprintPiMessage,
+	piCachedMessageSurvivor,
 } from "./pi-message-identity";
 import {
 	clearPiOrdinalAlignmentSession,
@@ -2983,6 +2983,49 @@ function pairPiFallbackBases(
 }
 
 /**
+ * Check an order-based pairing against the served-number ledger before it is
+ * applied, so that each real id keeps the number the model last saw.
+ *
+ * pairPiFallbackBases picks the newest fallback bases on the assumption that
+ * they were served last. The ledger records every number ever served, not just
+ * the latest pass, so it cannot confirm that assumption, but it can refute it:
+ * when some fallback base of this fingerprint was served and a chosen base was
+ * never served, the newest pair may come from a pass that never reached the
+ * model, and moving it onto the real id would change that message's number.
+ * Such a pair is still safe when the real id already holds a served row for
+ * every part, because the collision rules in adoptPiFallbackMessageTag then keep
+ * that served number and fold the unserved fallback into it. With no served
+ * fallback number at all there is no evidence either way and the newest-pair
+ * rule stands. Returns false when the pairing must not be applied.
+ */
+function piPairingKeepsServedNumbers(
+	pairs: ReadonlyMap<string, string | null>,
+	candidates: readonly { tagNumber: number; messageId: string }[],
+	served: ReadonlySet<number>,
+	rowsForRealContentId: (
+		realContentId: string,
+	) => readonly { tagNumber: number }[],
+): boolean {
+	const servedBases = new Set(
+		candidates
+			.filter((c) => served.has(c.tagNumber))
+			.map((c) => piFallbackBaseId(c.messageId)),
+	);
+	if (servedBases.size === 0) return true;
+	for (const [realId, base] of pairs) {
+		if (base === null || servedBases.has(base)) continue;
+		for (const c of candidates) {
+			if (piFallbackBaseId(c.messageId) !== base) continue;
+			const ordinal = /:p(\d+)$/.exec(c.messageId)?.[1];
+			if (ordinal === undefined) return false;
+			const rows = rowsForRealContentId(`${realId}:p${ordinal}`);
+			if (!rows.some((row) => served.has(row.tagNumber))) return false;
+		}
+	}
+	return true;
+}
+
+/**
  * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids,
  * or when an unresolved assistant moves to a different visible array index.
  * Match message tags by raw content fingerprint and tool tags by their owning
@@ -3130,7 +3173,12 @@ function adoptPiFallbackTags(
 				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
 				// predecessor to migrate from.
 				if (realMessageId.startsWith("pi-msg-")) continue;
-				if (realIdsByFingerprint.get(fingerprint)?.length !== 1) continue;
+				// Several real ids sharing one fingerprint (identical messages stamped
+				// in the same millisecond) can only adopt through an order-proven
+				// pairing below, never through the single-fallback shortcut: one
+				// fallback row cannot say which of the identical entries it tagged.
+				const sharedFingerprint =
+					(realIdsByFingerprint.get(fingerprint)?.length ?? 0) > 1;
 				if (!adoptable.has(fingerprint)) continue;
 				const candidates = findAdoptableFallbackTags(
 					db,
@@ -3139,25 +3187,35 @@ function adoptPiFallbackTags(
 				);
 				if (candidates.length === 0) continue;
 				// Group candidates by their fallback message base id (strip the :pN
-				// suffix). A unique base means exactly one fallback message carried this
-				// fingerprint → safe to adopt. Several bases are ambiguous unless
-				// pairPiFallbackBases can match them to this pass's real ids in order;
-				// otherwise skip and let tagTranscript allocate fresh.
+				// suffix). A unique base for a unique real id means exactly one fallback
+				// message carried this fingerprint → safe to adopt. Several bases, or
+				// several real ids, are ambiguous unless pairPiFallbackBases matches them
+				// in order and the served-number ledger agrees with that pairing;
+				// otherwise skip, and guardPiMessageAllocations refuses the pass rather
+				// than allocating a second number for an already tagged message.
 				const baseIds = new Set(
 					candidates.map((c) => piFallbackBaseId(c.messageId)),
 				);
 				let base: string | undefined;
-				if (baseIds.size === 1) base = [...baseIds][0];
+				if (baseIds.size === 1 && !sharedFingerprint) base = [...baseIds][0];
 				else {
 					if (!pairedBaseByRealId.has(realMessageId)) {
-						for (const [id, paired] of pairPiFallbackBases(
+						const pairs = pairPiFallbackBases(
 							(realIdsByFingerprint.get(fingerprint) ?? []).filter(
 								(id) => !id.startsWith("pi-msg-"),
 							),
 							candidates,
 							realIdPositions,
-						))
-							pairedBaseByRealId.set(id, paired);
+						);
+						const proven = piPairingKeepsServedNumbers(
+							pairs,
+							candidates,
+							getPiServedTagNumbers(sessionId),
+							(realContentId) =>
+								getPiMessageTagCandidates(db, sessionId, realContentId),
+						);
+						for (const [id, paired] of pairs)
+							pairedBaseByRealId.set(id, proven ? paired : null);
 					}
 					base = pairedBaseByRealId.get(realMessageId) ?? undefined;
 				}
