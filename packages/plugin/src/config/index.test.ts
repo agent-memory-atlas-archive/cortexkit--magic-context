@@ -284,7 +284,9 @@ describe("loadPluginConfig — graduated mural config", () => {
 
         expect(result.mural.enabled).toBe(true);
         expect(
-            (result.configWarnings ?? []).filter((w) => w === MURAL_MODEL_DEPRECATION_WARNING),
+            (result.configWarnings ?? []).filter((w) =>
+                w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+            ),
         ).toHaveLength(1);
         expect(MURAL_MODEL_DEPRECATION_WARNING).toContain("mural.model");
         expect(
@@ -300,7 +302,7 @@ describe("loadPluginConfig — graduated mural config", () => {
     it("emits no mural.model warning when the key is absent", () => {
         const result = loadWithUserConfig(JSON.stringify({ mural: { enabled: true } }));
 
-        expect(result.configWarnings ?? []).not.toContain(MURAL_MODEL_DEPRECATION_WARNING);
+        expect((result.configWarnings ?? []).some((w) => w.includes("mural.model"))).toBe(false);
     });
 
     it("lets a project choose the compress-cues task model like any other dreamer task model", () => {
@@ -328,7 +330,9 @@ describe("loadPluginConfig — graduated mural config", () => {
                 .primary,
         ).toEqual({ model: "open/project-curate" });
         expect(
-            (result.configWarnings ?? []).filter((w) => w === MURAL_MODEL_DEPRECATION_WARNING),
+            (result.configWarnings ?? []).filter((w) =>
+                w.endsWith(MURAL_MODEL_DEPRECATION_WARNING),
+            ),
         ).toHaveLength(1);
     });
 });
