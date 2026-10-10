@@ -195,6 +195,12 @@
   display: none;
 }
 
+/* Harness tabs that open a section sit directly under its heading, so give them
+   the same top spacing and left edge as the field rows below them. */
+.config-section-panel .config-card > .tab-pills {
+  padding: 14px 0 12px;
+}
+
 .config-section-panel .config-card-two-col {
   display: contents;
 }
