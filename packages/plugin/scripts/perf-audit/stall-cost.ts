@@ -97,10 +97,17 @@ const results: Record<string, unknown> = { label, src, messages: MESSAGES };
         insert.run(id(index), SESSION, created, created, data(index));
         warm.push(time(() => (lastOrdinal = read(db, SESSION, id(index))?.ordinal ?? -1)));
     }
+    // Lookups with no write in between, as ctx_expand rendering several
+    // messages does: the corrected watermark is reused only in this case.
+    const unchanged: number[] = [];
+    for (let step = 1; step <= 20; step += 1) {
+        unchanged.push(time(() => read(db, SESSION, id(MESSAGES + 20 - step))));
+    }
     results.ordinal = {
         cold_ms: round(cold),
         appended_lookup_median_ms: round(median(warm)),
         appended_lookup_max_ms: round(Math.max(...warm)),
+        unchanged_store_lookup_median_ms: round(median(unchanged)),
         last_ordinal: lastOrdinal,
     };
     db.close();
