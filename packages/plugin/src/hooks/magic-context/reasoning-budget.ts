@@ -17,7 +17,6 @@ import { estimateTokens } from "./read-session-formatting";
 import { neutralizedReasoningSource, makeSentinel } from "./sentinel";
 import { findLatestAssistantReasoningMutationExemptMessage } from "./strip-content";
 import type { MessageLike } from "./tag-messages";
-import { makeSentinel } from "./sentinel";
 
 const REASONING_PART_TYPES = new Set(["reasoning", "thinking", "redacted_thinking"]);
 
