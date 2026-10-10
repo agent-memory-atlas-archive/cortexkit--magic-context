@@ -32,6 +32,7 @@ import {
     resolveWrapupProtectedTailBoundary,
     type WrapupBoundaryPlan,
 } from "./protected-tail-boundary";
+import { prepareRawSessionOrdinals } from "./read-session-chunk";
 import type { ManagedRecompContext } from "./recomp-orchestrator";
 import { setRecompStarting, setRecompTerminal } from "./recomp-orchestrator";
 import { sendStatusNotification } from "./send-session-notification";
@@ -293,6 +294,10 @@ export async function runManagedWrapup(
     const messagesToKeep = Math.max(1, Math.floor(options.messagesToKeep));
     setRecompStarting(ctx.liveSessionState, sessionId, "Estimating wrapup…", "wrapup");
     try {
+        // Wait off-thread for the session's canonical ordinals before the
+        // synchronous boundary reads (see prepareRawSessionOrdinals); an explicit
+        // wrapup proceeds even if that warm-up failed.
+        await prepareRawSessionOrdinals(sessionId);
         return await runStartedWrapup(ctx, sessionId, messagesToKeep);
     } catch (error) {
         // Every normal exit sets a terminal progress state. A throw (planning, the

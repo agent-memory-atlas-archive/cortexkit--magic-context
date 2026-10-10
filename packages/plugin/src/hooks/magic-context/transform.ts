@@ -150,7 +150,7 @@ import {
     recordHighPressureNoEligibleHead,
     resolveOpenCodeProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { readRawSessionMessages } from "./read-session-chunk";
+import { prepareRawSessionOrdinals, readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
 import {
@@ -423,6 +423,11 @@ export interface TransformDeps {
     /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
     hostRawMessages?: (sessionId: string) => ReturnType<typeof readRawSessionMessages>;
     hostMessageReconciliationSource?: MessageReconciliationSource;
+    /**
+     * Resolves once canonical ordinal counts of the session no longer scan it
+     * on this thread (false when the off-thread warm-up failed).
+     */
+    hostPrepareRawOrdinals?: (sessionId: string) => Promise<boolean>;
     hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
     hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
     hostRefusalNotice?: HostRefusalNotice;
@@ -666,6 +671,7 @@ export function resolveTransformHostSeams(
         TransformDeps,
         | "hostRawMessages"
         | "hostMessageReconciliationSource"
+        | "hostPrepareRawOrdinals"
         | "hostProtectedTailBoundary"
         | "hostModelFallback"
         | "hostRefusalNotice"
@@ -676,6 +682,7 @@ export function resolveTransformHostSeams(
         hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
         hostMessageReconciliationSource:
             deps.hostMessageReconciliationSource ?? readRawSessionMessages,
+        hostPrepareRawOrdinals: deps.hostPrepareRawOrdinals ?? prepareRawSessionOrdinals,
         hostProtectedTailBoundary:
             deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
         hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
@@ -774,6 +781,20 @@ export function createTransform(deps: TransformDeps) {
         clearOpenCodePendingTransformDecision(sessionId);
 
         const db = deps.db;
+
+        // Many stages below count canonical ordinals synchronously. On the first
+        // pass of a session after a start, finding its compaction summaries means
+        // reading every message once; that runs on a worker while this pass
+        // waits, so the host's event loop stays free. If the worker fails (logged
+        // and counted there) the pass still runs and a count that needs the
+        // scan does it here once: a servable turn is never refused for it.
+        try {
+            const tPrepare = performance.now();
+            const ready = await host.hostPrepareRawOrdinals(sessionId);
+            logTransformTiming(sessionId, "rawOrdinals.prepare", tPrepare, `ready=${ready}`);
+        } catch (error) {
+            sessionLog(sessionId, "transform: canonical ordinal warm-up threw:", error);
+        }
 
         // A stage this pass cannot be served without has failed: the session's
         // saved drops, truncations, history cut or emergency state would be

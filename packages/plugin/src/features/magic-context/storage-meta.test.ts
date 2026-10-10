@@ -90,14 +90,15 @@ describe("storage-meta", () => {
             //#then
             // clearSession deletes all owned tables inside one transaction.
             // Retry marks are deleted before their compartment IDs disappear;
-            // the session activity mark is removed after the table rows.
+            // the session activity mark, and then the session's tag identity
+            // revision row, are removed after the table rows.
             // While the FTS rowid-map backfill is unfinished, two of the
             // statements read its state and sweep the session's unmapped
             // legacy FTS rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
             // The indexed temporal choices are session-owned too; adding their
             // deletion must not split cleanup across separate transactions.
-            expect(db.prepare).toHaveBeenCalledTimes(39);
+            expect(db.prepare).toHaveBeenCalledTimes(40);
         });
     });
 });

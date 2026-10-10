@@ -7,7 +7,11 @@ import type { MessageLike } from "../../hooks/magic-context/tag-messages";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import { initializeDatabase } from "./storage-db";
-import { getReasoningTokenEstimatesByMessage, insertTag } from "./storage-tags";
+import {
+    getMaxTagNumberByOwnerMessage,
+    getReasoningTokenEstimatesByMessage,
+    insertTag,
+} from "./storage-tags";
 
 const SESSION = "ses-stall-cache-review";
 const messages: MessageLike[] = ["old", "new"].map(
@@ -94,10 +98,23 @@ test("mixed tuple write: scalar identity assignments refresh the reasoning cutof
     }
 });
 
-test("external process writes: data_version refreshes owner maxima and reasoning estimates", async () => {
+/**
+ * A process that is not running Magic Context (here a plain bun:sqlite
+ * connection) rewrites a tag's number and reasoning count in place, which
+ * leaves the session's tag count and highest id as they were. Magic Context
+ * connections bump the session's tag identity revision on such a write (see
+ * storage-tag-identity-revision.ts); this one does not, so the summary keeps its
+ * cached owners. Re-reading the session on every foreign commit instead would
+ * cost a whole-session read on nearly every pass of a busy host. The update
+ * changes no row count and no id, so the count and highest id still fit "only
+ * appends". The test records the gap and the two things that close it: a new
+ * connection, or an identity write by this process.
+ */
+test("external process writes (residual): an in-place re-key keeping count and highest id is seen only after invalidation", async () => {
     const { dir, cleanup } = createTestTempDir("mc-stall-cache-review-");
     const path = join(dir, "context.db");
     const db = new Database(path);
+    let fresh: Database | undefined;
     try {
         seed(db);
         // A raw connection in a child process cannot bump the parent's generation.
@@ -117,7 +134,50 @@ test("external process writes: data_version refreshes owner maxima and reasoning
         );
         const [code, errors] = await Promise.all([child.exited, new Response(child.stderr).text()]);
         expect({ code, errors }).toEqual({ code: 0, errors: "" });
+        // The warm summary still answers from the old owners.
+        expect(projectOpencodeReasoningBudgetCutoff(db, SESSION, messages, 100, 0, 1)).toBe(5);
+        expect(getReasoningTokenEstimatesByMessage(db, SESSION, 1).get("old")).toBe(100);
+        // A new connection reads the committed rows.
+        fresh = new Database(path);
+        expectCommittedProjection(fresh);
+        // So does this one after any identity write of its own.
+        db.prepare(
+            "UPDATE tags SET message_id = message_id WHERE session_id = ? AND tag_number = 10",
+        ).run(SESSION);
         expectCommittedProjection(db);
+    } finally {
+        fresh?.close();
+        db.close();
+        cleanup();
+    }
+});
+
+test("external process writes: a tool tag given an owner by another process (the tool-owner backfill) is seen", async () => {
+    const { dir, cleanup } = createTestTempDir("mc-stall-cache-review-");
+    const path = join(dir, "context.db");
+    const db = new Database(path);
+    try {
+        seed(db);
+        // A tool tag written before owners were recorded.
+        insertTag(db, SESSION, "call-legacy", "tool", 10, 12, 0, "read", 0, null);
+        expect(getMaxTagNumberByOwnerMessage(db, SESSION).get("old")).toBe(5);
+        const child = Bun.spawn(
+            [
+                process.execPath,
+                "-e",
+                `
+            import { Database } from 'bun:sqlite';
+            const db = new Database(process.argv[1]);
+            db.prepare("UPDATE tags SET tool_owner_message_id = 'old' WHERE session_id = ? AND tag_number = 12 AND tool_owner_message_id IS NULL").run(${JSON.stringify(SESSION)});
+            db.close();
+        `,
+                path,
+            ],
+            { stdout: "pipe", stderr: "pipe", windowsHide: true },
+        );
+        const [code, errors] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+        expect({ code, errors }).toEqual({ code: 0, errors: "" });
+        expect(getMaxTagNumberByOwnerMessage(db, SESSION).get("old")).toBe(12);
     } finally {
         db.close();
         cleanup();

@@ -1,7 +1,10 @@
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
-import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
+import {
+    prepareRawSessionOrdinals,
+    readSessionChunk,
+} from "../../hooks/magic-context/read-session-chunk";
 import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
@@ -65,6 +68,10 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 message: "number",
             });
             const sessionId = toolContext.sessionID;
+            // Wait off-thread for the session's canonical ordinals before the synchronous
+            // reads below (see prepareRawSessionOrdinals); an explicit command proceeds
+            // even if that warm-up failed.
+            await prepareRawSessionOrdinals(sessionId);
             const mode = resolveCtxExpandMode(args, "positive");
             if (mode.kind === "error") {
                 return mode.message;

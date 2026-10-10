@@ -376,7 +376,16 @@ export function readRawSessionMessageSummaryPageFromDb(
     return assembleRawMessagePage(messageRows, partRows);
 }
 
+/**
+ * Number of ordinal-bearing messages in a session. Counted from the
+ * `(session_id, time_created, id)` index minus the session's finished
+ * compaction summaries (see {@link countCanonicalOrdinalsIndexed}); the
+ * statement below, which reads every message's JSON, is used only when that
+ * path is unavailable.
+ */
 export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: string): number {
+    const indexed = countCanonicalOrdinalsIndexed(db, sessionId, null, null);
+    if (indexed !== null) return indexed;
     const row = db
         .prepare(
             `SELECT COUNT(*) AS count
@@ -915,6 +924,8 @@ function countEligibleOrdinals(
     after: OrdinalKey | null,
     through: OrdinalKey,
 ): number {
+    const indexed = countCanonicalOrdinalsIndexed(db, sessionId, after, through);
+    if (indexed !== null) return indexed;
     const row = (
         after
             ? db
@@ -924,8 +935,411 @@ function countEligibleOrdinals(
                   .prepare(ORDINAL_RANGE_FROM_START_SQL)
                   .get(sessionId, through.timeCreated, through.id)
     ) as { visited?: unknown; eligible?: unknown } | null;
-    ordinalRowsVisited += typeof row?.visited === "number" ? row.visited : 0;
+    const visited = typeof row?.visited === "number" ? row.visited : 0;
+    ordinalRowsVisited += visited;
+    // This statement parses the JSON of every row it visits.
+    ordinalJsonRowsRead += visited;
     return typeof row?.eligible === "number" ? row.eligible : 0;
+}
+
+/*
+ * Index-only canonical counts.
+ *
+ * A canonical ordinal is the number of a session's messages at or before a
+ * point in `(time_created, id)` order, minus the finished compaction summaries
+ * among them. The first part is a COUNT(*) that the
+ * `(session_id, time_created, id)` index answers on its own. The second part
+ * needs message JSON, but only for rows whose `summary` flag is set, and those
+ * are rare. Each connection keeps, per session, the ids of the rows it has seen
+ * with that flag (the candidates). Every count re-reads the candidates by
+ * primary key, so a summary that finishes later, moves in time, changes session
+ * or is deleted is seen in the same statement that counts the index.
+ *
+ * New rows are found by rowid. `message` is an ordinary rowid table (OpenCode
+ * declares `id text PRIMARY KEY`, so the rowid is separate and not
+ * AUTOINCREMENT): a new row gets a rowid above every existing one. The set
+ * remembers the highest rows of the table, with their ids, when it was last
+ * brought up to date; the next count reads only the session's rows above the
+ * highest of those that still holds the same message. SQLite hands a deleted
+ * top rowid to the next insert, so a remembered row that has gone, or now holds
+ * a different message, is passed over for a lower one, and only when none
+ * survive is the session scanned in full again.
+ *
+ * This relies on one property of the writers: a row carries its `summary` flag
+ * from the moment it is inserted. OpenCode 1.18 creates its compaction
+ * assistant with `summary: true` and only later sets `finish` (compaction.ts
+ * and processor.ts at v1.18.35), and its message upsert never changes a row's
+ * session or creation time. Magic Context's own compaction marker writer
+ * reports the summary rows it writes through
+ * {@link noteRawSessionSummaryRowWritten}, which covers the case where its
+ * upsert rewrites an existing row. An in-place edit by any other writer that
+ * turns an ordinary row into a summary is not seen until
+ * {@link forgetRawSessionSummaryRows} runs for the session.
+ */
+
+const EXCLUDED_ROW_SQL = `${ORDINAL_SUMMARY_FLAG_SQL} AND ${ORDINAL_STOP_FLAG_SQL}`;
+/** How far below the highest rowid the remembered rows reach. */
+const SUMMARY_ANCHOR_SPAN = 256;
+/** How many of those rows are remembered. */
+const SUMMARY_ANCHOR_LIMIT = 64;
+/** Written summary ids kept per session before falling back to a full rescan. */
+const WRITTEN_SUMMARY_ID_LIMIT = 4096;
+
+interface RowAnchor {
+    rowid: number;
+    id: string;
+}
+
+interface SummaryCandidates {
+    epoch: number;
+    /** The highest rows of `message` when the set was last updated, highest first. Empty when the table was empty. */
+    anchors: RowAnchor[];
+    /** Ids of this session's rows that carried the `summary` flag when read. */
+    ids: Set<string>;
+}
+
+/** The candidates as one count uses them: every flagged row is in `ids` or above `floorRowid`. */
+interface CandidateView {
+    ids: string[];
+    floorRowid: number;
+    /** The id the row at `floorRowid` must still hold; null when the table was empty. */
+    floorId: string | null;
+}
+
+const summaryCandidateSets = new WeakMap<Database, Map<string, SummaryCandidates>>();
+/** Bumped by {@link forgetRawSessionSummaryRows}; older candidate sets are rebuilt. */
+const summaryCandidateEpochs = new Map<string, number>();
+/** Summary rows Magic Context wrote, merged into every connection's candidates. */
+const writtenSummaryIds = new Map<string, Set<string>>();
+/** Connections whose `message` table cannot be read by rowid or lacks json_each. */
+const indexedCountUnsupported = new WeakSet<Database>();
+let ordinalJsonRowsRead = 0;
+let summaryFullScans = 0;
+
+/**
+ * Rebuild a session's summary candidates from a full scan on the next count.
+ * Needed only after an in-place edit that gave an existing ordinary row the
+ * `summary` flag; deletes, inserts, moved timestamps and summaries finishing
+ * are all seen without it.
+ */
+export function forgetRawSessionSummaryRows(sessionId: string): void {
+    summaryCandidateEpochs.set(sessionId, (summaryCandidateEpochs.get(sessionId) ?? 0) + 1);
+    writtenSummaryIds.delete(sessionId);
+    // A watermark proven with the old candidates may carry the missed summary.
+    forgetRawSessionOrdinalWatermark(sessionId);
+}
+
+/**
+ * Record that this process wrote a compaction-summary row, so counts on every
+ * connection re-read it even when the write rewrote an existing row in place.
+ */
+export function noteRawSessionSummaryRowWritten(sessionId: string, messageId: string): void {
+    let ids = writtenSummaryIds.get(sessionId);
+    if (!ids) {
+        ids = new Set();
+        writtenSummaryIds.set(sessionId, ids);
+    }
+    ids.add(messageId);
+    if (ids.size > WRITTEN_SUMMARY_ID_LIMIT) forgetRawSessionSummaryRows(sessionId);
+}
+
+/** @internal Message rows whose JSON the ordinal counts may have parsed since the last reset. */
+export function getRawSessionOrdinalJsonRowsReadForTest(): number {
+    return ordinalJsonRowsRead;
+}
+
+/** @internal Full summary scans of a session since the last reset. */
+export function getRawSessionSummaryFullScansForTest(): number {
+    return summaryFullScans;
+}
+
+/** @internal */
+export function resetRawSessionOrdinalJsonRowsReadForTest(): void {
+    ordinalJsonRowsRead = 0;
+    summaryFullScans = 0;
+}
+
+const ANCHOR_ROWS_SQL = `SELECT rowid AS rid, id, 1 AS kind FROM message
+    WHERE rowid > (SELECT MAX(rowid) FROM message) - ${SUMMARY_ANCHOR_SPAN}`;
+
+/**
+ * One statement, so the remembered rows and the candidates come from the same
+ * state. kind 1: a remembered row; 2: a flagged row of the session; 3: an
+ * unflagged new row of the session; 4: the session's row count.
+ */
+const SUMMARY_FULL_SCAN_SQL = `${ANCHOR_ROWS_SQL}
+    UNION ALL
+    SELECT rowid, id, 2 FROM message WHERE session_id = ? AND ${ORDINAL_SUMMARY_FLAG_SQL}
+    UNION ALL
+    SELECT COUNT(*), NULL, 4 FROM message WHERE session_id = ?`;
+
+/** `+session_id` keeps SQLite on the rowid range instead of the session index. */
+const SUMMARY_SCAN_AFTER_SQL = `${ANCHOR_ROWS_SQL}
+    UNION ALL
+    SELECT rowid, id, CASE WHEN ${ORDINAL_SUMMARY_FLAG_SQL} THEN 2 ELSE 3 END
+    FROM message WHERE rowid > ? AND +session_id = ?`;
+
+const ANCHOR_CHECK_SQL =
+    "SELECT rowid AS rid, id FROM message WHERE rowid IN (SELECT value FROM json_each(?))";
+
+interface ScanRow {
+    rid: number | null;
+    id: string | null;
+    kind: number;
+}
+
+/** The highest remembered row that still holds the same message, or undefined if none does. */
+function survivingAnchor(db: Database, set: SummaryCandidates): RowAnchor | null | undefined {
+    if (set.anchors.length === 0) return null;
+    const current = new Map(
+        (
+            db
+                .prepare(ANCHOR_CHECK_SQL)
+                .all(JSON.stringify(set.anchors.map((anchor) => anchor.rowid))) as Array<{
+                rid: number;
+                id: string;
+            }>
+        ).map((row) => [row.rid, row.id]),
+    );
+    return set.anchors.find((anchor) => current.get(anchor.rowid) === anchor.id);
+}
+
+/**
+ * A full summary scan of one session: the highest rows of `message` and the
+ * session's flagged rows, read by one statement so both describe the same
+ * state. Rows written after that state sit above `anchors[0]` (or replace one
+ * of the remembered rows, which the next count notices), so a scan made on any
+ * connection, at any earlier time, can be installed with
+ * {@link installRawSessionSummaryScan} and brought up to date by the ordinary
+ * incremental read.
+ */
+export interface RawSessionSummaryScan {
+    anchors: Array<{ rowid: number; id: string }>;
+    ids: string[];
+    /** Rows of the session whose JSON the scan read. */
+    sessionRows: number;
+}
+
+/** Run a full summary scan. The warm-up worker calls this on its own connection. */
+export function scanRawSessionSummaryRows(db: Database, sessionId: string): RawSessionSummaryScan {
+    const rows = db.prepare(SUMMARY_FULL_SCAN_SQL).all(sessionId, sessionId) as ScanRow[];
+    const anchors: RowAnchor[] = [];
+    const ids: string[] = [];
+    let sessionRows = 0;
+    for (const row of rows) {
+        if (row.kind === 1 && typeof row.rid === "number" && typeof row.id === "string")
+            anchors.push({ rowid: row.rid, id: row.id });
+        else if (row.kind === 2 && typeof row.id === "string") ids.push(row.id);
+        else if (row.kind === 4 && typeof row.rid === "number") sessionRows = row.rid;
+    }
+    anchors.sort((left, right) => right.rowid - left.rowid);
+    anchors.length = Math.min(anchors.length, SUMMARY_ANCHOR_LIMIT);
+    return { anchors, ids, sessionRows };
+}
+
+/** The value to pass to {@link installRawSessionSummaryScan} for a scan started now. */
+export function getRawSessionSummaryEpoch(sessionId: string): number {
+    return summaryCandidateEpochs.get(sessionId) ?? 0;
+}
+
+/**
+ * Use a scan made elsewhere as this connection's summary candidates. Ignored
+ * when {@link forgetRawSessionSummaryRows} ran for the session after the scan
+ * started (`epoch` is then stale), or when the connection already has a usable
+ * set. Returns whether the session is now ready to count without a scan.
+ */
+export function installRawSessionSummaryScan(
+    db: Database,
+    sessionId: string,
+    scan: RawSessionSummaryScan,
+    epoch: number,
+): boolean {
+    if (epoch !== getRawSessionSummaryEpoch(sessionId)) return false;
+    if (isRawSessionSummaryWarm(db, sessionId)) return true;
+    let sessions = summaryCandidateSets.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        summaryCandidateSets.set(db, sessions);
+    }
+    sessions.set(sessionId, { epoch, anchors: [...scan.anchors], ids: new Set(scan.ids) });
+    return isRawSessionSummaryWarm(db, sessionId);
+}
+
+/**
+ * Whether the next count of this session on this connection can skip the full
+ * scan: a candidate set exists for the current epoch and one of its remembered
+ * rows still holds the same message. False when the store cannot be read by
+ * rowid (the JSON-reading count is used there instead).
+ */
+export function isRawSessionSummaryWarm(db: Database, sessionId: string): boolean {
+    const set = summaryCandidateSets.get(db)?.get(sessionId);
+    if (!set || set.epoch !== getRawSessionSummaryEpoch(sessionId)) return false;
+    try {
+        return survivingAnchor(db, set) !== undefined;
+    } catch {
+        return false;
+    }
+}
+
+/** Message rows of a session, counted from the `(session_id, ...)` index alone. */
+export function countStoredRawSessionRowsIndexed(db: Database, sessionId: string): number {
+    const row = db
+        .prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?")
+        .get(sessionId) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
+}
+
+function summaryCandidatesOf(db: Database, sessionId: string): CandidateView {
+    let sessions = summaryCandidateSets.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        summaryCandidateSets.set(db, sessions);
+    }
+    const epoch = getRawSessionSummaryEpoch(sessionId);
+    const cached = sessions.get(sessionId);
+    // null: the table was empty, so every row is new. undefined: rescan.
+    const floor = cached && cached.epoch === epoch ? survivingAnchor(db, cached) : undefined;
+    let ids: Set<string>;
+    let anchors: RowAnchor[];
+    if (floor === undefined) {
+        const scan = scanRawSessionSummaryRows(db, sessionId);
+        summaryFullScans += 1;
+        ordinalJsonRowsRead += scan.sessionRows;
+        ids = new Set(scan.ids);
+        anchors = scan.anchors;
+    } else {
+        const rows = db
+            .prepare(SUMMARY_SCAN_AFTER_SQL)
+            .all(floor?.rowid ?? 0, sessionId) as ScanRow[];
+        ids = cached?.ids ?? new Set<string>();
+        anchors = [];
+        for (const row of rows) {
+            if (row.kind === 1 && typeof row.rid === "number" && typeof row.id === "string")
+                anchors.push({ rowid: row.rid, id: row.id });
+            else if (row.kind === 2 && typeof row.id === "string") ids.add(row.id);
+            if (row.kind === 2 || row.kind === 3) ordinalJsonRowsRead += 1;
+        }
+        anchors.sort((left, right) => right.rowid - left.rowid);
+        anchors.length = Math.min(anchors.length, SUMMARY_ANCHOR_LIMIT);
+    }
+    for (const id of writtenSummaryIds.get(sessionId) ?? []) ids.add(id);
+    sessions.set(sessionId, { epoch, anchors, ids });
+    const top = anchors[0];
+    return { ids: [...ids], floorRowid: top?.rowid ?? 0, floorId: top?.id ?? null };
+}
+
+function canonicalCountSql(lower: boolean, upper: boolean): string {
+    const range = `${lower ? " AND (time_created, id) > (?, ?)" : ""}${
+        upper ? " AND (time_created, id) <= (?, ?)" : ""
+    }`;
+    return `SELECT
+        (SELECT COUNT(*) FROM message WHERE session_id = ?${range}) AS stored,
+        (SELECT COUNT(*) FROM message
+          WHERE id IN (SELECT value FROM json_each(?)) AND +session_id = ?${range}
+            AND ${EXCLUDED_ROW_SQL}) AS knownExcluded,
+        (SELECT COUNT(*) FROM message
+          WHERE rowid > ? AND +session_id = ? AND id NOT IN (SELECT value FROM json_each(?))${range}
+            AND ${EXCLUDED_ROW_SQL}) AS newExcluded,
+        (SELECT id FROM message WHERE rowid = ?) AS floorId`;
+}
+
+const CANONICAL_COUNT_SQL = new Map<string, string>();
+function canonicalCountStatementText(lower: boolean, upper: boolean): string {
+    const key = `${lower}:${upper}`;
+    let sql = CANONICAL_COUNT_SQL.get(key);
+    if (!sql) {
+        sql = canonicalCountSql(lower, upper);
+        CANONICAL_COUNT_SQL.set(key, sql);
+    }
+    return sql;
+}
+
+/**
+ * Ordinal-bearing messages of a session in `(after, through]` (either bound may
+ * be open), counted from the index plus the summary candidates. Returns null
+ * when this connection's store cannot be read this way, so the caller can use
+ * the statement that reads every row's JSON.
+ */
+function countCanonicalOrdinalsIndexed(
+    db: Database,
+    sessionId: string,
+    after: OrdinalKey | null,
+    through: OrdinalKey | null,
+): number | null {
+    if (indexedCountUnsupported.has(db)) return null;
+    const range: Array<string | number> = [];
+    if (after) range.push(after.timeCreated, after.id);
+    if (through) range.push(through.timeCreated, through.id);
+    try {
+        return withReadSnapshot(db, () => {
+            // Inside one read snapshot no other connection's commit can land
+            // between validating the remembered rows, reading the rows above
+            // them and counting. The check that the remembered top row still
+            // holds the same message id (floorId) can then only fail when the
+            // caller's own open transaction wrote in between.
+            for (let attempt = 0; attempt < STABLE_STORE_ATTEMPTS; attempt += 1) {
+                const view = summaryCandidatesOf(db, sessionId);
+                const ids = JSON.stringify(view.ids);
+                const row = db
+                    .prepare(canonicalCountStatementText(after !== null, through !== null))
+                    .get(
+                        sessionId,
+                        ...range,
+                        ids,
+                        sessionId,
+                        ...range,
+                        view.floorRowid,
+                        sessionId,
+                        ids,
+                        ...range,
+                        view.floorRowid,
+                    ) as {
+                    stored?: unknown;
+                    knownExcluded?: unknown;
+                    newExcluded?: unknown;
+                    floorId?: unknown;
+                } | null;
+                if (view.floorId !== null && row?.floorId !== view.floorId) continue;
+                const stored = typeof row?.stored === "number" ? row.stored : 0;
+                const excluded =
+                    (typeof row?.knownExcluded === "number" ? row.knownExcluded : 0) +
+                    (typeof row?.newExcluded === "number" ? row.newExcluded : 0);
+                ordinalRowsVisited += stored;
+                ordinalJsonRowsRead += view.ids.length;
+                return stored - excluded;
+            }
+            return null;
+        });
+    } catch (error) {
+        // A store without a rowid `message` table or without JSON1's json_each
+        // (test fixtures, unusual builds) keeps the JSON-reading count.
+        if (/no such (column|table|function)|json_each/i.test(String(error))) {
+            indexedCountUnsupported.add(db);
+            return null;
+        }
+        throw error;
+    }
+}
+
+function connectionHasOpenTransaction(db: Database): boolean {
+    const state = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
+    return state.inTransaction === true || state.isTransaction === true;
+}
+
+/**
+ * Run `read` inside one read transaction, so all its statements see the same
+ * committed state (in WAL mode, one snapshot). A transaction the caller already
+ * holds is used as it is. The transaction only reads, so it is ended with
+ * ROLLBACK, which releases the snapshot without a commit.
+ */
+function withReadSnapshot<T>(db: Database, read: () => T): T {
+    if (connectionHasOpenTransaction(db)) return read();
+    db.exec("BEGIN");
+    try {
+        return read();
+    } finally {
+        if (connectionHasOpenTransaction(db)) db.exec("ROLLBACK");
+    }
 }
 
 function reusableWatermark(
@@ -981,8 +1395,8 @@ function rememberOrdinalWatermark(
  * unchanged; then a lookup counts just the rows between the watermark and the
  * target. Any write anywhere in the store (an append, a delete, a moved
  * timestamp, a rewritten summary, another process's commit) changes the stamp,
- * and the whole prefix is counted again, which costs one indexed range scan
- * that reads each earlier message's JSON.
+ * and the whole prefix is counted again. That count reads the index, not the
+ * messages: see {@link countCanonicalOrdinalsIndexed}.
  */
 function canonicalOrdinalOf<T extends OrdinalKey>(
     db: Database,

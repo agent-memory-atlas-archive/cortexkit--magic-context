@@ -8,6 +8,7 @@ import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-m
 import type { Database } from "../../shared/sqlite";
 import { isSystemDirective } from "../../shared/system-directive";
 import { isHostUnservedRow, markHostUnservedRow } from "./host-served-rows";
+import { prewarmRawSessionOrdinalsForDb } from "./raw-ordinal-warmup";
 import {
     getMessageTimesFromOpenCodeDb,
     getRawSessionMessageCountFromDb,
@@ -591,6 +592,23 @@ export function readRawSessionMessageRange(
 
 readRawSessionMessages.readPage = readRawSessionMessagePage;
 readRawSessionMessages.getCount = getRawSessionMessageOrdinalCount;
+readRawSessionMessages.prepare = prepareRawSessionOrdinals;
+
+/**
+ * Prepare a session's canonical ordinal counts without blocking the serving
+ * thread: the one full scan for its compaction summaries runs on a worker (see
+ * raw-ordinal-warmup.ts), after which counts read only the rows added since.
+ * Resolves false when that off-thread scan failed; a later count then scans on
+ * the calling thread, so background callers should reschedule instead of
+ * reading. Sessions served by a registered raw-message provider, or without an
+ * OpenCode store, need nothing.
+ */
+export async function prepareRawSessionOrdinals(sessionId: string): Promise<boolean> {
+    if (sessionProviders.get(sessionId)?.provider) return true;
+    if (!openCodeDbExists()) return true;
+    const db = withReadOnlySessionDb((connection) => connection);
+    return (await prewarmRawSessionOrdinalsForDb(db, sessionId)) === "warm";
+}
 
 /**
  * Prime the active raw-message cache with a TAIL-ONLY read (only messages
@@ -905,6 +923,7 @@ export function readRawSessionMessageById(sessionId: string, messageId: string):
     if (!openCodeDbExists()) return null;
     return withReadOnlySessionDb((db) => readRawSessionMessageByIdFromDb(db, sessionId, messageId));
 }
+readRawSessionMessageById.prepare = prepareRawSessionOrdinals;
 
 function readRawSessionMessagesFromSource(sessionId: string): RawMessage[] {
     const provider = sessionProviders.get(sessionId)?.provider;

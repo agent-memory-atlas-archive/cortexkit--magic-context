@@ -53,6 +53,10 @@ const KNOWN_SLOTS: Record<string, KnownSlot> = {
         classification: "VERDICT",
         reason: "Correct: circuit state expires and a half-open probe re-evaluates the endpoint.",
     },
+    "packages/plugin/src/hooks/magic-context/raw-ordinal-warmup.ts:exitHookRegistered": {
+        classification: "PUBLICATION",
+        reason: "Correct: records that the one process-exit handler stopping canonical-ordinal warm-up workers is installed; it holds no failure or absence verdict.",
+    },
     "packages/plugin/src/features/magic-context/memory/project-identity.ts:homeProjectPermission": {
         classification: "VERDICT",
         reason: "Boot config publishes the home-project permission; the setter replaces it on another host initialization, while explicit resolution arguments override it.",

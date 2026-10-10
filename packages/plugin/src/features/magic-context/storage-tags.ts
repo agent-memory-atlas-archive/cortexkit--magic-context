@@ -8,6 +8,7 @@ import {
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
 import { queuePendingOp, removePendingOp } from "./storage-ops";
+import { tagIdentityRevisionKey } from "./storage-tag-identity-revision";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -751,17 +752,50 @@ interface TagOwnerRow {
  * transform pass used to read every tag of the session for it, twice; this is
  * kept per connection and extended with the rows appended since the last read.
  *
- * It is rebuilt from scratch when anything but an append may have happened:
- * another connection committed (`data_version` moved), or a statement that can
- * change or delete an existing tag ran in this process (the generation from
- * `getTagIdentityWriteGeneration` moved). A prose ratio it has not folded yet
- * also rebuilds it. Inside an open transaction it is neither used nor stored,
- * since uncommitted rows can still roll back.
+ * It is rebuilt from scratch when a statement that can change or delete an
+ * existing tag ran in this process (the generation from
+ * `getTagIdentityWriteGeneration` moved), or when a prose ratio it has not
+ * folded yet is asked for. Status, drop-mode and size writes never move that
+ * generation, so they never rebuild it.
+ *
+ * A commit by another connection (`data_version` moved) is checked against the
+ * session's shape first: the number of its tags and its highest tag id, read
+ * from the `(session_id, ...)` index together with the rows above the cached
+ * highest id in one statement. When the count grew by exactly the number of
+ * new rows, the other connection only appended, and those rows are folded in.
+ * A delete, or an insert below the cached highest id (only possible with an
+ * explicit id, since `tags.id` is AUTOINCREMENT), leaves the count short of
+ * that and rebuilds. A delete and an explicit-id insert below the highest id in
+ * the same interval would cancel out; no writer inserts tags with an explicit id.
+ *
+ * Tool tags written before owners were recorded have no owner and count for
+ * no message. Another process can give them one later (the tool-owner backfill
+ * that runs when an OpenCode process opens the store), so their ids are kept
+ * and re-read by primary key after each such commit; there are none in
+ * sessions created since owners were recorded.
+ *
+ * In-place rewrites of a tag's id, session, message id, number, type, owner or
+ * reasoning count are counted in the session's tag identity revision by every
+ * Magic Context connection (a connection-local trigger, see
+ * storage-tag-identity-revision.ts), read in the same statement as the count;
+ * a changed revision rebuilds. Rewrites by a connection that never installed
+ * that trigger (a tool editing the file directly) are not seen while the
+ * count and highest id still fit an append.
+ *
+ * Inside an open transaction it is neither used nor stored, since uncommitted
+ * rows can still roll back.
  */
 interface TagOwnerSummary {
     dataVersion: number;
+    schemaVersion: number;
     generation: number;
     lastRowId: number;
+    /** Tag rows of the session folded into this summary. */
+    rowCount: number;
+    /** Ids of tool tags folded without an owner; another process may still adopt them. */
+    unownedToolRows: Set<number>;
+    /** The session's tag identity revision when the summary was built or last checked. */
+    identityRevision: string | null;
     maxTagByOwner: Map<string, number>;
     /** Reasoning estimates per prose ratio, folded exactly as a full read would. */
     reasoningEstimatesByRatio: Map<number, Map<string, number>>;
@@ -771,19 +805,30 @@ const tagOwnerSummaries = new WeakMap<Database, Map<string, TagOwnerSummary>>();
 /** The prose ratio comes from session calibration and changes rarely; keep the most recent few. */
 const MAX_CACHED_PROSE_RATIOS = 4;
 let tagOwnerRowsRead = 0;
+let tagOwnerShapeChecks = 0;
 
 /** @internal Tag rows the owner summary has read since the last reset. */
 export function getTagOwnerRowsReadForTest(): number {
     return tagOwnerRowsRead;
 }
 
+/** @internal Shape checks made after another connection's commit since the last reset. */
+export function getTagOwnerShapeChecksForTest(): number {
+    return tagOwnerShapeChecks;
+}
+
 /** @internal */
 export function resetTagOwnerRowsReadForTest(): void {
     tagOwnerRowsRead = 0;
+    tagOwnerShapeChecks = 0;
 }
 
-function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow): void {
+function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow, newRow = true): void {
     summary.lastRowId = Math.max(summary.lastRowId, row.id);
+    if (newRow) summary.rowCount += 1;
+    if (row.type === "tool" && typeof row.tool_owner_message_id !== "string")
+        summary.unownedToolRows.add(row.id);
+    else summary.unownedToolRows.delete(row.id);
     const owner =
         row.type === "tool"
             ? typeof row.tool_owner_message_id === "string"
@@ -829,42 +874,133 @@ function connectionInTransaction(db: Database): boolean {
     }
 }
 
+/**
+ * The rows above the cached highest id together with the session's tag count
+ * and highest id, from one statement so all three describe the same commit.
+ * The count and highest id come from the `(session_id, ...)` index alone.
+ */
+const TAG_OWNER_APPENDED_WITH_SHAPE_SQL = `SELECT ${TAG_OWNER_COLUMNS}, 0 AS shape, NULL AS tag_count, NULL AS max_id, NULL AS revision
+    FROM tags WHERE id > ? AND +session_id = ?
+    UNION ALL
+    SELECT NULL, NULL, NULL, NULL, NULL, NULL, 1, COUNT(*), MAX(id), (SELECT value FROM schema_migrations_meta WHERE key = ?)
+    FROM tags WHERE session_id = ?`;
+
+function readTagIdentityRevision(db: Database, sessionId: string): string | null {
+    const row = db
+        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+        .get(tagIdentityRevisionKey(sessionId)) as { value?: unknown } | null;
+    return typeof row?.value === "string" ? row.value : null;
+}
+
+/**
+ * After another connection's commit: the rows it appended to the session, or
+ * null when the session changed in a way appends cannot explain.
+ */
+function appendedSinceForeignCommit(
+    db: Database,
+    sessionId: string,
+    cached: TagOwnerSummary,
+): TagOwnerRow[] | null {
+    tagOwnerShapeChecks += 1;
+    const rows = db
+        .prepare(TAG_OWNER_APPENDED_WITH_SHAPE_SQL)
+        .all(cached.lastRowId, sessionId, tagIdentityRevisionKey(sessionId), sessionId) as Array<
+        TagOwnerRow & {
+            shape: number;
+            tag_count: number | null;
+            max_id: number | null;
+            revision: string | null;
+        }
+    >;
+    const shape = rows.find((row) => row.shape === 1);
+    const appended = rows.filter((row) => row.shape === 0);
+    const highest = appended.reduce((max, row) => Math.max(max, row.id), cached.lastRowId);
+    if (
+        !shape ||
+        // Another Magic Context connection rewrote a tag's identity or reasoning
+        // count in this session; the count and highest id cannot show that.
+        (shape.revision ?? null) !== cached.identityRevision ||
+        shape.tag_count !== cached.rowCount + appended.length ||
+        (shape.max_id ?? 0) !== highest
+    )
+        return null;
+    return appended;
+}
+
+/** Ownerless tool tags of the summary that another process has since given an owner. */
+function adoptedSinceForeignCommit(db: Database, cached: TagOwnerSummary): TagOwnerRow[] {
+    if (cached.unownedToolRows.size === 0) return [];
+    return db
+        .prepare(
+            `SELECT ${TAG_OWNER_COLUMNS} FROM tags
+             WHERE id IN (SELECT value FROM json_each(?)) AND tool_owner_message_id IS NOT NULL`,
+        )
+        .all(JSON.stringify([...cached.unownedToolRows])) as TagOwnerRow[];
+}
+
 function readTagOwnerSummary(
     db: Database,
     sessionId: string,
     proseRatio?: number,
 ): TagOwnerSummary {
     const inTransaction = connectionInTransaction(db);
-    const dataVersion = inTransaction
-        ? -1
-        : ((db.prepare("PRAGMA data_version").get() as { data_version?: number } | null)
-              ?.data_version ?? -1);
+    const versions = inTransaction
+        ? null
+        : (db
+              .prepare(
+                  "SELECT data_version AS dataVersion, (SELECT schema_version FROM pragma_schema_version) AS schemaVersion FROM pragma_data_version",
+              )
+              .get() as { dataVersion?: number; schemaVersion?: number } | null);
+    const dataVersion = versions?.dataVersion ?? -1;
+    const schemaVersion = versions?.schemaVersion ?? -1;
     const generation = getTagIdentityWriteGeneration();
     const sessions = tagOwnerSummaries.get(db) ?? new Map<string, TagOwnerSummary>();
     const cached = inTransaction ? undefined : sessions.get(sessionId);
     if (
         cached &&
-        cached.dataVersion === dataVersion &&
         cached.generation === generation &&
+        // A rebuilt or altered table can keep the session's count and highest id.
+        cached.schemaVersion === schemaVersion &&
         (proseRatio === undefined || cached.reasoningEstimatesByRatio.has(proseRatio))
     ) {
-        // Only appends can have happened. `+session_id` keeps SQLite on the
-        // rowid range, so this reads the rows appended since, in any session.
-        const rows = db
-            .prepare(
-                `SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE id > ? AND +session_id = ? ORDER BY id`,
-            )
-            .all(cached.lastRowId, sessionId) as TagOwnerRow[];
-        tagOwnerRowsRead += rows.length;
-        for (const row of rows) foldTagOwnerRow(cached, row);
-        return cached;
+        let rows: TagOwnerRow[] | null;
+        if (cached.dataVersion === dataVersion) {
+            // Only this connection wrote, and only appends. `+session_id` keeps
+            // SQLite on the rowid range, so this reads the rows appended since,
+            // in any session.
+            rows = db
+                .prepare(
+                    `SELECT ${TAG_OWNER_COLUMNS} FROM tags WHERE id > ? AND +session_id = ? ORDER BY id`,
+                )
+                .all(cached.lastRowId, sessionId) as TagOwnerRow[];
+        } else {
+            rows = appendedSinceForeignCommit(db, sessionId, cached);
+        }
+        if (rows) {
+            const adopted =
+                cached.dataVersion === dataVersion ? [] : adoptedSinceForeignCommit(db, cached);
+            tagOwnerRowsRead += rows.length + adopted.length;
+            for (const row of rows) foldTagOwnerRow(cached, row);
+            for (const row of adopted) foldTagOwnerRow(cached, row, false);
+            cached.dataVersion = dataVersion;
+            return cached;
+        }
     }
     const ratios = [...(cached?.reasoningEstimatesByRatio.keys() ?? [])];
     if (proseRatio !== undefined && !ratios.includes(proseRatio)) ratios.push(proseRatio);
     const summary: TagOwnerSummary = {
         dataVersion,
+        schemaVersion,
         generation,
         lastRowId: 0,
+        rowCount: 0,
+        unownedToolRows: new Set(),
+        // Read the revision before the rows. A rewrite committed between the two
+        // reads is already in the rows, and the revision check after the next
+        // foreign commit sees the newer revision and rebuilds once more; the
+        // other order could store a revision that already includes a rewrite
+        // the rows miss.
+        identityRevision: readTagIdentityRevision(db, sessionId),
         maxTagByOwner: new Map(),
         reasoningEstimatesByRatio: new Map(
             ratios.slice(-MAX_CACHED_PROSE_RATIOS).map((ratio) => [ratio, new Map()]),

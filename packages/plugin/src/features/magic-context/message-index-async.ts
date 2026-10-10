@@ -98,6 +98,21 @@ function clearCompletedIncrementalKeys(sessionId: string): void {
     }
 }
 
+/**
+ * Sources backed by the OpenCode store provide `prepare`, an off-thread warm-up
+ * after which their synchronous reads count ordinals without scanning the
+ * session. When it resolves false the job retries later instead of reading.
+ * Sources without `prepare` are read directly.
+ */
+type PreparedSource = { prepare?: (sessionId: string) => Promise<boolean> };
+
+const PREPARE_RETRY_MS = 60_000;
+
+async function sourceReady(source: unknown, sessionId: string): Promise<boolean> {
+    const prepare = (source as PreparedSource | null)?.prepare;
+    return typeof prepare === "function" ? prepare(sessionId) : true;
+}
+
 type FullReadMessages = ((sessionId: string) => RawMessage[]) & {
     readPage?: (
         sessionId: string,
@@ -107,9 +122,9 @@ type FullReadMessages = ((sessionId: string) => RawMessage[]) & {
         after?: RawMessageOrdinalAnchor,
     ) => RawMessage[];
     getCount?: (sessionId: string) => number;
-};
+} & PreparedSource;
 
-export interface BoundedMessageReconciliationSource {
+export interface BoundedMessageReconciliationSource extends PreparedSource {
     readPage(
         sessionId: string,
         afterOrdinal: number,
@@ -121,7 +136,8 @@ export interface BoundedMessageReconciliationSource {
 }
 
 export type MessageReconciliationSource = FullReadMessages | BoundedMessageReconciliationSource;
-type ReadSingleMessage = (sessionId: string, messageId: string) => RawMessage | null;
+type ReadSingleMessage = ((sessionId: string, messageId: string) => RawMessage | null) &
+    PreparedSource;
 type IncrementalMessageSource = ReadSingleMessage | RawMessage;
 
 function defer(fn: () => void): void {
@@ -187,7 +203,10 @@ async function reconcileSessionIndex(
     db: Database,
     sessionId: string,
     readMessages: MessageReconciliationSource,
-): Promise<void> {
+): Promise<boolean> {
+    // Wait for the warm-up outside the session lock, so live indexing of this
+    // session is not held behind it.
+    if (!(await sourceReady(readMessages, sessionId))) return false;
     await runWithSessionLock(sessionId, async () => {
         if (heapHolder.reconciledSessions.has(sessionId)) return;
 
@@ -245,6 +264,7 @@ async function reconcileSessionIndex(
             heapHolder.activeReconcilerBuffers.delete(sessionId);
         }
     });
+    return true;
 }
 
 export function scheduleReconciliation(
@@ -263,6 +283,14 @@ export function scheduleReconciliation(
     scheduleAfterBootQuiet(() => {
         defer(() => {
             void reconcileSessionIndex(db, sessionId, readMessages)
+                .then((ran) => {
+                    if (ran) return;
+                    // The source could not be prepared: try again later.
+                    setTimeout(() => {
+                        heapHolder.reconciliationScheduledSessions.delete(sessionId);
+                        scheduleReconciliation(db, sessionId, readMessages);
+                    }, PREPARE_RETRY_MS).unref?.();
+                })
                 .catch((error) => {
                     logIndexingError(sessionId, "reconciliation", error);
                     if (isDatabaseLockedError(error))
@@ -296,7 +324,7 @@ export function scheduleIncrementalIndex(
     const timer = setTimeout(() => {
         heapHolder.incrementalTimers.delete(schedulingKey);
         heapHolder.pendingIncrementalKeys.add(schedulingKey);
-        void runWithSessionLock(sessionId, () => {
+        const indexMessage = () => {
             const message =
                 typeof messageSource === "function"
                     ? messageSource(sessionId, messageId)
@@ -322,7 +350,17 @@ export function scheduleIncrementalIndex(
                 heapHolder.reconciledSessions.add(sessionId);
             }
             heapHolder.completedIncrementalKeys.add(revisionKey);
-        })
+        };
+        void sourceReady(messageSource, sessionId)
+            .then((ready) => {
+                if (ready) return runWithSessionLock(sessionId, indexMessage);
+                // Try again after PREPARE_RETRY_MS. A later reconciliation of the
+                // session also indexes this message.
+                setTimeout(
+                    () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
+                    PREPARE_RETRY_MS,
+                ).unref?.();
+            })
             .catch((error) => {
                 heapHolder.reconciledSessions.delete(sessionId);
                 logIndexingError(sessionId, `incremental index for ${messageId}`, error);
