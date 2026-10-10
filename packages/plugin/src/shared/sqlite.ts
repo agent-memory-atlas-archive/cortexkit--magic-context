@@ -235,8 +235,8 @@ const trackedSqliteConnections = new Map<number, TrackedSqliteConnection>();
 let nextSqliteConnectionSequence = 1;
 
 /**
- * Columns of the context store's `tags` table that never decide which message a
- * tag belongs to, its number, its type, or its reasoning token estimate.
+ * Columns of Magic Context's `tags` table (context.db) that never decide which
+ * message a tag belongs to, its number, its type, or its reasoning token estimate.
  */
 const TAG_COLUMNS_OUTSIDE_IDENTITY = new Set([
     "status",

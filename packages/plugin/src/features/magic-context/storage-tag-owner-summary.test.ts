@@ -20,7 +20,12 @@ import {
 
 const SESSION = "ses-tags";
 
-/** The reasoning budget projection's owner grouping, computed from every tag as it used to be. */
+/**
+ * Highest tag number per owning message, read from every tag of the session:
+ * a tool tag counts for its tool owner message (skipped without one), any other
+ * tag for the message its content id names. This is how
+ * projectOpencodeReasoningBudgetCutoff grouped tags before the summary cache.
+ */
 function frozenMaxTagByOwner(db: Database, sessionId: string): Map<string, number> {
     const maxTags = new Map<string, number>();
     for (const tag of getTagsBySession(db, sessionId)) {
@@ -31,7 +36,11 @@ function frozenMaxTagByOwner(db: Database, sessionId: string): Map<string, numbe
     return maxTags;
 }
 
-/** The estimate statement as it was before the summary cache. */
+/**
+ * Reasoning token estimate per owning message (the largest message-tag count
+ * times the prose ratio), computed with the full-session statement that
+ * getReasoningTokenEstimatesByMessage ran before the summary cache.
+ */
 function frozenReasoningEstimates(
     db: Database,
     sessionId: string,
@@ -113,7 +122,7 @@ describe("tag owner summary", () => {
             addTag(db, 6, "m-3", "message", null);
             addTag(db, 7, "call-3", "tool", null, "m-3");
             expectMatchesFullRead(db);
-            // Another prose ratio is folded on demand.
+            // A prose ratio the summary has not seen yet must still match a full read.
             expectMatchesFullRead(db, 1.5);
 
             // A reasoning count written later changes an existing row.

@@ -768,7 +768,7 @@ interface TagOwnerSummary {
 }
 
 const tagOwnerSummaries = new WeakMap<Database, Map<string, TagOwnerSummary>>();
-/** Calibration moves the prose ratio rarely; keep the few most recent. */
+/** The prose ratio comes from session calibration and changes rarely; keep the most recent few. */
 const MAX_CACHED_PROSE_RATIOS = 4;
 let tagOwnerRowsRead = 0;
 

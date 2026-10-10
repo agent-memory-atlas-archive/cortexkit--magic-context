@@ -22,9 +22,11 @@ import type { MessageLike } from "./tag-messages";
 type CutoffArgs = Parameters<typeof opencodeReasoningBudgetCutoff>[0];
 
 /**
- * The cutoff as it was before the frozen decisions were decoded once per call:
- * every cost callback decoded them all again through the strip helper. Copied
- * here so a change to the implementation cannot move both sides.
+ * opencodeReasoningBudgetCutoff as it was before this change. Each assistant's
+ * cost callback called stripReasoningFromMergedAssistants, which decoded every
+ * frozen merged-reasoning decision (the persisted record of which reasoning
+ * parts to replace with sentinels) again. Copied here so a change to the
+ * implementation cannot move both sides of the comparison.
  */
 function frozenCutoff(args: CutoffArgs): number {
     const assistants = args.messages.filter((message) => message.info.role === "assistant");
@@ -82,7 +84,10 @@ function user(index: number): MessageLike {
     } as unknown as MessageLike;
 }
 
-/** An assistant with two signed thinking parts around a tool call, so a strip has a choice. */
+/**
+ * An assistant with two reasoning parts around a tool call, so stripping has to
+ * choose which part to replace.
+ */
 function assistant(index: number): MessageLike {
     return {
         info: { id: `a-${index}`, role: "assistant", tokens: { reasoning: index % 3 ? 0 : 40 } },
@@ -109,7 +114,11 @@ function assistant(index: number): MessageLike {
     } as unknown as MessageLike;
 }
 
-/** Runs of assistants between users, with frozen part decisions, legacy bare ids and none. */
+/**
+ * Assistant runs separated by users. Some assistants have a decision naming the
+ * exact reasoning parts to strip, some an older decision holding only the
+ * message id, and the rest none.
+ */
 function fixture(assistantCount: number): CutoffArgs {
     const messages: MessageLike[] = [];
     const messageTagNumbers = new Map<MessageLike, number>();
@@ -121,14 +130,15 @@ function fixture(assistantCount: number): CutoffArgs {
         messages.push(message);
         messageTagNumbers.set(message, ++tag);
         if (index % 5 === 1) {
-            // A decision naming exact parts, by host id and by index.
+            // A decision naming the parts to strip, by host part id or by index.
             frozenMergedIds.add(
                 MERGED_REASONING_PARTS_PREFIX +
                     JSON.stringify([`a-${index}`, index % 2 ? [`p-${index}-1`] : [0]]),
             );
             frozenMergedIds.add(`a-${index}`);
         } else if (index % 5 === 3) {
-            // A legacy bare id: replayed through the layout rule, not exact parts.
+            // An older decision holding only the message id: the parts to strip
+            // are chosen from the message's layout, not named individually.
             frozenMergedIds.add(`a-${index}`);
         }
     }
