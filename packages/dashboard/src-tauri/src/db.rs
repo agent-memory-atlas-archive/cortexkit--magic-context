@@ -1128,9 +1128,11 @@ pub struct Compartment {
     pub title: String,
     pub content: String,
     pub created_at: i64,
-    /// Resolved from OpenCode DB using start_message_id
+    /// Epoch milliseconds from the OpenCode message table or Pi/OMP JSONL entry
+    /// matched by start_message_id.
     pub start_time: Option<i64>,
-    /// Resolved from OpenCode DB using end_message_id
+    /// Epoch milliseconds from the OpenCode message table or Pi/OMP JSONL entry
+    /// matched by end_message_id.
     pub end_time: Option<i64>,
     /// v2 decay-rate score (1–100). Higher = decays into lower render tiers
     /// more slowly. Default 50.
@@ -7272,9 +7274,32 @@ pub fn get_pi_session_detail(
         .filter(|m| m.usage.as_ref().is_some_and(|u| u.total > 0))
         .count() as i64;
 
-    let compartments = conn
+    let mut compartments = conn
         .and_then(|c| get_compartments(c, session_id).ok())
         .unwrap_or_default();
+    let boundary_ids: Vec<String> = compartments
+        .iter()
+        .flat_map(|compartment| {
+            [
+                compartment.start_message_id.as_deref(),
+                compartment.end_message_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(str::to_owned)
+        })
+        .collect();
+    let entry_times = pi_sessions::read_pi_entry_times(&path, &boundary_ids);
+    for compartment in &mut compartments {
+        compartment.start_time = compartment
+            .start_message_id
+            .as_ref()
+            .and_then(|id| entry_times.get(id).copied());
+        compartment.end_time = compartment
+            .end_message_id
+            .as_ref()
+            .and_then(|id| entry_times.get(id).copied());
+    }
     let facts = conn
         .and_then(|c| get_session_facts(c, session_id).ok())
         .unwrap_or_default();

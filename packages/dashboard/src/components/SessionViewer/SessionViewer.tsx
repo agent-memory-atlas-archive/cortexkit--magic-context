@@ -27,6 +27,7 @@ import {
   updateSessionFact,
 } from "../../lib/api";
 import { LoadMoreTrigger } from "../../lib/load-more";
+import { formatCompartmentDateSpan } from "./session-dates";
 import type { HarnessFilter } from "./session-filter";
 import { parseStoredHarnessFilter, sessionHarnessOptions } from "./session-filter";
 
@@ -700,7 +701,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
             class="section-title"
             style={{
               display: "flex",
-              "align-items": "flex-start",
+              "align-items": "center",
               gap: "8px",
               "min-width": 0,
               "flex-wrap": "wrap",
@@ -718,7 +719,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
               <span
                 style={{
                   display: "inline-flex",
-                  "align-items": "flex-start",
+                  "align-items": "center",
                   gap: "8px",
                   "min-width": 0,
                   flex: "1 1 0",
@@ -950,12 +951,30 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                   {detail().project_display}
                 </span>
               </div>
-              <div class="card-meta">
+              <div
+                class="card-meta"
+                style={{ "min-width": "0", "align-items": "stretch", "flex-direction": "column" }}
+              >
                 <span class="id-text selectable">{detail().session_id}</span>
                 <Show when={detail().pi_jsonl_path}>
                   {(path) => (
-                    <span>
-                      JSONL: <span class="id-text selectable">{path()}</span>
+                    <span
+                      style={{
+                        display: "flex",
+                        "align-items": "center",
+                        gap: "6px",
+                        "min-width": "0",
+                        "max-width": "100%",
+                      }}
+                    >
+                      <span style={{ "flex-shrink": "0" }}>JSONL:</span>
+                      <span
+                        class="id-text selectable"
+                        title={path()}
+                        style={{ display: "block", flex: "1 1 auto", "min-width": "0" }}
+                      >
+                        {path()}
+                      </span>
                     </span>
                   )}
                 </Show>
@@ -1211,17 +1230,25 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 legacy
                               </span>
                             ) : null}
-                            {comp.start_time && comp.end_time && (
-                              <span
-                                style={{
-                                  color: "var(--text-muted)",
-                                  "font-size": "11px",
-                                  "margin-left": "8px",
-                                }}
-                              >
-                                {formatDateTime(comp.start_time)} → {formatDateTime(comp.end_time)}
-                              </span>
-                            )}
+                            <Show
+                              when={formatCompartmentDateSpan(
+                                comp.start_time,
+                                comp.end_time,
+                                comp.created_at,
+                              )}
+                            >
+                              {(dateSpan) => (
+                                <span
+                                  style={{
+                                    color: "var(--text-muted)",
+                                    "font-size": "11px",
+                                    "margin-left": "8px",
+                                  }}
+                                >
+                                  {dateSpan()}
+                                </span>
+                              )}
+                            </Show>
                           </div>
                           <span style={{ "font-size": "11px", color: "var(--text-muted)" }}>
                             {expandedCompartment() === comp.id ? "▲" : "▼"}
