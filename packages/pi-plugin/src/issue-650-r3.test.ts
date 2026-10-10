@@ -18,6 +18,7 @@ import { saveSourceContent } from "@magic-context/core/features/magic-context/st
 import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import * as logger from "@magic-context/core/shared/logger";
 import {
 	type Database,
 	getTagIdentityWriteGeneration,
