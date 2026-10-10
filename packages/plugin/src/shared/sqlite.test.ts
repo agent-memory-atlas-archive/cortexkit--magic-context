@@ -33,6 +33,7 @@ describe("SQLite runtime selector", () => {
         `;
         const child = spawnSync("node", ["--trace-warnings", "--input-type=module", "-e", script], {
             encoding: "utf8",
+            windowsHide: true,
         });
 
         expect(child.error).toBeUndefined();
