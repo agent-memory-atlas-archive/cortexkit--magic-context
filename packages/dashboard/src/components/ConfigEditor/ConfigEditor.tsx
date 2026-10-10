@@ -19,7 +19,6 @@ import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./Harn
 import HelpPopover from "./HelpPopover";
 import { LANGUAGE_OPTIONS } from "./languages";
 import ModelRoutes from "./ModelRoutes";
-import ModelSelect from "./ModelSelect";
 import PerModelTable from "./PerModelTable";
 import ProtectedTools from "./ProtectedTools";
 import { PER_MODEL_KEYS, type PerModelValues } from "./per-model-overrides";
@@ -114,14 +113,6 @@ const FIELD_DEFS: FieldDef[] = [
       "Render a deterministic image of project memories that did not fit the context budget.",
     section: "Memory & search",
   },
-  {
-    key: "mural.model",
-    label: "Cue Compressor Model",
-    type: "string",
-    description:
-      "Shared across harnesses. Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.",
-    section: "Background models",
-  },
   // Context defaults and their exceptions are rendered by PerModelTable.
   // Tags & cleanup
   {
@@ -182,12 +173,7 @@ const FIELD_DEFS: FieldDef[] = [
 // These fields are valid only in trusted user configuration. They remain in the
 // schema coverage manifest because the user form renders them, but project forms
 // must not present controls for settings the runtime strips from repositories.
-const USER_ONLY_FORM_FIELDS = new Set([
-  "language",
-  "allow_home_project",
-  "mural.model",
-  "protected_tokens",
-]);
+const USER_ONLY_FORM_FIELDS = new Set(["language", "allow_home_project", "protected_tokens"]);
 
 // ── Nested value access helpers ─────────────────────────────
 
@@ -512,14 +498,6 @@ function ConfigForm(props: {
             emptyLabel="No override"
             onChange={(next) => handleFieldChange(field.key, next)}
           />
-        ) : field.key === "mural.model" ? (
-          <ModelSelect
-            label="Cue Compressor Model"
-            models={[...new Set(Object.values(props.modelCatalogs).filter(Array.isArray).flat())]}
-            value={value() as string | undefined}
-            placeholder="Use built-in cue model"
-            onChange={(next) => handleFieldChange(field.key, next || undefined)}
-          />
         ) : (
           <input
             class="config-input"
@@ -528,7 +506,7 @@ function ConfigForm(props: {
             value={typeof value() === "object" ? JSON.stringify(value()) : String(value() ?? "")}
             placeholder={defaultPlaceholder(
               field.key,
-              field.key === "language" ? "No language override" : "Use built-in cue model",
+              field.key === "language" ? "No language override" : undefined,
             )}
             onInput={(e) => {
               const next = e.currentTarget.value;

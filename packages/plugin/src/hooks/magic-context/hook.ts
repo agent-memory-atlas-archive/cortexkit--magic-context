@@ -199,7 +199,7 @@ export interface MagicContextDeps {
          *  session-hook construction boundary via isCompactionEnabled; the
          *  resolved boolean is threaded to the transform phases. */
         compaction?: { enabled?: boolean };
-        mural?: { enabled: boolean; model?: string };
+        mural?: { enabled: boolean };
     };
     /** Registration-owned prompt-surface loader shared with the tool registry. */
     promptSurfaceRuntime?: PromptSurfaceRuntime;
@@ -932,7 +932,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
             dreaming,
             "opencode",
             deps.config.language,
-            sampledDream.mural?.model,
         );
         const executor = createDreamTaskExecutor({
             client: deps.client,
@@ -1075,7 +1074,6 @@ export function createMagicContextHook(deps: MagicContextDeps) {
                               currentDreamer,
                               "opencode",
                               deps.config.language,
-                              sampledDream.mural?.model,
                           ),
                           executor: createDreamTaskExecutor({
                               client: deps.client,
