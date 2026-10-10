@@ -1,7 +1,9 @@
 /**
- * Review probes for the issue 650 fix (Pi tool-tag identity). Tests marked
- * `test.failing` record a finding: they assert the behaviour the review expects
- * and currently fail. Each one is paired with a passing test that pins the
+ * Review probes for Pi tool-tag identity: one tool call must never carry two
+ * different §N§ tag numbers, and repairing a duplicate (one row on the real
+ * assistant entry, one on a temporary `pi-msg-` owner) must keep exactly the
+ * number and status the model was last served. Tests marked `test.failing`
+ * assert the behaviour these probes expect and currently fail. Each one is paired with a passing test that pins the
  * current behaviour, so the expected failure cannot pass for an unrelated reason
  * such as a broken fixture.
  */
@@ -202,10 +204,11 @@ test("review 650: storage survivor matrix never changes the last-served number o
 						db.close();
 					}
 				}
-	// Safety holds everywhere. These are the combinations that refuse although
-	// keeping the last-served row unchanged (without copying the loser's dropped
-	// status onto it) would leave every served byte identical: an active
-	// last-served survivor whose duplicate is dropped.
+	// No combination changed the last-served number or status. These are the
+	// combinations that refuse even though a safe repair exists: keep the
+	// last-served row as it is, delete the duplicate without copying its dropped
+	// status, and the served array stays identical. Each one is an active
+	// last-served row whose duplicate is dropped.
 	expect(refusedWithByteSafeFold.sort()).toEqual(
 		[
 			"fallback=active real=dropped served=[154] cached=-",
@@ -222,9 +225,10 @@ test("review 650: storage survivor matrix never changes the last-served number o
 	);
 });
 
-// The reporter's mechanism: tag 8 was served as `[dropped §8§]`; a later pass
-// lost the real owner, minted 154 for the same call and served `§154§ <output>`
-// because 154 is active. Every later served array also carried 154, so the
+// How the reported duplicate arises: tag 8 (real assistant owner) was served as
+// the dropped placeholder `[dropped §8§]`. A later pass could not match the
+// assistant to its real entry id, so it tagged the same call again as 154 under
+// a `pi-msg-` owner and served the result with the active prefix `§154§ `. Every later served array also carried 154, so the
 // last-served (cached) bytes name 154, active.
 function reporterCachedBytes(): PiMessage[] {
 	return [
@@ -334,7 +338,8 @@ test("review 650: an identical twin call's result vetoes, and cannot stand in fo
 	);
 	expect(piCachedToolSurvivor(both, "call", 20, rows)).toBeUndefined();
 
-	// The call's own result is gone; only the identical twin carries a number.
+	// The result for `call` is gone; only `twin` (same tool, arguments and output,
+	// different call id) still shows a tag number.
 	const twinOnly = session("cached-twin-only");
 	serveCached(
 		twinOnly,
@@ -613,8 +618,9 @@ test("review 650: a served message-tag conflict (issue comment 2) is still not a
 		expect((thrown as Error).message).toBe(
 			"Conflicting served Pi message tag numbers; refusing identity adoption",
 		);
-		// The context handler maps any other failed pass to PiStorageBusyError,
-		// so the user again sees "storage is busy; send your message again".
+		// The context handler wraps every failure that is not a typed identity
+		// conflict in PiStorageBusyError, so the user again sees "storage is busy;
+		// send your message again".
 		expect(findPiTagIdentityConflict(thrown)).toBeUndefined();
 	} finally {
 		db.close();

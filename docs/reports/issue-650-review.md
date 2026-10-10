@@ -23,7 +23,7 @@ liveness or completeness, not byte safety:
 | --- | --- |
 | 1. Survivor selection | Byte-safe in all 64 combinations. Incomplete: 10 combinations refuse even though a byte-safe fold exists, including the reporter's realistic state (F1). |
 | 2. Self-repair safety | Sound. It cannot change a served byte, merge two calls, or change tail bytes on a defer pass. The cached-byte evidence cannot be borrowed from a twin call. |
-| 3. Owner matching (`pi-tool-identity.ts`) | No merge of distinct calls found. Same-args twice, a retry that reuses the call id, and cloned entries all stay separate. Liveness note N1. |
+| 3. Owner matching (`pi-tool-identity.ts`) | No merge of distinct calls found. Same-args twice, a retry that reuses the call id, and cloned entries all stay separate. Liveness cost: an extension that changes an assistant's timestamp or call ids now blocks turns (N1). |
 | 4. Refusal | Correct for tool-tag conflicts through the real handler and host runner. Storage-busy wording is unchanged. Gap: message-tag conflicts (F2). |
 | 5. Tightened fixtures | Tightened, not weakened. One assertion became a precondition echo, and the claim it used to carry is now pinned as a refusal. |
 
@@ -136,7 +136,9 @@ from the tests:
   both slots stay unresolved.
 
 Separate entries could only merge if two different assistant entries had the same
-millisecond timestamp and the same ordered call ids. No real host produces that.
+millisecond timestamp and the same ordered call ids. Pi stamps each assistant message
+when it is created and providers issue fresh call ids per response, so this needs a
+copied entry, and copies are left unresolved (third test above).
 
 **N1 (liveness, not a merge).** If an extension changes the assistant's timestamp or its
 call-id vector, for example by removing one of two calls, the identity misses.
