@@ -140,3 +140,20 @@ Each first asserted a refusal that the ruling replaces with a served result:
   `issue-650-identical-pair.test.ts`: guard tests expect a report; the
   message evidence matrix moves `both-cached` and `wrong-fingerprint` to the
   proven side and adds `both-rendered` and `wrong-header` as refusing cases.
+
+## Rebase onto master `977a3d8f`
+
+- Fallback ids and the raw-ordinal offset are separate. The offset numbers
+  `RawMessage.ordinal` for branch entries read from the session store
+  (historian, search index, ctx_expand); those messages always carry their
+  real entry id. The position-independent fallback ids name only context-event
+  messages that have no entry, and are used only for tag keys inside a
+  transform pass. Neither reads the other.
+- The OpenCode stall fix's tag-identity write classifier (`mayChangeTagIdentity`
+  in `shared/sqlite.ts`) treats any `UPDATE tags` that assigns `message_id` or
+  `tool_owner_message_id` as an identity write, since neither column is in its
+  identity-free list. The re-key of an old index-bearing row to its new id is
+  such an update; `issue-650-r3.test.ts` pins that it advances the
+  identity-write generation.
+- The checkout-claim removal dropped the claim branch from the Pi refusal
+  notice; the identity-conflict branch stays.
