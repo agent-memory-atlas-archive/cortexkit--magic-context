@@ -319,9 +319,22 @@ function differential(moveSessions: boolean, invalidateMoves: boolean): void {
     expect(mismatches).toEqual([]);
 }
 
-test("6,000-step differential: compaction, ties, time moves, suffix deletes, reused rowids, reinserted summaries and scan interleaving", () =>
-    differential(false, false));
-test.failing("6,000-step differential: session moves must also match the old whole-prefix count", () =>
-    differential(true, false));
-test("6,000-step differential: invalidating destinations of session moves restores parity", () =>
-    differential(true, true));
+// Each variant runs 6,000 steps on two connections; under the parallel full
+// suite on a loaded host one took close to the suite's 30 s default.
+const DIFFERENTIAL_TIMEOUT_MS = 120_000;
+
+test(
+    "6,000-step differential: compaction, ties, time moves, suffix deletes, reused rowids, reinserted summaries and scan interleaving",
+    () => differential(false, false),
+    DIFFERENTIAL_TIMEOUT_MS,
+);
+test.failing(
+    "6,000-step differential: session moves must also match the old whole-prefix count",
+    () => differential(true, false),
+    DIFFERENTIAL_TIMEOUT_MS,
+);
+test(
+    "6,000-step differential: invalidating destinations of session moves restores parity",
+    () => differential(true, true),
+    DIFFERENTIAL_TIMEOUT_MS,
+);
