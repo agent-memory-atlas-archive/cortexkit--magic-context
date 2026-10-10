@@ -24,6 +24,7 @@ import {
     insertTag,
     resetTagOwnerRowsReadForTest,
 } from "../../src/features/magic-context/storage-tags";
+import { prewarmRawSessionOrdinalsForDb } from "../../src/hooks/magic-context/raw-ordinal-warmup";
 import {
     countRawSessionMessageOrdinalsFromDb,
     getRawSessionOrdinalJsonRowsReadForTest,
@@ -260,6 +261,44 @@ const targetTime = 1_700_000_000_000 + targetIndex * 10;
     reader.close();
 }
 
+// The first pass after a restart: a fresh connection on a cold cache counts
+// the newest message, once directly (the summary scan runs on this thread) and
+// once after awaiting the off-thread warm-up. A 2 ms ticker records the
+// longest time the event loop was held.
+async function longestBlock(
+    run: () => Promise<unknown>,
+): Promise<{ total_ms: number; longest_block_ms: number }> {
+    let last = performance.now();
+    let longest = 0;
+    const ticker = setInterval(() => {
+        const now = performance.now();
+        longest = Math.max(longest, now - last);
+        last = now;
+    }, 2);
+    const started = performance.now();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await run();
+    const total = performance.now() - started;
+    clearInterval(ticker);
+    longest = Math.max(longest, performance.now() - last);
+    return { total_ms: Math.round(total), longest_block_ms: Math.round(longest * 10) / 10 };
+}
+{
+    const restart: Record<string, unknown> = {};
+    for (const mode of ["in-thread", "prewarmed"] as const) {
+        dropPageCache();
+        const reader = new Database(opencodePath, { readonly: true });
+        let ordinal = -1;
+        let warmup = "";
+        const measured = await longestBlock(async () => {
+            if (mode === "prewarmed") warmup = await prewarmRawSessionOrdinalsForDb(reader, SESSION);
+            ordinal = readRawSessionMessageByIdFromDb(reader, SESSION, targetId)?.ordinal ?? -1;
+        });
+        restart[mode] = { ...measured, ordinal, ...(mode === "prewarmed" ? { warmup } : {}) };
+        reader.close();
+    }
+    results.first_pass_after_restart_cold = restart;
+}
 // Tag owner summary: first read, a pass after another connection appended
 // tags, and a pass after another connection's status write.
 {

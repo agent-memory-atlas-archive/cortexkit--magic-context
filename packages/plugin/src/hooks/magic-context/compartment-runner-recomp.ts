@@ -49,6 +49,7 @@ import {
 import {
     getRawSessionMessageCount,
     getRawSessionTagKeysThrough,
+    prepareRawSessionOrdinals,
     readSessionChunk,
 } from "./read-session-chunk";
 import { sendStatusNotification } from "./send-session-notification";
@@ -168,6 +169,10 @@ export async function executeContextRecompInternal(deps: CompartmentRunnerDeps):
         return "## Magic Recomp — Skipped\n\nCould not acquire the compartment-state lease for this session.";
     }
     const leaseHolderId = holderId;
+    // Wait off-thread for the session's canonical ordinals before the synchronous
+    // boundary reads (see prepareRawSessionOrdinals); an explicit recomp proceeds
+    // even if that warm-up failed.
+    await prepareRawSessionOrdinals(sessionId);
     // Once promotion commits, the rebuilt compartments are the session's history. The
     // steps after it (depth reset, drop queue, publication signal, embedding, compaction
     // marker) can each be repaired later. One failing must not report the committed

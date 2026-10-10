@@ -763,9 +763,16 @@ interface TagOwnerRow {
  * highest id in one statement. When the count grew by exactly the number of
  * new rows, the other connection only appended, and those rows are folded in.
  * Anything else (a delete, an insert below the cached highest id) rebuilds.
- * The one change this cannot see is another connection rewriting a tag's owner,
- * message id, number or reasoning count in place; only the process serving the
- * session re-keys its tags, and this process's own re-keys move the generation.
+ *
+ * Tool tags written before owners were recorded have no owner and count for
+ * no message. Another process can give them one later (the tool-owner backfill
+ * that runs when an OpenCode process opens the store), so their ids are kept
+ * and re-read by primary key after each such commit; there are none in
+ * sessions created since owners were recorded. Other in-place rewrites of a
+ * tag's owner, message id, number or reasoning count by another process are
+ * not seen while the session's count and highest id are unchanged: only the
+ * process serving a session re-keys its tags, and this process's own re-keys
+ * move the generation.
  *
  * Inside an open transaction it is neither used nor stored, since uncommitted
  * rows can still roll back.
@@ -777,6 +784,8 @@ interface TagOwnerSummary {
     lastRowId: number;
     /** Tag rows of the session folded into this summary. */
     rowCount: number;
+    /** Ids of tool tags folded without an owner; another process may still adopt them. */
+    unownedToolRows: Set<number>;
     maxTagByOwner: Map<string, number>;
     /** Reasoning estimates per prose ratio, folded exactly as a full read would. */
     reasoningEstimatesByRatio: Map<number, Map<string, number>>;
@@ -804,9 +813,12 @@ export function resetTagOwnerRowsReadForTest(): void {
     tagOwnerShapeChecks = 0;
 }
 
-function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow): void {
+function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow, newRow = true): void {
     summary.lastRowId = Math.max(summary.lastRowId, row.id);
-    summary.rowCount += 1;
+    if (newRow) summary.rowCount += 1;
+    if (row.type === "tool" && typeof row.tool_owner_message_id !== "string")
+        summary.unownedToolRows.add(row.id);
+    else summary.unownedToolRows.delete(row.id);
     const owner =
         row.type === "tool"
             ? typeof row.tool_owner_message_id === "string"
@@ -889,6 +901,17 @@ function appendedSinceForeignCommit(
     return appended;
 }
 
+/** Ownerless tool tags of the summary that another process has since given an owner. */
+function adoptedSinceForeignCommit(db: Database, cached: TagOwnerSummary): TagOwnerRow[] {
+    if (cached.unownedToolRows.size === 0) return [];
+    return db
+        .prepare(
+            `SELECT ${TAG_OWNER_COLUMNS} FROM tags
+             WHERE id IN (SELECT value FROM json_each(?)) AND tool_owner_message_id IS NOT NULL`,
+        )
+        .all(JSON.stringify([...cached.unownedToolRows])) as TagOwnerRow[];
+}
+
 function readTagOwnerSummary(
     db: Database,
     sessionId: string,
@@ -928,8 +951,11 @@ function readTagOwnerSummary(
             rows = appendedSinceForeignCommit(db, sessionId, cached);
         }
         if (rows) {
-            tagOwnerRowsRead += rows.length;
+            const adopted =
+                cached.dataVersion === dataVersion ? [] : adoptedSinceForeignCommit(db, cached);
+            tagOwnerRowsRead += rows.length + adopted.length;
             for (const row of rows) foldTagOwnerRow(cached, row);
+            for (const row of adopted) foldTagOwnerRow(cached, row, false);
             cached.dataVersion = dataVersion;
             return cached;
         }
@@ -942,6 +968,7 @@ function readTagOwnerSummary(
         generation,
         lastRowId: 0,
         rowCount: 0,
+        unownedToolRows: new Set(),
         maxTagByOwner: new Map(),
         reasoningEstimatesByRatio: new Map(
             ratios.slice(-MAX_CACHED_PROSE_RATIOS).map((ratio) => [ratio, new Map()]),

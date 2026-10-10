@@ -1104,35 +1104,125 @@ function survivingAnchor(db: Database, set: SummaryCandidates): RowAnchor | null
     return set.anchors.find((anchor) => current.get(anchor.rowid) === anchor.id);
 }
 
+/**
+ * A full summary scan of one session: the highest rows of `message` and the
+ * session's flagged rows, read by one statement so both describe the same
+ * state. Rows written after that state sit above `anchors[0]` (or replace one
+ * of the remembered rows, which the next count notices), so a scan made on any
+ * connection, at any earlier time, can be installed with
+ * {@link installRawSessionSummaryScan} and brought up to date by the ordinary
+ * incremental read.
+ */
+export interface RawSessionSummaryScan {
+    anchors: Array<{ rowid: number; id: string }>;
+    ids: string[];
+    /** Rows of the session whose JSON the scan read. */
+    sessionRows: number;
+}
+
+/** Run a full summary scan. The warm-up worker calls this on its own connection. */
+export function scanRawSessionSummaryRows(db: Database, sessionId: string): RawSessionSummaryScan {
+    const rows = db.prepare(SUMMARY_FULL_SCAN_SQL).all(sessionId, sessionId) as ScanRow[];
+    const anchors: RowAnchor[] = [];
+    const ids: string[] = [];
+    let sessionRows = 0;
+    for (const row of rows) {
+        if (row.kind === 1 && typeof row.rid === "number" && typeof row.id === "string")
+            anchors.push({ rowid: row.rid, id: row.id });
+        else if (row.kind === 2 && typeof row.id === "string") ids.push(row.id);
+        else if (row.kind === 4 && typeof row.rid === "number") sessionRows = row.rid;
+    }
+    anchors.sort((left, right) => right.rowid - left.rowid);
+    anchors.length = Math.min(anchors.length, SUMMARY_ANCHOR_LIMIT);
+    return { anchors, ids, sessionRows };
+}
+
+/** The value to pass to {@link installRawSessionSummaryScan} for a scan started now. */
+export function getRawSessionSummaryEpoch(sessionId: string): number {
+    return summaryCandidateEpochs.get(sessionId) ?? 0;
+}
+
+/**
+ * Use a scan made elsewhere as this connection's summary candidates. Ignored
+ * when {@link forgetRawSessionSummaryRows} ran for the session after the scan
+ * started (`epoch` is then stale), or when the connection already has a usable
+ * set. Returns whether the session is now ready to count without a scan.
+ */
+export function installRawSessionSummaryScan(
+    db: Database,
+    sessionId: string,
+    scan: RawSessionSummaryScan,
+    epoch: number,
+): boolean {
+    if (epoch !== getRawSessionSummaryEpoch(sessionId)) return false;
+    if (isRawSessionSummaryWarm(db, sessionId)) return true;
+    let sessions = summaryCandidateSets.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        summaryCandidateSets.set(db, sessions);
+    }
+    sessions.set(sessionId, { epoch, anchors: [...scan.anchors], ids: new Set(scan.ids) });
+    return isRawSessionSummaryWarm(db, sessionId);
+}
+
+/**
+ * Whether the next count of this session on this connection can skip the full
+ * scan: a candidate set exists for the current epoch and one of its remembered
+ * rows still holds the same message. False when the store cannot be read by
+ * rowid (the JSON-reading count is used there instead).
+ */
+export function isRawSessionSummaryWarm(db: Database, sessionId: string): boolean {
+    const set = summaryCandidateSets.get(db)?.get(sessionId);
+    if (!set || set.epoch !== getRawSessionSummaryEpoch(sessionId)) return false;
+    try {
+        return survivingAnchor(db, set) !== undefined;
+    } catch {
+        return false;
+    }
+}
+
+/** Message rows of a session, counted from the `(session_id, ...)` index alone. */
+export function countStoredRawSessionRowsIndexed(db: Database, sessionId: string): number {
+    const row = db
+        .prepare("SELECT COUNT(*) AS count FROM message WHERE session_id = ?")
+        .get(sessionId) as { count?: number } | null;
+    return typeof row?.count === "number" ? row.count : 0;
+}
+
 function summaryCandidatesOf(db: Database, sessionId: string): CandidateView {
     let sessions = summaryCandidateSets.get(db);
     if (!sessions) {
         sessions = new Map();
         summaryCandidateSets.set(db, sessions);
     }
-    const epoch = summaryCandidateEpochs.get(sessionId) ?? 0;
+    const epoch = getRawSessionSummaryEpoch(sessionId);
     const cached = sessions.get(sessionId);
     // null: the table was empty, so every row is new. undefined: rescan.
     const floor = cached && cached.epoch === epoch ? survivingAnchor(db, cached) : undefined;
-    const full = floor === undefined;
-    const rows = (
-        full
-            ? db.prepare(SUMMARY_FULL_SCAN_SQL).all(sessionId, sessionId)
-            : db.prepare(SUMMARY_SCAN_AFTER_SQL).all(floor?.rowid ?? 0, sessionId)
-    ) as ScanRow[];
-    const ids = full || !cached ? new Set<string>() : cached.ids;
-    const anchors: RowAnchor[] = [];
-    for (const row of rows) {
-        if (row.kind === 1 && typeof row.rid === "number" && typeof row.id === "string")
-            anchors.push({ rowid: row.rid, id: row.id });
-        else if (row.kind === 2 && typeof row.id === "string") ids.add(row.id);
-        if (row.kind === 4) ordinalJsonRowsRead += typeof row.rid === "number" ? row.rid : 0;
-        else if (row.kind === 2 || row.kind === 3) ordinalJsonRowsRead += full ? 0 : 1;
+    let ids: Set<string>;
+    let anchors: RowAnchor[];
+    if (floor === undefined) {
+        const scan = scanRawSessionSummaryRows(db, sessionId);
+        summaryFullScans += 1;
+        ordinalJsonRowsRead += scan.sessionRows;
+        ids = new Set(scan.ids);
+        anchors = scan.anchors;
+    } else {
+        const rows = db
+            .prepare(SUMMARY_SCAN_AFTER_SQL)
+            .all(floor?.rowid ?? 0, sessionId) as ScanRow[];
+        ids = cached?.ids ?? new Set<string>();
+        anchors = [];
+        for (const row of rows) {
+            if (row.kind === 1 && typeof row.rid === "number" && typeof row.id === "string")
+                anchors.push({ rowid: row.rid, id: row.id });
+            else if (row.kind === 2 && typeof row.id === "string") ids.add(row.id);
+            if (row.kind === 2 || row.kind === 3) ordinalJsonRowsRead += 1;
+        }
+        anchors.sort((left, right) => right.rowid - left.rowid);
+        anchors.length = Math.min(anchors.length, SUMMARY_ANCHOR_LIMIT);
     }
-    if (full) summaryFullScans += 1;
     for (const id of writtenSummaryIds.get(sessionId) ?? []) ids.add(id);
-    anchors.sort((left, right) => right.rowid - left.rowid);
-    anchors.length = Math.min(anchors.length, SUMMARY_ANCHOR_LIMIT);
     sessions.set(sessionId, { epoch, anchors, ids });
     const top = anchors[0];
     return { ids: [...ids], floorRowid: top?.rowid ?? 0, floorId: top?.id ?? null };
