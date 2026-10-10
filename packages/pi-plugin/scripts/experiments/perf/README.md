@@ -27,6 +27,24 @@ bun scripts/experiments/perf/benchmark.ts --synthetic --points 1000,3000,5725 --
 
 Each pass measures output serialization and then waits 150 ms before sampling deferred DB work. Historian lanes use a fail-soft local runner so trigger and scheduling costs are measured without making a model request. The execute lane marks all but the newest tag window compacted between accumulation passes; the auto-search lane persists a no-hint decision on the first pass and measures sticky replay afterward.
 
+### Production-shaped append passes
+
+Four `run.ts` flags reproduce conditions that a single-connection synthetic run never shows:
+
+- `--pi087`: the branch starts with a persisted system message entry, and the event omits system messages, as Pi 0.87's `emitContext` does.
+- `--external-writes`: a second connection commits before every pass, so `PRAGMA data_version` advances as it does when other OpenCode or Pi processes share `context.db`.
+- `--lingering-fallback`: seeds one `pi-msg-*` message tag that no live message can adopt.
+- `--historical-tags N`: seeds N compacted tags for history outside the current projection; `--tool-result-repeat N` enlarges tool results.
+
+```bash
+bun scripts/experiments/perf/run.ts --messages 12040 \
+  --points 3000,6000,9000,12000,12001,12002,12003 \
+  --pi087 --external-writes --lingering-fallback --historical-tags 45000 \
+  --tool-result-repeat 200 --output /tmp/pi-append.json
+```
+
+Warm the session in steps of at most about 3,000 messages: a first pass that tags 12,000 messages exceeds the 25-second pass budget.
+
 ## Byte-identity comparison
 
 Commit the harness before the optimization so the baseline revision contains `run.ts`, then run:

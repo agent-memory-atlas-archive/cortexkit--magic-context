@@ -484,6 +484,7 @@ export const __test = {
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
 	buildEntryFingerprintMap,
+	readPiEntryFingerprintCount: () => piEntryFingerprintCount,
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
 	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
@@ -818,6 +819,12 @@ interface PiBranchEntryLookup {
 	entryIdByMessageRef: Map<object, string>;
 	entryIdsByFingerprint: Map<string, string[]>;
 	alignedEntryIds: (string | undefined)[];
+	/**
+	 * The same projection without system-role slots. Pi 0.87+ withholds system
+	 * messages from `context` handlers (runner.js emitContext filters them out),
+	 * so its event arrays align with this list rather than `alignedEntryIds`.
+	 */
+	alignedVisibleEntryIds: (string | undefined)[];
 }
 
 interface PiBranchProjectionCache {
@@ -1805,7 +1812,58 @@ function isPiContextEmitEligible(entry: unknown): entry is { id: string } {
 	);
 }
 
-function buildPiAlignedEntryIds(
+function buildPiAlignedEntryIds(entries: readonly unknown[]): {
+	all: (string | undefined)[];
+	visible: (string | undefined)[];
+} {
+	const all = buildPiAlignedEntryIdsIncludingSystem(entries);
+	return { all, visible: buildPiAlignedVisibleEntryIds(entries) };
+}
+
+/**
+ * Entry ids for the messages a Pi 0.87+ `context` handler receives: the
+ * compaction-aware projection with every system-role message removed. The
+ * compaction summary keeps its unresolved slot; its system snapshot does not.
+ */
+function buildPiAlignedVisibleEntryIds(
+	entries: readonly unknown[],
+): (string | undefined)[] {
+	let compactionIndex = -1;
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		if (
+			(entries[index] as { type?: unknown } | undefined)?.type === "compaction"
+		) {
+			compactionIndex = index;
+			break;
+		}
+	}
+	const visible = (entry: unknown): entry is { id: string } =>
+		isPiContextEmitEligible(entry) && !isPiSystemMessageEntry(entry);
+	if (compactionIndex < 0) {
+		return entries.filter(visible).map((entry) => entry.id);
+	}
+	const firstKeptEntryId = (
+		entries[compactionIndex] as { firstKeptEntryId?: unknown }
+	).firstKeptEntryId;
+	const ids: (string | undefined)[] = [undefined];
+	if (typeof firstKeptEntryId === "string") {
+		let foundFirstKept = false;
+		for (let index = 0; index < compactionIndex; index += 1) {
+			const entry = entries[index];
+			if ((entry as { id?: unknown } | undefined)?.id === firstKeptEntryId) {
+				foundFirstKept = true;
+			}
+			if (foundFirstKept && visible(entry)) ids.push(entry.id);
+		}
+	}
+	for (let index = compactionIndex + 1; index < entries.length; index += 1) {
+		const entry = entries[index];
+		if (visible(entry)) ids.push(entry.id);
+	}
+	return ids;
+}
+
+function buildPiAlignedEntryIdsIncludingSystem(
 	entries: readonly unknown[],
 ): (string | undefined)[] {
 	let compactionIndex = -1;
@@ -1905,10 +1963,12 @@ function getPiBranchEntryLookup(
 ): PiBranchEntryLookup {
 	const cached = piBranchLookupByProjection.get(entries);
 	if (cached) return cached;
+	const aligned = buildPiAlignedEntryIds(entries);
 	const lookup: PiBranchEntryLookup = {
 		entryIdByMessageRef: new Map(),
 		entryIdsByFingerprint: new Map(),
-		alignedEntryIds: buildPiAlignedEntryIds(entries),
+		alignedEntryIds: aligned.all,
+		alignedVisibleEntryIds: aligned.visible,
 	};
 	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
 	piBranchLookupByProjection.set(entries, lookup);
@@ -2036,6 +2096,9 @@ function readPiBranchEntriesForContext(
 				addPiBranchEntryToLookup(cached.lookup, entry);
 				if (isPiContextEmitEligible(entry)) {
 					cached.lookup.alignedEntryIds.push(entry.id);
+					if (!isPiSystemMessageEntry(entry)) {
+						cached.lookup.alignedVisibleEntryIds.push(entry.id);
+					}
 				}
 			}
 			const projection = {
@@ -2071,7 +2134,66 @@ function readPiBranchEntriesForContext(
 	}
 }
 
+/**
+ * The fingerprint fields that do not depend on content, serialized exactly as
+ * the first four elements of {@link piMessageEntryFingerprint}. Two messages can
+ * share a fingerprint only if they share this header, so a header lookup can
+ * rule a message out without hashing its content.
+ */
+function piMessageEntryFingerprintHeader(message: unknown): string | null {
+	if (!message || typeof message !== "object") return null;
+	const record = message as {
+		responseId?: unknown;
+		timestamp?: unknown;
+		role?: unknown;
+		toolCallId?: unknown;
+	};
+	if (typeof record.role !== "string") return null;
+	return JSON.stringify([
+		typeof record.responseId === "string" ? record.responseId : null,
+		typeof record.timestamp === "number" || typeof record.timestamp === "string"
+			? record.timestamp
+			: null,
+		record.role,
+		typeof record.toolCallId === "string" ? record.toolCallId : null,
+	]);
+}
+
+/**
+ * Headers of every persisted `pi-msg-*` message tag fingerprint, or null when a
+ * stored fingerprint has an unexpected shape and the caller must hash every
+ * message. Rows without a fingerprint can never be adopted and are skipped.
+ */
+function readPiFallbackFingerprintHeaders(
+	db: ContextDatabase,
+	sessionId: string,
+): Set<string> | null {
+	const rows = db
+		.prepare(
+			`SELECT DISTINCT entry_fingerprint FROM tags WHERE session_id = ? AND type = 'message'
+			 AND entry_fingerprint IS NOT NULL AND message_id LIKE 'pi-msg-%'`,
+		)
+		.all(sessionId) as { entry_fingerprint: string }[];
+	const headers = new Set<string>();
+	for (const row of rows) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(row.entry_fingerprint);
+		} catch {
+			return null;
+		}
+		if (!Array.isArray(parsed) || parsed.length !== 5) return null;
+		headers.add(JSON.stringify(parsed.slice(0, 4)));
+	}
+	return headers;
+}
+
+// Content hashes computed by piMessageEntryFingerprint. Read only by tests that
+// bound the per-pass work, which must not grow with session length.
+let piEntryFingerprintCount = 0;
+
 function piMessageEntryFingerprint(message: unknown): string | null {
+	piEntryFingerprintCount += 1;
 	if (!message || typeof message !== "object") return null;
 	const record = message as {
 		responseId?: unknown;
@@ -2110,13 +2232,23 @@ function buildEntryFingerprintMap(
 	resolveStableId: (msg: unknown, index: number) => string | undefined,
 	reusableMessageIds?: ReadonlySet<string>,
 	includeReusable = true,
+	reusableHeaders?: ReadonlySet<string> | null,
 ): Map<string, string> {
 	const map = new Map<string, string>();
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		const id = resolveStableId(msg, i);
 		if (!id) continue;
-		if (!includeReusable && reusableMessageIds?.has(id)) continue;
+		if (reusableMessageIds?.has(id)) {
+			if (!includeReusable) continue;
+			// Already-tagged messages only need a fingerprint to be matched
+			// against a persisted fallback row. Hashing every one of them made
+			// this stage scale with session size whenever any fallback row lingered.
+			if (reusableHeaders) {
+				const header = piMessageEntryFingerprintHeader(msg);
+				if (header === null || !reusableHeaders.has(header)) continue;
+			}
+		}
 		const fp = piMessageEntryFingerprint(msg);
 		if (fp) map.set(id, fp);
 	}
@@ -2191,7 +2323,7 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 	try {
 		const result = fn();
 		db.exec("COMMIT");
-		logSlowWriteTransaction("pi_compaction_queue", transactionStartedAt);
+		logSlowWriteTransaction("pi_fallback_adoption", transactionStartedAt);
 		return result;
 	} catch (error) {
 		db.exec("ROLLBACK");
@@ -2729,9 +2861,18 @@ export function registerPiContextHandler(
 			const branchLookup =
 				branchEntries === null ? null : getPiBranchEntryLookup(branchEntries);
 			const alignedEntryIds = branchLookup?.alignedEntryIds ?? null;
+			// Pi 0.87+ never shows system messages to `context` handlers, so an
+			// event without any must be aligned against the projection without
+			// them. Otherwise every pass of a session that persisted a system entry
+			// misses this lane and hashes every message in the fallback below.
+			const eventAlignedEntryIds =
+				branchLookup &&
+				!(event.messages as readonly unknown[]).some(isPiSystemEntry)
+					? branchLookup.alignedVisibleEntryIds
+					: alignedEntryIds;
 			const resolvedEntryIds =
-				alignedEntryIds?.length === event.messages.length
-					? alignedEntryIds
+				eventAlignedEntryIds?.length === event.messages.length
+					? eventAlignedEntryIds
 					: branchEntries === null
 						? null
 						: collectMessageEntryIdsByRef(
@@ -6503,6 +6644,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// Existing fallback rows may match any old real-id message. Once the
 		// indexed gate is empty, only the newly observed tail needs fingerprints.
 		hasFallbackMessageTags,
+		// Read after the preflight revision: a fallback row committed later
+		// changes the revision, and adoption then rebuilds with fresh headers.
+		hasFallbackMessageTags
+			? readPiFallbackFingerprintHeaders(args.db, args.sessionId)
+			: undefined,
 	);
 	args.assertCurrentPass?.();
 	adoptPiFallbackTags(
@@ -6515,19 +6661,24 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			resolveStableId: stableIdResolver,
 			hasFallbackMessageTags,
 			preflightRevision,
-			rebuildFingerprints:
-				!hasFallbackMessageTags && args.reusableMessageIds?.size
-					? () => {
-							args.assertCurrentPass?.();
-							const full = buildEntryFingerprintMap(
-								args.messages as PiAgentMessage[],
-								stableIdResolver,
-							);
-							for (const [id, fingerprint] of full)
-								entryFingerprintByMessageId.set(id, fingerprint);
-							return entryFingerprintByMessageId;
-						}
-					: undefined,
+			rebuildFingerprints: args.reusableMessageIds?.size
+				? () => {
+						args.assertCurrentPass?.();
+						// Runs with the writer held, so the fallback rows read here are
+						// authoritative. Only messages sharing a fallback row's header
+						// can match it; hash those instead of the whole session.
+						const full = buildEntryFingerprintMap(
+							args.messages as PiAgentMessage[],
+							stableIdResolver,
+							args.reusableMessageIds,
+							true,
+							readPiFallbackFingerprintHeaders(args.db, args.sessionId),
+						);
+						for (const [id, fingerprint] of full)
+							entryFingerprintByMessageId.set(id, fingerprint);
+						return entryFingerprintByMessageId;
+					}
+				: undefined,
 		},
 	);
 	logTransformTiming(
