@@ -197,7 +197,7 @@ async function withFixture(
 }
 
 describe("Pi ordinal offset independent review", () => {
-	it.failing("unreachable verbose range: reports unavailable instead of invented system messages", async () => {
+	it("unreachable verbose range: reports unavailable instead of invented system messages", async () => {
 		await withFixture(async (db, sessionId, entries) => {
 			const text = await expand(db, sessionId, entries, {
 				start: 1001,
@@ -215,7 +215,7 @@ describe("Pi ordinal offset independent review", () => {
 		});
 	});
 
-	it.failing("unreachable single message: reports unavailable instead of full recovery", async () => {
+	it("unreachable single message: reports unavailable instead of full recovery", async () => {
 		await withFixture(async (db, sessionId, entries) => {
 			expect(await expand(db, sessionId, entries, { message: 1001 })).toContain(
 				"No message at ordinal 1001",
@@ -230,7 +230,7 @@ describe("Pi ordinal offset independent review", () => {
 		});
 	});
 
-	it.failing("unanchored expansion: refuses a lost stored range instead of relabeling branch messages", async () => {
+	it("unanchored expansion: refuses a lost stored range instead of relabeling branch messages", async () => {
 		await withFixture(async (db, sessionId, entries) => {
 			const jumped = entries.slice(0, 12);
 			expect(resolvePiOrdinalAlignment(db, sessionId, jumped).kind).toBe(
@@ -249,7 +249,7 @@ describe("Pi ordinal offset independent review", () => {
 		});
 	});
 
-	it.failing("anchor read failure: does not claim shifted history is aligned", async () => {
+	it("anchor read failure: does not claim shifted history is aligned", async () => {
 		await withFixture((db, sessionId, entries) => {
 			const prepare = db.prepare.bind(db);
 			spyOn(db, "prepare").mockImplementation((sql: string) => {

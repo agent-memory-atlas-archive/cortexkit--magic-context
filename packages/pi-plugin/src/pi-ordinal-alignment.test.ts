@@ -506,6 +506,55 @@ describe("Pi ordinal alignment: fail-closed and unchanged cases", () => {
 		}
 	});
 
+	it("a failed anchor read is unresolved, logged once, and keeps the marker waiting", () => {
+		const db = createTestDb();
+		const sessionId = "ordinal-anchor-read-failure";
+		const logs: string[] = [];
+		spyOn(logger, "sessionLog").mockImplementation((_id, ...parts) => {
+			logs.push(parts.map(String).join(" "));
+		});
+		try {
+			const { full, branch } = divergedSession();
+			seedStoredCompartments(db, sessionId, full);
+			const prepare = db.prepare.bind(db);
+			spyOn(db, "prepare").mockImplementation((sql: string) => {
+				if (sql.startsWith("SELECT sequence, start_message, end_message"))
+					throw new Error("anchor read unavailable");
+				return prepare(sql);
+			});
+			expect(resolvePiOrdinalAlignment(db, sessionId, branch)).toMatchObject({
+				kind: "unresolved",
+				offset: 0,
+			});
+			resolvePiOrdinalAlignment(db, sessionId, branch);
+			expect(
+				logs.filter((line) =>
+					line.startsWith("pi ordinal alignment: unresolved"),
+				),
+			).toHaveLength(1);
+			const outcome = applyDeferredPiCompactionMarker(
+				{
+					db,
+					readBranchEntries: () => branch,
+					appendCompaction: () => "must-not-append",
+				},
+				sessionId,
+				{
+					firstKeptEntryId: null,
+					endMessageId: "a16484",
+					ordinal: STORED_LAST_END,
+					tokensBefore: 0,
+					summary: "summary",
+					publishedAt: 1,
+				},
+			);
+			expect(outcome).toEqual({ kind: "waiting-for-entry" });
+		} finally {
+			clearPiOrdinalAlignmentSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("two stored anchors that imply different offsets leave the session unanchored", () => {
 		const db = createTestDb();
 		const sessionId = "ordinal-shift-disagree";

@@ -3337,7 +3337,13 @@ export function registerPiContextHandler(
 				rawMessageProvider,
 			);
 			rawMessageProviderUnregistersBySession.set(sessionId, unregisterRaw);
-			scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
+			// The search index files messages under stored ordinals; while those
+			// cannot be placed on this branch, indexing would file branch-local
+			// numbers under them, so it waits.
+			const indexOrdinalsPlaceable = (): boolean =>
+				!isPiOrdinalAlignmentUnanchored(ordinalAlignment());
+			if (indexOrdinalsPlaceable())
+				scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
 			const alignedEntryIds =
 				branchEntries === null
 					? null
@@ -3571,7 +3577,7 @@ export function registerPiContextHandler(
 			);
 			logTransformTiming(sessionId, "findLastUserMessageId", tLastUser);
 			const tMessageIndexScheduling = performance.now();
-			if (latestUser) {
+			if (latestUser && indexOrdinalsPlaceable()) {
 				const located = branchEntries
 					? convertLocatedPiUserEntry(
 							branchEntries,

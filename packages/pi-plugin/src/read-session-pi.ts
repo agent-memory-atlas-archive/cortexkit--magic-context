@@ -379,14 +379,29 @@ function attachPiPartVersion(
 	});
 }
 
+const UNREACHABLE_PI_STORE_TYPE = "unavailable";
+
 /**
  * The slot for an ordinal the stored coordinates count but the branch walk no
  * longer reaches (see `pi-ordinal-alignment.ts`). It has no id and no content:
  * like a protocol entry it keeps the numbering dense, and readers that need
  * text (historian chunks, the search index, ctx_expand) find nothing in it.
+ * It carries a non-enumerable `storeType` of "unavailable" (the same
+ * non-enumerable convention OpenCode 2 rows use), so a reader can tell it from
+ * a real message without changing serialized output.
  */
 export function unreachablePiOrdinalSlot(ordinal: number): RawMessage {
-	return { ordinal, id: "", role: "system", parts: [] };
+	const slot: RawMessage = { ordinal, id: "", role: "system", parts: [] };
+	Object.defineProperty(slot, "storeType", {
+		value: UNREACHABLE_PI_STORE_TYPE,
+		enumerable: false,
+	});
+	return slot;
+}
+
+/** True for a slot whose message is no longer in the session's history. */
+export function isUnreachablePiOrdinalSlot(message: RawMessage): boolean {
+	return message.storeType === UNREACHABLE_PI_STORE_TYPE;
 }
 
 export function* iterateEntriesToRawMessageRange(

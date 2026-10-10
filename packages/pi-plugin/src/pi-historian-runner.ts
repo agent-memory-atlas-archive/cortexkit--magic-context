@@ -153,7 +153,10 @@ import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transa
 
 import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
 import { resolvePiHarnessKind } from "./pi-harness-kind";
-import { resolvePiRawOrdinalOffset } from "./pi-ordinal-alignment";
+import {
+	isPiOrdinalAlignmentUnanchored,
+	resolvePiOrdinalAlignment,
+} from "./pi-ordinal-alignment";
 import {
 	iterateEntriesToRawMessageRange,
 	SYNTH_USER_ID_PREFIX,
@@ -1329,11 +1332,16 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 			if (readBranchEntries) {
 				try {
 					const branchEntries = readBranchEntries();
-					firstKeptEntryId = findFirstKeptEntryId(
+					const alignment = resolvePiOrdinalAlignment(
+						db,
+						sessionId,
 						branchEntries,
-						lastNewEnd,
-						resolvePiRawOrdinalOffset(db, sessionId, branchEntries),
 					);
+					// Leave the marker unresolved (pending) while stored ordinals
+					// cannot be placed on the branch; a later drain resolves it.
+					firstKeptEntryId = isPiOrdinalAlignmentUnanchored(alignment)
+						? null
+						: findFirstKeptEntryId(branchEntries, lastNewEnd, alignment.offset);
 					if (!firstKeptEntryId) {
 						sessionLog(
 							sessionId,

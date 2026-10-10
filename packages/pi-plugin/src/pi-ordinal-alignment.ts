@@ -34,6 +34,9 @@
  *   cannot be placed: the session is `unanchored`. The historian and the
  *   native compaction marker stay paused for it, and readers keep plain branch
  *   numbering, which is what they did before this module existed.
+ * - When the stored anchors cannot even be read (a failed query), the session
+ *   is `unresolved`: the same pauses apply, because a failed read proves
+ *   nothing about where the stored ordinals sit.
  * - Stored ordinals behind the branch numbering (`behind`) cannot be expressed
  *   as empty slots. Readers keep plain branch numbering, as they always have,
  *   and the condition is logged.
@@ -77,7 +80,9 @@ export type PiOrdinalAlignment =
 			offset: 0;
 			reason: "anchor-missing" | "anchors-disagree";
 			detail: string;
-	  };
+	  }
+	/** The stored anchors could not be read; historian paused until they can. */
+	| { kind: "unresolved"; offset: 0; detail: string };
 
 const ALIGNED: PiOrdinalAlignment = { kind: "aligned", offset: 0 };
 
@@ -179,6 +184,8 @@ function signature(alignment: PiOrdinalAlignment): string {
 			return `${alignment.kind}:${alignment.anchorId}:${alignment.storedOrdinal}:${alignment.branchOrdinal}`;
 		case "unanchored":
 			return `unanchored:${alignment.detail}`;
+		case "unresolved":
+			return "unresolved";
 	}
 }
 
@@ -192,6 +199,8 @@ function describe(alignment: PiOrdinalAlignment): string {
 			return `pi ordinal alignment: stored ordinals run ${alignment.branchOrdinal - alignment.storedOrdinal} behind the branch walk (newest compartment end ${alignment.anchorId} stored at ${alignment.storedOrdinal}, branch ordinal ${alignment.branchOrdinal}); keeping plain branch numbering`;
 		case "unanchored":
 			return `pi ordinal alignment: ${alignment.reason}: ${alignment.detail}; historian and native compaction marker paused for this session`;
+		case "unresolved":
+			return `pi ordinal alignment: unresolved: ${alignment.detail}; historian and native compaction marker paused for this session until the anchors can be read`;
 	}
 }
 
@@ -219,13 +228,15 @@ export function resolvePiOrdinalAlignment(
 	try {
 		rows = readAnchorRows(db, sessionId);
 	} catch (error) {
-		// Without the rows nothing can be placed. Plain numbering is what every
-		// reader used before alignment existed, so it is the safe fallback.
-		sessionLog(
-			sessionId,
-			`pi ordinal alignment: compartment anchor read failed (${error instanceof Error ? error.message : String(error)}); keeping plain branch numbering`,
-		);
-		return ALIGNED;
+		// Without the rows nothing can be placed, and nothing proves the session
+		// is aligned either. Not cached: the next call reads the rows again.
+		const unresolved: PiOrdinalAlignment = {
+			kind: "unresolved",
+			offset: 0,
+			detail: `compartment anchor read failed (${error instanceof Error ? error.message : String(error)})`,
+		};
+		report(sessionId, unresolved);
+		return unresolved;
 	}
 	const key = rows
 		.map(
@@ -287,11 +298,18 @@ export function resolvePiOrdinalAlignmentForContext(
 		: ALIGNED;
 }
 
-/** True when the stored ordinals cannot be placed on the branch. */
+/**
+ * True when the stored ordinals cannot be placed on the branch, either because
+ * the anchors do not fit it (`unanchored`) or because they could not be read
+ * (`unresolved`). Every caller that addresses stored ordinals pauses on it.
+ */
 export function isPiOrdinalAlignmentUnanchored(
 	alignment: PiOrdinalAlignment,
-): alignment is Extract<PiOrdinalAlignment, { kind: "unanchored" }> {
-	return alignment.kind === "unanchored";
+): alignment is Extract<
+	PiOrdinalAlignment,
+	{ kind: "unanchored" } | { kind: "unresolved" }
+> {
+	return alignment.kind === "unanchored" || alignment.kind === "unresolved";
 }
 
 /** Forget the per-session log state (session shutdown or switch). */
