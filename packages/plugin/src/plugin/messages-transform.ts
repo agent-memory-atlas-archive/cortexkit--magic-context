@@ -1,4 +1,3 @@
-import type { CheckoutClaimGate } from "../features/magic-context/checkout-claim";
 import {
     type FailClosedController,
     isFailClosedBlockingError,
@@ -423,18 +422,6 @@ export function createMessagesTransformHandler(args: {
      * registry picks the adapter (the one that most recently ran the session).
      */
     rustReplayParticipant?: () => RustLkgReplayParticipant | null | undefined;
-    /**
-     * The checkout claim check, run before anything in the pass can write. A
-     * session whose agent another machine holds is refused here, in every mode
-     * (compaction-off included): passing it through would let this machine keep
-     * working on an agent it does not hold.
-     */
-    checkoutClaim?: {
-        gate: Pick<CheckoutClaimGate, "refusal">;
-        projectRoot: string;
-        /** Tells the user before the refusal is thrown (the host shows a thrown error tersely). */
-        onRefusal?: (sessionId: string, message: string) => Promise<void>;
-    };
 }): (input: Record<string, never>, output: MessagesTransformOutput) => Promise<MessageWithParts[]> {
     const resolveRust = (sessionId: string): RustLkgReplayParticipant | undefined =>
         args.rustReplayParticipant
@@ -447,24 +434,6 @@ export function createMessagesTransformHandler(args: {
             typeof sessionId === "string" &&
             sessionId.length > 0 &&
             args.internalChildSessions?.has(sessionId) === true;
-        // Magic Context's own child sessions belong to no agent; every other
-        // session is checked once per cache period before the pass writes.
-        if (args.checkoutClaim && sessionId && !isInternalChild) {
-            const refusal = await args.checkoutClaim.gate.refusal(
-                sessionId,
-                args.checkoutClaim.projectRoot,
-            );
-            if (refusal) {
-                if (args.checkoutClaim.onRefusal) {
-                    try {
-                        await args.checkoutClaim.onRefusal(sessionId, refusal.message);
-                    } catch (noticeError) {
-                        log("[magic-context] checkout-claim host refusal failed:", noticeError);
-                    }
-                }
-                throw refusal;
-            }
-        }
         // Snapshot only the array, never nested messages: compaction-off gates
         // every stage that writes retained message internals, and its additive
         // path only prepends new synthetic message objects. A shallow snapshot

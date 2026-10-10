@@ -4,7 +4,6 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { isCheckoutClaimRefusalError } from "@magic-context/core/features/magic-context/checkout-claim";
 import { log } from "@magic-context/core/shared/logger";
 import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
 import { isOmpSideContext } from "./omp-request-kind";
@@ -91,9 +90,7 @@ export function registerPiGuardedContext(
 			budget.recovery === "not attempted"
 				? "no managed result; refused"
 				: budget.recovery;
-		const message = isCheckoutClaimRefusalError(reason)
-			? reason.message
-			: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
+		const message = `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
 		try {
 			ctx.ui?.notify(message, "error");
 		} catch (error) {
@@ -106,10 +103,8 @@ export function registerPiGuardedContext(
 		} finally {
 			if (!budget.sideTurn) ctx.abort();
 		}
-		// Queue ordinary error diagnostics without blocking a provider request.
-		// A checkout held elsewhere forbids even deferred writes to its Magic Context
-		// store; the magic-context-turn-refused entry already displays the reason.
-		if (isCheckoutClaimRefusalError(reason)) return;
+		// This callback only queues a diagnostic; it must never do storage work on
+		// the payload hook's synchronous dispatch stack.
 		try {
 			options.onRefusal?.(ctx, budget, message, isCurrent);
 		} catch (error) {
@@ -232,19 +227,16 @@ export function registerPiGuardedContext(
 				throw error;
 			}
 			log("[magic-context][pi] turn refused", error);
-			// A checkout-claim refusal is not a retryable preparation failure: the
-			// user has to move the agent first, so show its own message instead.
 			// Direct handler fixtures lack the host abort API; retain their original
 			// exception contract. Real Pi contexts always supply abort().
 			if (typeof ctx.abort !== "function") {
 				budget.abandoned = true;
-				if (!isCheckoutClaimRefusalError(error))
-					options.onRefusal?.(
-						ctx,
-						budget,
-						error instanceof Error ? error.message : String(error),
-						isOwned,
-					);
+				options.onRefusal?.(
+					ctx,
+					budget,
+					error instanceof Error ? error.message : String(error),
+					isOwned,
+				);
 				throw error;
 			}
 			active.refused = true;

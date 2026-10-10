@@ -55,6 +55,9 @@ test("v1_untouched and captured fixture bytes remain sha256 pinned", () => {
 			// before Magic Context's first write for a session (62c040ad76, "gate every
 			// pre-turn Magic Context write on the checkout claim"); OpenCode 2 wires the
 			// same check through its own adapter, so this is a v1 change, not v2 leakage.
+			// Re-minted when that checkout-claim check was removed again: the claim is
+			// now checked only at session registration, reconnect and move, outside
+			// Magic Context's per-turn path. Also a v1 change, not v2 leakage.
 			bytes = bytes
 				.replace('import { setup } from "./v2/server";\n', "")
 				.replace("PluginModule & { setup: typeof setup }", "PluginModule")

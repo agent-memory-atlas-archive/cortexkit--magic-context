@@ -7,7 +7,6 @@ import {
     pluginConfigReader,
 } from "../../config/live-run-config";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
-import { createSubcCheckoutClaimGate } from "../../features/magic-context/checkout-claim";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
@@ -78,7 +77,6 @@ import {
 import { lkgReplayLimit, measureLkgReplay } from "../../hooks/magic-context/lkg-replay-fit";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
-import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import {
@@ -599,10 +597,6 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const liveConfigReader = pluginConfigReader(directory, config);
-    const checkoutClaim = createSubcCheckoutClaimGate(
-        "opencode",
-        () => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-    );
     const compactionOff = !isCompactionEnabled(config);
     const conflicts = detectConflicts(directory, {
         compactionEnabled: !compactionOff,
@@ -1431,25 +1425,6 @@ export async function registerContext(context: V2Context) {
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
-        // Before anything below writes for this session: refuse the turn when
-        // another machine holds the session's agent. This holds in compaction-off
-        // mode too; passing the draft through would keep working on an agent this
-        // machine does not hold.
-        const claimRefusal = await checkoutClaim.refusal(draft.sessionID, directory);
-        if (claimRefusal) {
-            pushNotification(
-                "toast",
-                { message: claimRefusal.message, variant: "error" },
-                draft.sessionID,
-            );
-            await refuseBeforeProvider(
-                context.session,
-                draft.sessionID,
-                "checkout-claim-held-elsewhere",
-                claimRefusal,
-            );
-            throw new V2ContextRefusal(claimRefusal.message, { cause: claimRefusal });
-        }
         const systemAtEntry = structuredClone(draft.system);
         const slotAtEntry = getSlot(draft.sessionID);
         const restoreLkgSystem = () => {
