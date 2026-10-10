@@ -113,7 +113,7 @@ test("external process writes: data_version refreshes owner maxima and reasoning
         `,
                 path,
             ],
-            { stdout: "pipe", stderr: "pipe" },
+            { stdout: "pipe", stderr: "pipe", windowsHide: true },
         );
         const [code, errors] = await Promise.all([child.exited, new Response(child.stderr).text()]);
         expect({ code, errors }).toEqual({ code: 0, errors: "" });
