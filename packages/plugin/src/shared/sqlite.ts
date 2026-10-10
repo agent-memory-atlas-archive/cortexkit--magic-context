@@ -270,9 +270,12 @@ export function mayChangeTagIdentity(sql: string): boolean {
         return true;
     const insert = /^\s*INSERT\s+INTO\s+(?:main\.)?["`]?tags["`]?\s*\(([^)]*)\)/i.exec(sql);
     if (insert) {
-        const columns = (insert[1] ?? "")
-            .split(",")
-            .map((column) => column.trim().replace(/["`[\]]/g, "").toLowerCase());
+        const columns = (insert[1] ?? "").split(",").map((column) =>
+            column
+                .trim()
+                .replace(/["`[\]]/g, "")
+                .toLowerCase(),
+        );
         return columns.includes("id") || columns.includes("rowid");
     }
     const update = /^\s*UPDATE\s+(?:main\.)?["`]?tags["`]?\s+SET\s+([\s\S]*?)\bWHERE\b/i.exec(sql);
@@ -280,7 +283,10 @@ export function mayChangeTagIdentity(sql: string): boolean {
         const assigned = [...(update[1] ?? "").matchAll(/(?:^|,)\s*["`]?(\w+)["`]?\s*=/g)].map(
             (match) => (match[1] ?? "").toLowerCase(),
         );
-        return assigned.length === 0 || assigned.some((column) => !TAG_COLUMNS_OUTSIDE_IDENTITY.has(column));
+        return (
+            assigned.length === 0 ||
+            assigned.some((column) => !TAG_COLUMNS_OUTSIDE_IDENTITY.has(column))
+        );
     }
     return true;
 }
@@ -318,7 +324,9 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             }
             if (WRITER_TRANSACTION_END.test(sql) && openWriterTransactions.has(db))
                 return endWriterTransaction(db, () => nativeExec(sql), sql);
-            if (!/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)) {
+            if (
+                !/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)
+            ) {
                 try {
                     return withAutocommitTimeout(db, () => nativeExec(sql));
                 } finally {

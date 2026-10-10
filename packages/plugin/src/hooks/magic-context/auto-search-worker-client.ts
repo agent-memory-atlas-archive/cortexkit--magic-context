@@ -7,6 +7,8 @@ import {
 import type { EmbeddingPurpose } from "../../features/magic-context/memory/embedding-provider";
 import type {
     CapturedQueryEmbedding,
+    MessageHistorySearchOutcome,
+    MessageHistorySearchRequest,
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
@@ -110,7 +112,7 @@ export function persistAutoSearchDecision(
 }
 
 export interface AutoSearchWorkerInput {
-    job?: "search" | "backfill";
+    job?: "search" | "backfill" | "messages";
     path: string;
     harness: HarnessId;
     sessionId: string;
@@ -118,15 +120,22 @@ export interface AutoSearchWorkerInput {
     query: string;
     options: Omit<
         UnifiedSearchOptions,
-        "embedQuery" | "isEmbeddingRuntimeEnabled" | "signal" | "readMessages"
+        | "embedQuery"
+        | "isEmbeddingRuntimeEnabled"
+        | "signal"
+        | "readMessages"
+        | "searchMessageHistory"
     >;
     embeddingRuntimeEnabled: boolean;
     embeddingHostBusy: boolean;
     snapshot: ReturnType<typeof getProjectEmbeddingSnapshot>;
     deadlineUnixMs?: number;
+    /** The message-history lane to run, for the "messages" job. */
+    messageRequest?: MessageHistorySearchRequest;
 }
 export type AutoSearchWorkerReply =
     | { kind: "result"; results: UnifiedSearchResult[] }
+    | { kind: "messages"; outcome: MessageHistorySearchOutcome }
     | { kind: "error"; error: string }
     | { kind: "query"; id: number; text: string }
     | { kind: "batch"; id: number; texts: string[]; purpose: EmbeddingPurpose };
@@ -244,6 +253,7 @@ async function executeAutoSearchWorker(
         isEmbeddingRuntimeEnabled,
         signal: deadlineSignal,
         readMessages: _readMessages,
+        searchMessageHistory: _searchMessageHistory,
         ...serializable
     } = options;
     const lifecycle = registerAutoSearchWork(sessionId);
@@ -305,6 +315,8 @@ async function executeAutoSearchWorker(
                 finish([], new Error(reply.error));
                 return;
             }
+            // Only the "messages" job answers with a message-lane outcome.
+            if (reply.kind === "messages") return;
             const response: AutoSearchEmbeddingReply = { id: reply.id };
             try {
                 if (reply.kind === "query")
@@ -341,5 +353,72 @@ async function executeAutoSearchWorker(
             if (!settled && !signal?.aborted) worker.postMessage(response);
         });
         if (signal?.aborted) abort();
+    });
+}
+
+function defaultAutoSearchWorkerEntry(): URL {
+    return new URL(
+        new URL(import.meta.url).pathname.endsWith(".ts")
+            ? "./auto-search-worker.ts"
+            : "./auto-search-worker.js",
+        import.meta.url,
+    );
+}
+
+/**
+ * Run the message-history lane of a search on a worker with its own read-only
+ * connection, so its FTS statements (the per-probe match counts of an explicit
+ * `ctx_search` in particular) never run on the serving thread. The worker calls
+ * the same `searchMessageHistory`, so results and ranking are unchanged.
+ *
+ * Resolves null when the store has no file a worker can open or the worker
+ * fails; the caller then runs the lane in process as before.
+ */
+export function searchMessageHistoryOffThread(
+    db: Database,
+    request: MessageHistorySearchRequest,
+    entry: URL = defaultAutoSearchWorkerEntry(),
+): Promise<MessageHistorySearchOutcome | null> {
+    const path = getSqliteDatabasePath(db);
+    if (!path) return Promise.resolve(null);
+    const input: AutoSearchWorkerInput = {
+        job: "messages",
+        path,
+        harness: getHarness(),
+        sessionId: request.sessionId,
+        projectPath: "",
+        query: request.query,
+        options: {},
+        embeddingRuntimeEnabled: false,
+        embeddingHostBusy: false,
+        snapshot: null,
+        messageRequest: request,
+    };
+    return new Promise((resolve) => {
+        let settled = false;
+        let worker: Worker | undefined;
+        const finish = (outcome: MessageHistorySearchOutcome | null, failure?: unknown) => {
+            if (settled) return;
+            settled = true;
+            if (failure !== undefined)
+                log(
+                    `[search] message search worker failed: ${failure instanceof Error ? failure.message : String(failure)}`,
+                );
+            void worker?.terminate();
+            worker?.unref();
+            resolve(outcome);
+        };
+        try {
+            worker = new Worker(entry, { workerData: input });
+        } catch (error) {
+            finish(null, error);
+            return;
+        }
+        worker.on("message", (reply: AutoSearchWorkerReply) => {
+            if (reply.kind === "messages") finish(reply.outcome);
+            else if (reply.kind === "error") finish(null, reply.error);
+        });
+        worker.on("error", (error) => finish(null, error));
+        worker.on("exit", (code) => finish(null, `exited (${code}) without a result`));
     });
 }

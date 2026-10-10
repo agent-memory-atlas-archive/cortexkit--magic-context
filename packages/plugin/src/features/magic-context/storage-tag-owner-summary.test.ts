@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
 import { Database as UnwrappedDatabase } from "bun:sqlite";
+import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,7 +42,11 @@ function frozenReasoningEstimates(
         .prepare(
             "SELECT type, message_id, tool_owner_message_id, reasoning_token_count FROM tags WHERE session_id = ? AND reasoning_token_count IS NOT NULL",
         )
-        .all(sessionId) as Array<{ type: string; message_id: string; reasoning_token_count: number }>;
+        .all(sessionId) as Array<{
+        type: string;
+        message_id: string;
+        reasoning_token_count: number;
+    }>;
     const totals = new Map<string, number>();
     for (const row of rows) {
         if (row.type !== "message") continue;
@@ -82,7 +86,9 @@ function addTag(
         0,
         toolOwner,
         null,
-        reasoning === null ? null : { tokenCount: 5, inputTokenCount: 0, reasoningTokenCount: reasoning },
+        reasoning === null
+            ? null
+            : { tokenCount: 5, inputTokenCount: 0, reasoningTokenCount: reasoning },
     );
 }
 
@@ -112,7 +118,11 @@ describe("tag owner summary", () => {
             expectMatchesFullRead(db, 1.5);
 
             // A reasoning count written later changes an existing row.
-            backfillTagTokenCounts(db, SESSION, 6, { tokenCount: 5, inputTokenCount: 0, reasoningTokenCount: 300 });
+            backfillTagTokenCounts(db, SESSION, 6, {
+                tokenCount: 5,
+                inputTokenCount: 0,
+                reasoningTokenCount: 300,
+            });
             expectMatchesFullRead(db);
 
             // A removal lowers an owner's maximum.
@@ -120,17 +130,17 @@ describe("tag owner summary", () => {
             expectMatchesFullRead(db);
 
             // An owner re-assignment through this process's connection.
-            db.prepare("UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?").run(
-                "m-2",
-                SESSION,
-                4,
-            );
+            db.prepare(
+                "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",
+            ).run("m-2", SESSION, 4);
             expectMatchesFullRead(db);
 
             // A commit by another process, invisible to this process's write count.
             other = new UnwrappedDatabase(path);
             other.exec("PRAGMA busy_timeout = 1000");
-            other.prepare("DELETE FROM tags WHERE session_id = ? AND tag_number = ?").run(SESSION, 2);
+            other
+                .prepare("DELETE FROM tags WHERE session_id = ? AND tag_number = ?")
+                .run(SESSION, 2);
             expectMatchesFullRead(db);
 
             // Rows read inside a transaction that rolls back never reach the cache.
@@ -153,7 +163,14 @@ describe("tag owner summary", () => {
                 initializeDatabase(db);
                 db.transaction(() => {
                     for (let tag = 1; tag <= tagCount; tag += 1) {
-                        addTag(db, tag, `m-${tag}`, tag % 3 === 0 ? "tool" : "message", tag, `m-${tag - 1}`);
+                        addTag(
+                            db,
+                            tag,
+                            `m-${tag}`,
+                            tag % 3 === 0 ? "tool" : "message",
+                            tag,
+                            `m-${tag - 1}`,
+                        );
                     }
                 })();
                 getReasoningTokenEstimatesByMessage(db, SESSION, 1);

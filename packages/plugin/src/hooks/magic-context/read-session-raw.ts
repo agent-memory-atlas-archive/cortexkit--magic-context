@@ -869,7 +869,8 @@ export function resetRawSessionOrdinalRowsVisitedForTest(): void {
 
 /** Order two keys the way SQLite's BINARY collation orders `(time_created, id)`. */
 function compareOrdinalKeys(left: OrdinalKey, right: OrdinalKey): number {
-    if (left.timeCreated !== right.timeCreated) return left.timeCreated < right.timeCreated ? -1 : 1;
+    if (left.timeCreated !== right.timeCreated)
+        return left.timeCreated < right.timeCreated ? -1 : 1;
     if (left.id === right.id) return 0;
     return Buffer.compare(Buffer.from(left.id, "utf8"), Buffer.from(right.id, "utf8"));
 }

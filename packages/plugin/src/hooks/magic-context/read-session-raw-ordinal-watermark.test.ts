@@ -141,10 +141,14 @@ function expectCanonical(fixture: Store, order: "forward" | "backward" | "shuffl
         });
     }
     for (const id of sequence) {
-        expect({ id, ordinal: readRawSessionMessageByIdFromDb(fixture.db, SESSION, id)?.ordinal ?? null })
-            .toEqual({ id, ordinal: frozenPointLookupOrdinal(fixture.db, id) });
-        expect({ id, ordinal: readRawSessionMessageOrdinalByIdFromDb(fixture.db, SESSION, id) })
-            .toEqual({ id, ordinal: frozenOrdinalById(fixture.db, id) });
+        expect({
+            id,
+            ordinal: readRawSessionMessageByIdFromDb(fixture.db, SESSION, id)?.ordinal ?? null,
+        }).toEqual({ id, ordinal: frozenPointLookupOrdinal(fixture.db, id) });
+        expect({
+            id,
+            ordinal: readRawSessionMessageOrdinalByIdFromDb(fixture.db, SESSION, id),
+        }).toEqual({ id, ordinal: frozenOrdinalById(fixture.db, id) });
     }
 }
 

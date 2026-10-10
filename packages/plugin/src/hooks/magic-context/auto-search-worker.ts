@@ -3,7 +3,7 @@ import { ensureMemoryEmbeddings } from "../../features/magic-context/memory/embe
 import { getProjectEmbeddings } from "../../features/magic-context/memory/embedding-cache";
 import { getMemoriesByProject } from "../../features/magic-context/memory/storage-memory";
 import { installProjectEmbeddingSearchBridge } from "../../features/magic-context/project-embedding-registry";
-import { unifiedSearch } from "../../features/magic-context/search";
+import { searchMessageHistory, unifiedSearch } from "../../features/magic-context/search";
 import { setEmbeddingSessionBusy } from "../../shared/embedding-activity";
 import { setHarness } from "../../shared/harness";
 import { Database } from "../../shared/sqlite";
@@ -106,6 +106,10 @@ try {
             }
         }
         port.postMessage({ kind: "result", results: [] } satisfies AutoSearchWorkerReply);
+    } else if (input.job === "messages") {
+        if (!input.messageRequest) throw new Error("message search job carries no request");
+        const outcome = searchMessageHistory(db, input.messageRequest);
+        port.postMessage({ kind: "messages", outcome } satisfies AutoSearchWorkerReply);
     } else {
         const results = await unifiedSearch(db, input.sessionId, input.projectPath, input.query, {
             ...input.options,

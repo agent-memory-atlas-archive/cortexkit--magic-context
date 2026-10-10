@@ -12,7 +12,10 @@ import type { MessageLike } from "./tag-messages";
 
 function message(index: number, text = `message ${index}`): MessageLike {
     return {
-        info: { id: `msg_${String(index).padStart(7, "0")}`, role: index % 2 ? "assistant" : "user" },
+        info: {
+            id: `msg_${String(index).padStart(7, "0")}`,
+            role: index % 2 ? "assistant" : "user",
+        },
         parts: [{ type: "text", text }],
     } as unknown as MessageLike;
 }

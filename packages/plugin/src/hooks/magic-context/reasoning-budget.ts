@@ -234,10 +234,7 @@ export function opencodeReasoningBudgetCutoff(args: {
                 const costMessage = { ...message, parts: [...message.parts] };
                 const id = message.info.id ?? "";
                 // Stripping can only touch a message with a frozen decision.
-                if (
-                    args.frozenMergedIds &&
-                    (frozenParts?.has(id) || args.frozenMergedIds.has(id))
-                )
+                if (args.frozenMergedIds && (frozenParts?.has(id) || args.frozenMergedIds.has(id)))
                     stripReasoningFromMergedAssistants([costMessage], "anthropic", {
                         frozenMessageIds: args.frozenMergedIds,
                         frozenParts,
