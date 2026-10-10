@@ -172,7 +172,7 @@ export interface DreamTaskExecutorDeps {
     /** Resolved project transform mode; an explicit TS mode always stays on TS. */
     transformMode?: "ts" | "rust";
     /** Rust-mode module transport; classify uses it only after MODULE authority is confirmed. */
-    mural?: { enabled: boolean; model?: string };
+    mural?: { enabled: boolean };
     memoryInjectionBudgetTokens?: number;
     retinaHandoff?: boolean;
     /** Process-local progress callback for user-facing status displays; it never reads from or writes to the prompt/result cache. */
@@ -774,9 +774,8 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
                 if (deps.mural?.enabled !== true) {
                     return skip("mural is not enabled");
                 }
-                // `config.model` is already resolved by task-config using the
-                // executing harness's task-specific, mural/project-level,
-                // then default model settings.
+                // `config.model` is already resolved by task-config from the
+                // executing harness's task-specific, then default model settings.
                 const result = await runCompressCues({
                     db,
                     client: deps.client,
