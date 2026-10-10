@@ -1035,11 +1035,7 @@ describe("Pi system-prompt section injection (#649)", () => {
 			prompt: "hello",
 			systemPrompt: "BASE PROMPT",
 		};
-		const results = await runtime.emitPiEvent(
-			"before_agent_start",
-			event,
-			ctx,
-		);
+		const results = await runtime.emitPiEvent("before_agent_start", event, ctx);
 		const forced = results.find(
 			(r): r is { systemPrompt: string } =>
 				typeof r === "object" && r !== null && "systemPrompt" in r,
