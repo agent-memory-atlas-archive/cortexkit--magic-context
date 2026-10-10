@@ -8,7 +8,6 @@ import { escalationBands } from "../../shared/escalation-bands";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
-import { readThroughPassCache } from "./pass-input-cache";
 import { stableStringify } from "../../shared/stable-json";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import {
@@ -2651,12 +2650,6 @@ export function clearThinkingBindingRecoveryIf(
  * the applied set never shrinks while the session exists.
  */
 export function getMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
-    return readThroughPassCache(db, `merged-reasoning:${sessionId}`, "", () =>
-        readMergedReasoningStrippedIds(db, sessionId),
-    );
-}
-
-function readMergedReasoningStrippedIds(db: Database, sessionId: string): Set<string> {
     const row = db
         .prepare("SELECT merged_reasoning_stripped_ids FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { merged_reasoning_stripped_ids?: string } | null;

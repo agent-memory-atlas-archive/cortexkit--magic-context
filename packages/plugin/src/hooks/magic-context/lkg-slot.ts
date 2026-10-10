@@ -611,72 +611,25 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
     });
     const anchorIndex = entryInputIds.indexOf(slot.lastInputMessageId);
     if (anchorIndex < 0) return null;
-    const noted = noteEntryDigests(sessionId, messages.slice(0, anchorIndex + 1), entryInputIds);
-    if (!noted) return null;
+    const entryContentDigests = messages.slice(0, anchorIndex + 1).map((message, index) => {
+        const fields = lkgContentFields(message);
+        return fields
+            ? memoizedLkgContentDigestFromFields(entryInputIds[index] ?? "", fields)
+            : null;
+    });
+    if (entryContentDigests.some((digest) => digest === null)) return null;
     const pristineTail = structuredClone(messages.slice(anchorIndex + 1)) as MessageLike[];
     return {
         pristineTail,
         entryInputIds,
-        entryContentDigests: noted,
+        entryContentDigests: entryContentDigests as string[],
         anchorIndex,
     };
 }
 
-/**
- * Digest the captured prefix. A message whose id, position and content signature
- * match the previous note reuses that digest: the signature is the same rolling
- * hash the capture path already uses to detect a content change, so an unchanged
- * prefix is not sha256'd again. A changed message, or a prefix the signature
- * cannot prove, is hashed exactly as before.
- */
-function noteEntryDigests(
-    sessionId: string,
-    messages: readonly MessageLike[],
-    ids: readonly string[],
-): string[] | null {
-    const prior = notedEntryDigests.get(sessionId);
-    const digests: string[] = [];
-    const signatures: string[] = [];
-    const notedMessages: MessageLike[] = [];
-    for (let index = 0; index < messages.length; index += 1) {
-        const message = messages[index] as MessageLike;
-        const fields = lkgContentFields(message);
-        if (!fields) return null;
-        const signature = signatureForFields(fields);
-        // Same object and same signature is the unchanged prefix: OpenCode keeps
-        // those message objects, and the signature is the content-sensitive hash.
-        // A mutated object fails the signature compare and is hashed again.
-        const reusable =
-            prior !== undefined &&
-            prior.ids[index] === ids[index] &&
-            prior.signatures[index] === signature &&
-            prior.digests[index] !== undefined;
-        digests.push(
-            reusable
-                ? (prior.digests[index] as string)
-                : memoizedLkgContentDigestFromFields(ids[index] ?? "", fields),
-        );
-        signatures.push(signature);
-        notedMessages.push(message);
-    }
-    notedEntryDigests.set(sessionId, {
-        ids: [...ids],
-        signatures,
-        digests,
-        messages: notedMessages,
-    });
-    return digests;
-}
-
-const notedEntryDigests = new Map<
-    string,
-    { ids: string[]; signatures: string[]; digests: string[]; messages: MessageLike[] }
->();
-
 export function resetLkgSlotsForTest(): void {
     digestMemo.clear();
     digestMemoBytes = 0;
-    notedEntryDigests.clear();
     lkgHeapHolder.entries.clear();
     totalBytes = 0;
     persistenceBackend = undefined;

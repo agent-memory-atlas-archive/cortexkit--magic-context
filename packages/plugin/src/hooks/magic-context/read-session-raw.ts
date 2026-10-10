@@ -42,26 +42,6 @@ export interface RawMessageOrdinalAnchor {
     id: string;
 }
 
-/**
- * A proven point in the canonical ordinal space. `ordinal` is the watermark
- * message's own ordinal, so later lookups add only the eligible rows after it.
- */
-export interface RawMessageOrdinalWatermark extends RawMessageOrdinalAnchor {
-    ordinal: number;
-    /**
-     * `data` text of the watermark message when its ordinal was assigned.
-     * A later lookup trusts the ordinal only while that row's text is unchanged,
-     * which an index read can prove without parsing the prefix.
-     */
-    data?: string;
-    /**
-     * Stored message rows at or before the watermark, summaries included.
-     * An insert before the watermark changes this count, so the ordinal is not
-     * reused until the prefix is classified again.
-     */
-    storedRowsAtOrBefore?: number;
-}
-
 export interface RawMessageOrdinalEntry extends RawMessageOrdinalAnchor {
     contributesOrdinal: boolean;
     hasValidInfo: boolean;
@@ -538,280 +518,6 @@ function isAnchorRow(row: unknown): row is AnchorRow {
     );
 }
 
-interface OrdinalTargetKey {
-    timeCreated: number;
-    id: string;
-    summary: boolean;
-    data?: string;
-}
-
-/**
- * Legacy ordinal SQL treated numeric `summary: 1` as a compaction summary and
- * boolean `summary: true` the same way. A text needle cannot tell those apart,
- * so only rows that mention a summary are parsed; ordinary rows count from the
- * index without a JSON read.
- */
-const RAW_COMPACTION_SUMMARY_NEEDLE = '"summary"';
-
-/**
- * Same predicate as the historical `COUNT(*)` ordinal, including its treatment
- * of numeric 1. Invalid JSON is not a summary. Callers that already parsed the
- * row should not pay for a second parse.
- */
-/**
- * Rows the historical ordinal statement did not count. A compaction summary is
- * one. Malformed JSON made that statement abort, so the point lookup returned
- * no ordinal; counting the malformed row would publish a coordinate no caller
- * has served. Invalid JSON is therefore not an eligible row.
- */
-export function isLegacyOrdinalExcludedRow(data: string): boolean {
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(data);
-    } catch {
-        return true;
-    }
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    const info = parsed as { summary?: unknown; finish?: unknown };
-    return (info.summary === true || info.summary === 1) && info.finish === "stop";
-}
-
-/** Malformed JSON made the historical count abort, so no later ordinal was published. */
-export function isMalformedOrdinalRow(data: string): boolean {
-    try {
-        JSON.parse(data);
-        return false;
-    } catch {
-        return true;
-    }
-}
-
-export function isLegacyOrdinalCompactionSummary(data: string): boolean {
-    return data.includes(RAW_COMPACTION_SUMMARY_NEEDLE) && isLegacyOrdinalExcludedRow(data);
-}
-
-function ordinalTargetKey(db: Database, sessionId: string, messageId: string): OrdinalTargetKey | null {
-    const row = db
-        .prepare(
-            "SELECT id, time_created, data FROM message WHERE session_id = ? AND id = ? LIMIT 1",
-        )
-        .get(sessionId, messageId) as { id?: unknown; time_created?: unknown; data?: unknown } | null;
-    if (typeof row?.id !== "string" || typeof row.time_created !== "number") return null;
-    const data = typeof row.data === "string" ? row.data : "";
-    return {
-        id: row.id,
-        timeCreated: row.time_created,
-        summary: isLegacyOrdinalCompactionSummary(data),
-        data,
-    };
-}
-
-function storedRowsAtOrBefore(
-    db: Database,
-    sessionId: string,
-    through: RawMessageOrdinalAnchor,
-): number {
-    const row = db
-        .prepare(
-            `SELECT COUNT(*) AS count FROM message
-             WHERE session_id = ? AND (time_created, id) <= (?, ?)`,
-        )
-        .get(sessionId, through.timeCreated, through.id) as { count?: unknown } | null;
-    return typeof row?.count === "number" ? row.count : 0;
-}
-
-function watermarkStillHolds(
-    db: Database,
-    sessionId: string,
-    watermark: RawMessageOrdinalWatermark,
-): boolean {
-    if (!Number.isSafeInteger(watermark.ordinal) || watermark.ordinal < 1) return false;
-    // Without the stored-row count an insert before the watermark is invisible,
-    // and reusing the ordinal would publish the wrong coordinate.
-    if (watermark.storedRowsAtOrBefore === undefined) return false;
-    if (storedRowsAtOrBefore(db, sessionId, watermark) !== watermark.storedRowsAtOrBefore) {
-        return false;
-    }
-    const row = db
-        .prepare(
-            "SELECT data FROM message WHERE session_id = ? AND id = ? AND time_created = ? LIMIT 1",
-        )
-        .get(sessionId, watermark.id, watermark.timeCreated) as { data?: unknown } | null;
-    if (typeof row?.data !== "string") return false;
-    if (watermark.data !== undefined) return row.data === watermark.data;
-    return !isLegacyOrdinalCompactionSummary(row.data);
-}
-
-/**
- * Count canonical ordinals in an index range. The bounds are row-value seeks on
- * `(session_id, time_created, id)`, so the visited rows are exactly the range
- * and not the rest of the session.
- *
- * A cold range (no watermark) counts every stored row by the index, then
- * subtracts compaction summaries. Ordinary rows never match the summary text
- * needle, so their JSON is not parsed. A watermarked range is the messages
- * appended since the last proven ordinal; that span is small enough to classify
- * directly, which also counts a summary inserted before the watermark.
- */
-function countEligibleOrdinalsBetween(
-    db: Database,
-    sessionId: string,
-    after: RawMessageOrdinalWatermark | null,
-    through: RawMessageOrdinalAnchor,
-): number {
-    if (!after) {
-        const stored = db
-            .prepare(
-                `SELECT COUNT(*) AS count FROM message
-                 WHERE session_id = ? AND (time_created, id) <= (?, ?)`,
-            )
-            .get(sessionId, through.timeCreated, through.id) as { count?: unknown } | null;
-        const storedCount = typeof stored?.count === "number" ? stored.count : 0;
-        if (storedCount === 0) return 0;
-        const summaries = db
-            .prepare(
-                `SELECT data FROM message
-                 WHERE session_id = ?
-                   AND (time_created, id) <= (?, ?)
-                   AND (instr(data, ?) > 0 OR json_valid(data) = 0)`,
-            )
-            .all(
-                sessionId,
-                through.timeCreated,
-                through.id,
-                RAW_COMPACTION_SUMMARY_NEEDLE,
-            ) as Array<{ data?: unknown }>;
-        let excluded = 0;
-        for (const row of summaries) {
-            if (typeof row.data !== "string") continue;
-            // A malformed row aborted the historical count. Matching that means
-            // this id, and every id after it, has no published ordinal.
-            if (isMalformedOrdinalRow(row.data)) return Number.NaN;
-            if (isLegacyOrdinalExcludedRow(row.data)) excluded += 1;
-        }
-        return storedCount - excluded;
-    }
-    const stored = db
-        .prepare(
-            `SELECT COUNT(*) AS count FROM message
-             WHERE session_id = ?
-               AND (time_created, id) > (?, ?)
-               AND (time_created, id) <= (?, ?)`,
-        )
-        .get(sessionId, after.timeCreated, after.id, through.timeCreated, through.id) as {
-        count?: unknown;
-    } | null;
-    const storedCount = typeof stored?.count === "number" ? stored.count : 0;
-    if (storedCount === 0) return 0;
-    const summaries = db
-        .prepare(
-            `SELECT data FROM message
-             WHERE session_id = ?
-               AND (time_created, id) > (?, ?)
-               AND (time_created, id) <= (?, ?)
-               AND (instr(data, ?) > 0 OR json_valid(data) = 0)`,
-        )
-        .all(
-            sessionId,
-            after.timeCreated,
-            after.id,
-            through.timeCreated,
-            through.id,
-            RAW_COMPACTION_SUMMARY_NEEDLE,
-        ) as Array<{ data?: unknown }>;
-    let excluded = 0;
-    for (const row of summaries) {
-        if (typeof row.data !== "string") continue;
-        if (isMalformedOrdinalRow(row.data)) return Number.NaN;
-        if (isLegacyOrdinalExcludedRow(row.data)) excluded += 1;
-    }
-    return storedCount - excluded;
-}
-
-const provenOrdinalWatermarks = new Map<string, RawMessageOrdinalWatermark>();
-
-/**
- * Remember an ordinal this process has just assigned from the OpenCode store.
- * The next lookup for the same session adds only the rows after that message.
- * A revert, a restart, or a watermark row that no longer exists drops it; the
- * lookup then classifies the prefix again instead of publishing a stale count.
- */
-export function noteProvenRawSessionOrdinal(
-    sessionId: string,
-    watermark: RawMessageOrdinalWatermark,
-): void {
-    if (!Number.isSafeInteger(watermark.ordinal) || watermark.ordinal < 1) return;
-    const prior = provenOrdinalWatermarks.get(sessionId);
-    if (
-        prior &&
-        (prior.timeCreated > watermark.timeCreated ||
-            (prior.timeCreated === watermark.timeCreated && prior.id > watermark.id) ||
-            prior.ordinal > watermark.ordinal)
-    ) {
-        return;
-    }
-    provenOrdinalWatermarks.set(sessionId, watermark);
-}
-
-export function forgetProvenRawSessionOrdinal(sessionId: string): void {
-    provenOrdinalWatermarks.delete(sessionId);
-}
-
-/** @internal Test hook. Production lookups drop a stale watermark through {@link forgetProvenRawSessionOrdinal}. */
-export function resetProvenRawSessionOrdinalsForTest(): void {
-    provenOrdinalWatermarks.clear();
-}
-
-function provenWatermarkBefore(
-    sessionId: string,
-    target: RawMessageOrdinalAnchor,
-): RawMessageOrdinalWatermark | undefined {
-    const watermark = provenOrdinalWatermarks.get(sessionId);
-    if (!watermark) return undefined;
-    if (
-        watermark.timeCreated < target.timeCreated ||
-        (watermark.timeCreated === target.timeCreated && watermark.id < target.id)
-    ) {
-        return watermark;
-    }
-    return undefined;
-}
-
-function countCanonicalOrdinalThrough(
-    db: Database,
-    sessionId: string,
-    messageId: string,
-    watermark: RawMessageOrdinalWatermark | undefined,
-    knownTarget?: OrdinalTargetKey,
-): number | null {
-    const target = knownTarget ?? ordinalTargetKey(db, sessionId, messageId);
-    if (!target || target.summary) return null;
-    // A caller-supplied watermark wins. Otherwise reuse an ordinal this process
-    // assigned earlier in the session, but only while that row is still the
-    // message it was. An insert before it, or a revert, fails that check and the
-    // prefix is classified again.
-    const candidate =
-        watermark &&
-        (watermark.timeCreated < target.timeCreated ||
-            (watermark.timeCreated === target.timeCreated && watermark.id < target.id))
-            ? watermark
-            : provenWatermarkBefore(sessionId, target);
-    const anchor = candidate && watermarkStillHolds(db, sessionId, candidate) ? candidate : null;
-    if (candidate && !anchor) provenOrdinalWatermarks.delete(sessionId);
-    const delta = countEligibleOrdinalsBetween(db, sessionId, anchor, target);
-    const ordinal = (anchor?.ordinal ?? 0) + delta;
-    if (!Number.isFinite(ordinal) || ordinal <= 0) return null;
-    if (ordinal > 0 && knownTarget?.data !== undefined) {
-        noteProvenRawSessionOrdinal(sessionId, {
-            ...target,
-            ordinal,
-            data: knownTarget.data,
-            storedRowsAtOrBefore: storedRowsAtOrBefore(db, sessionId, target),
-        });
-    }
-    return ordinal > 0 ? ordinal : null;
-}
-
 /**
  * Read ONLY the eligible tail — messages at/after the last compartment boundary
  * — assigning them their correct ABSOLUTE ordinals (continuing from
@@ -1080,27 +786,48 @@ export function readRawSessionMessagePartsByIdFromDb(
  * Resolve one message ID in the canonical raw-message ordinal space. Synthetic
  * compaction summaries are excluded so this count matches every module wire
  * ordinal and does not depend on the stored compartment basis.
- *
- * The count is the indexer's last proven ordinal plus the eligible rows strictly
- * after that watermark and through the target. A row-value range seeks the
- * `(session_id, time_created, id)` index instead of JSON-parsing every earlier
- * message. Without a watermark the same count still holds, but the prefix has
- * to be classified once.
  */
 export function readRawSessionMessageOrdinalByIdFromDb(
     db: Database,
     sessionId: string,
     messageId: string,
-    watermark?: RawMessageOrdinalWatermark,
 ): number | null {
-    return countCanonicalOrdinalThrough(db, sessionId, messageId, watermark);
+    const row = db
+        .prepare(
+            `SELECT COUNT(candidate.id) AS ordinal
+             FROM message AS target
+             JOIN message AS candidate
+               ON candidate.session_id = target.session_id
+              AND NOT (
+                  CASE WHEN json_valid(candidate.data) = 1
+                       THEN COALESCE(json_extract(candidate.data, '$.summary'), 0)
+                       ELSE 0 END = 1
+                  AND CASE WHEN json_valid(candidate.data) = 1
+                           THEN COALESCE(json_extract(candidate.data, '$.finish'), '')
+                           ELSE '' END = 'stop'
+              )
+              AND (candidate.time_created < target.time_created
+                   OR (candidate.time_created = target.time_created AND candidate.id <= target.id))
+             WHERE target.session_id = ?
+               AND target.id = ?
+               AND NOT (
+                   CASE WHEN json_valid(target.data) = 1
+                        THEN COALESCE(json_extract(target.data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(target.data) = 1
+                            THEN COALESCE(json_extract(target.data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )`,
+        )
+        .get(sessionId, messageId) as OrdinalRow | null;
+    const ordinal = row?.ordinal;
+    return typeof ordinal === "number" && ordinal > 0 ? ordinal : null;
 }
 
 export function readRawSessionMessageByIdFromDb(
     db: Database,
     sessionId: string,
     messageId: string,
-    watermark?: RawMessageOrdinalWatermark,
 ): RawMessage | null {
     const row = db
         .prepare(
@@ -1116,13 +843,17 @@ export function readRawSessionMessageByIdFromDb(
         return null;
     }
 
-    const ordinal = countCanonicalOrdinalThrough(db, sessionId, messageId, watermark, {
-        timeCreated: row.time_created,
-        id: row.id,
-        summary: false,
-        data: row.data,
-    });
-    if (ordinal === null) {
+    const ordinalRow = db
+        .prepare(
+            `SELECT COUNT(*) AS ordinal FROM message
+             WHERE session_id = ?
+               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
+                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
+               AND (time_created < ? OR (time_created = ? AND id <= ?))`,
+        )
+        .get(sessionId, row.time_created, row.time_created, messageId) as OrdinalRow | null;
+    const ordinal = typeof ordinalRow?.ordinal === "number" ? ordinalRow.ordinal : 0;
+    if (ordinal <= 0) {
         return null;
     }
 

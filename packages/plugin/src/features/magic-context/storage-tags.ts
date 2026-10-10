@@ -1,7 +1,6 @@
 import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
-import { readThroughPassCache } from "./pass-input-cache";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
 import { removePendingOp } from "./storage-ops";
@@ -708,19 +707,6 @@ export function getAllStatusTagTokenTotalsFlat(
  * tools repeat that estimate. Repeated text tags likewise charge the group once.
  */
 export function getReasoningTokenEstimatesByMessage(
-    db: Database,
-    sessionId: string,
-    proseRatio: number,
-): Map<string, number> {
-    return readThroughPassCache(
-        db,
-        `reasoning-estimates:${sessionId}`,
-        String(proseRatio),
-        () => readReasoningTokenEstimatesByMessage(db, sessionId, proseRatio),
-    );
-}
-
-function readReasoningTokenEstimatesByMessage(
     db: Database,
     sessionId: string,
     proseRatio: number,
@@ -2258,10 +2244,6 @@ export const TAG_SELECT_COLUMNS =
     "id, message_id, type, status, drop_mode, tool_name, input_byte_size, byte_size, reasoning_byte_size, session_id, tag_number, caveman_depth, tool_owner_message_id, token_count";
 
 export function getTagsBySession(db: Database, sessionId: string): TagEntry[] {
-    return readThroughPassCache(db, `tags:${sessionId}`, "", () => readTagsBySession(db, sessionId));
-}
-
-function readTagsBySession(db: Database, sessionId: string): TagEntry[] {
     const rows = db
         .prepare(
             `SELECT ${TAG_SELECT_COLUMNS} FROM tags WHERE session_id = ? ORDER BY tag_number ASC, id ASC`,
