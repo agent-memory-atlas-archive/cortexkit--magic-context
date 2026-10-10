@@ -2182,9 +2182,15 @@ export default function ConfigEditor(props: {
         </div>
       </div>
 
+      {/* Model discovery status floats over the page instead of taking a row, so the
+          form does not jump down while models load and back up when they arrive. */}
       <Show when={props.catalogLoading || props.catalogError}>
-        <div class="empty-state" role="status">
-          <span>{props.catalogLoading ? "Loading OpenCode models..." : props.catalogError}</span>
+        <div
+          class={`config-catalog-toast ${props.catalogLoading ? "" : "is-error"}`}
+          role="status"
+          aria-live="polite"
+        >
+          <span>{props.catalogLoading ? "Loading OpenCode models…" : props.catalogError}</span>
           <Show when={!props.catalogLoading && props.catalogError}>
             <button type="button" class="btn sm" onClick={props.onRetryCatalogs}>
               Retry model discovery

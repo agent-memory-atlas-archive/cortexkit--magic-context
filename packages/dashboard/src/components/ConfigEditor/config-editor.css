@@ -808,3 +808,30 @@
     grid-column: 1 / -1;
   }
 }
+
+/* Model discovery status: a small toast pinned to the bottom-right corner. Being
+   out of the document flow, it never moves the form when it appears or goes away. */
+.config-catalog-toast {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 14%);
+  color: var(--text-secondary);
+  font-size: 12px;
+  animation: toast-in 200ms ease-out;
+}
+
+.config-catalog-toast.is-error {
+  background: var(--error-bg);
+  border-color: var(--error-border);
+  color: var(--error-text);
+}
