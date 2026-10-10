@@ -11,10 +11,6 @@ import { isCompactionEnabled, isDreamerRunnable } from "./config/agent-disable";
 import { createDreamerOutputCapSampler } from "./config/live-child-output-cap";
 import { dreamerRunConfig, historianRunConfig, pluginConfigReader } from "./config/live-run-config";
 import { migrateMagicContextConfigLocations } from "./config/migrate-config-location";
-import {
-    createSubcCheckoutClaimGate,
-    openCodeEventSessionId,
-} from "./features/magic-context/checkout-claim";
 import { openOpenCodeDb } from "./features/magic-context/dreamer/open-opencode-db";
 import { DREAMER_SYSTEM_PROMPT } from "./features/magic-context/dreamer/task-prompts";
 import type {
@@ -847,24 +843,6 @@ const server: Plugin = async (ctx) => {
         }),
     );
 
-    // The checkout claim: Magic Context must not write for a session whose agent
-    // another machine holds. Its first write for a session can come from the
-    // event stream (session.created), chat.message, or a transform pass, so
-    // each of those consults the gate first. The verdict is cached per session,
-    // so only a session's first sight (and each cache expiry) pays for a check.
-    // Nothing is written when the plugin is disabled, so nothing is checked.
-    const checkoutClaimGate = pluginConfig.enabled
-        ? createSubcCheckoutClaimGate(
-              "opencode",
-              () => pluginConfig.subc?.connection_file ?? getDefaultSubcConnectionFile(),
-          )
-        : undefined;
-    const isCheckoutClaimRefused = async (sessionId: string | undefined): Promise<boolean> => {
-        if (!checkoutClaimGate || !sessionId) return false;
-        if (liveSessionState.internalChildSessions.has(sessionId)) return false;
-        return (await checkoutClaimGate.refusal(sessionId, ctx.directory)) !== null;
-    };
-
     return {
         tool: tools,
         event: createEventHandler({
@@ -873,11 +851,6 @@ const server: Plugin = async (ctx) => {
                     if (input.event.type === "session.deleted") {
                         const properties = input.event.properties as { info?: { id?: string } };
                         if (properties.info?.id) dreamerCap.delete(properties.info.id);
-                    } else if (await isCheckoutClaimRefused(openCodeEventSessionId(input.event))) {
-                        // The host's own deletion of a session still clears its local
-                        // state above; every other event of a session held elsewhere
-                        // is left for the machine that holds it.
-                        return;
                     }
                     await magicContextRuntime.magicContext?.event?.(input);
                 },
@@ -944,26 +917,6 @@ const server: Plugin = async (ctx) => {
             getMagicContext: () => magicContextRuntime.magicContext,
             failClosed,
             failClosedBlockingEnabled,
-            // Refuse before any write when another machine holds the session's
-            // agent; MC writes nothing when the plugin is disabled.
-            checkoutClaim: checkoutClaimGate
-                ? {
-                      gate: checkoutClaimGate,
-                      projectRoot: ctx.directory,
-                      onRefusal: async (sessionId, message) => {
-                          const { sendStatusNotification } = await importPluginModule(
-                              () => import("./hooks/magic-context/send-session-notification"),
-                          );
-                          const { abortSessionFailClosed } = await importPluginModule(
-                              () => import("./hooks/magic-context/transform-postprocess-phase"),
-                          );
-                          await sendStatusNotification(ctx.client, sessionId, message, {
-                              toastDurationMs: 15000,
-                          });
-                          await abortSessionFailClosed(ctx.client, sessionId);
-                      },
-                  }
-                : undefined,
             // Compaction-off mode (issue #266): fail_closed_blocking is inert
             // BY DESIGN in this mode — a failed transform degrades to
             // passthrough of the input messages instead of blocking the turn.
@@ -992,9 +945,6 @@ const server: Plugin = async (ctx) => {
             },
         }) as unknown as NonNullable<Hooks["experimental.chat.messages.transform"]>,
         "experimental.chat.system.transform": async (input, output) => {
-            // The messages transform refuses such a turn loudly; this hook only
-            // has to stay out of the store.
-            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
             await magicContextRuntime.magicContext?.["experimental.chat.system.transform"]?.(
                 input,
                 output,
@@ -1025,8 +975,6 @@ const server: Plugin = async (ctx) => {
                 provId && modId
                     ? { providerID: provId, modelID: modId, agentName: agent || "default" }
                     : null;
-            // The turn itself is refused by the messages transform, loudly.
-            if (await isCheckoutClaimRefused((input as { sessionID?: string }).sessionID)) return;
             await magicContextRuntime.magicContext?.["chat.message"]?.(input, output);
         },
         "tool.definition": async (input, output) => {

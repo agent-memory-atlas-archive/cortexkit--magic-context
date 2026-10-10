@@ -39,67 +39,6 @@ function deferred<T>() {
 }
 
 for (const cancellation of ["successor", "signal"] as const) {
-	test(`r2: ${cancellation} fences checkout-claim resumption before all writes`, async () => {
-		const db = createTestDb();
-		const sessionId = `r2-claim-${cancellation}`;
-		const paused = deferred<null>();
-		const entered = deferred<void>();
-		let calls = 0;
-		const fake = createFakePi();
-		registerPiContextHandler(
-			fake.pi as never,
-			{ db },
-			{
-				checkoutClaim: {
-					refusal: async () => {
-						if (++calls === 1) {
-							entered.resolve();
-							return paused.promise;
-						}
-						return null;
-					},
-				},
-			},
-		);
-		const handler = fake.handlers.get("context") as unknown as Handler;
-		const controller = new AbortController();
-		const raw = [userMessage("old claim input")];
-		const old = handler(
-			{ messages: raw },
-			{
-				...fakeContext(sessionId, process.cwd(), ["old"], raw),
-				signal: controller.signal,
-			},
-		).catch((error: Error) => error);
-		try {
-			await entered.promise;
-			if (cancellation === "signal")
-				controller.abort(new Error("cancelled claim"));
-			else {
-				const newer = [userMessage("new claim input", 2)];
-				await handler(
-					{ messages: newer },
-					fakeContext(sessionId, process.cwd(), ["new"], newer),
-				);
-			}
-			paused.resolve(null);
-			expect(((await old) as Error).message).toBe(
-				cancellation === "signal"
-					? "cancelled claim"
-					: "Pi context pass superseded before writer admission",
-			);
-			expect(
-				db.prepare("SELECT * FROM tags WHERE message_id='old:p0'").all(),
-			).toEqual([]);
-		} finally {
-			paused.resolve(null);
-			await old;
-			clearContextHandlerSession(sessionId);
-			resetLkgSlotsForTest();
-			db.close();
-		}
-	});
-
 	test(`r2: ${cancellation} fences real auto-search continuation and LKG publication`, async () => {
 		const db = createTestDb();
 		const sessionId = `r2-search-${cancellation}`;

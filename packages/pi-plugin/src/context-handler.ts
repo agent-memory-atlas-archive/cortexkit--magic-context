@@ -37,7 +37,6 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
-import type { CheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
@@ -3086,13 +3085,6 @@ function loadPiHistorianStateSnapshot(
 export function registerPiContextHandler(
 	pi: ExtensionAPI,
 	baseOptions: PiContextHandlerOptions,
-	processOptions: {
-		/**
-		 * The checkout claim check, run before the pass writes anything. A refusal
-		 * escapes the handler, so the guarded wrapper aborts the turn and shows it.
-		 */
-		checkoutClaim?: Pick<CheckoutClaimGate, "refusal">;
-	} = {},
 ): void {
 	const tagger = createTagger();
 	const lkgCoordinator = createPiLkgCoordinator(
@@ -3187,17 +3179,8 @@ export function registerPiContextHandler(
 			assert: assertCurrentPass,
 			remainingMs: () => budget.remainingWork(),
 		});
-		budget.stage = "schema/claim";
+		budget.stage = "schema";
 		const toolWireSchema = await guardAwait(loadPiToolWireSchema());
-		if (processOptions.checkoutClaim) {
-			const claimSessionId = resolveSessionId(ctx);
-			if (claimSessionId) {
-				const refusal = await guardAwait(
-					processOptions.checkoutClaim.refusal(claimSessionId, ctx.cwd),
-				);
-				if (refusal) throw refusal;
-			}
-		}
 		const transformStartTime = budget.startedAt;
 		let rawMessageCount = 0;
 		let rawFallbackLimit: number | undefined;

@@ -59,14 +59,6 @@
             "hosts": ["opencode2"]
         },
         {
-            "path": "tests/checkout-claim.test.ts",
-            "tier": "ts-only",
-            "invocation": { "ts": true, "rust": false },
-            "rationale": "Agent checkout claim: real OpenCode 1, Pi and OMP hosts against a wire-level fake subc daemon playing ALF agent.for_host_session and engram claim.read refuse a held-elsewhere session before any Magic Context write or provider call, then serve it once the claim moves back; PID lsof proves throwaway-store containment. OpenCode 2 runs the same gate in its context hook (unit-tested against the same fake daemon); Rust mode goes through the TypeScript plugin's pass",
-            "contract_refs": ["AGENT-CHECKOUT-CLAIM"],
-            "hosts": ["opencode", "pi", "omp"]
-        },
-        {
             "path": "tests/cache-ttl-live-config.test.ts",
             "tier": "ts-only",
             "invocation": { "ts": true, "rust": false },
