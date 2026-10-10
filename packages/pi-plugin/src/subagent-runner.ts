@@ -1178,6 +1178,10 @@ export class PiSubagentRunner implements SubagentRunner {
 			}
 			if (!options.accountingSessionId || recordedAccounting) return;
 			recordedAccounting = true;
+			const modelRef =
+				typeof options.model === "string" ? options.model : undefined;
+			const providerSeparator = modelRef?.indexOf("/") ?? -1;
+			const hasProvider = providerSeparator > 0;
 			recordChildInvocation({
 				db: openDatabase(),
 				parentSessionId: options.accountingSessionId,
@@ -1197,14 +1201,12 @@ export class PiSubagentRunner implements SubagentRunner {
 								? "empty"
 								: "failed",
 				messages,
-				providerId:
-					typeof options.model === "string"
-						? options.model.split("/")[0]
-						: null,
-				modelId:
-					typeof options.model === "string"
-						? options.model.split("/").slice(1).join("/")
-						: null,
+				providerId: hasProvider
+					? modelRef?.slice(0, providerSeparator)
+					: undefined,
+				modelId: hasProvider
+					? modelRef?.slice(providerSeparator + 1)
+					: modelRef,
 				error: result.ok ? null : result.error,
 				parentInvocationId: options.accountingParentInvocationId ?? null,
 			});

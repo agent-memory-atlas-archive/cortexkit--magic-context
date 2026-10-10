@@ -221,9 +221,9 @@ export interface Compartment {
   title: string;
   content: string;
   created_at: number;
-  /** Resolved from OpenCode DB — epoch ms */
+  /** Epoch milliseconds from the OpenCode message table or matching Pi/OMP JSONL entry. */
   start_time?: number;
-  /** Resolved from OpenCode DB — epoch ms */
+  /** Epoch milliseconds from the OpenCode message table or matching Pi/OMP JSONL entry. */
   end_time?: number;
   /** v2 decay-rate score (1–100). Higher decays into lower tiers slower. */
   importance: number;

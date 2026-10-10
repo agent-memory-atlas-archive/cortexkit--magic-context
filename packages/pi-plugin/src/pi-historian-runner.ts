@@ -1165,6 +1165,8 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 							onProgress: buildProgressLogger("fallback"),
 							accountingSessionId: sessionId,
 							accountingSubagent: "historian",
+							accountingTask:
+								candidate.kind === "session" ? "fallback-session" : "fallback",
 						},
 					});
 					const fbPass = await validateHistorianResult(

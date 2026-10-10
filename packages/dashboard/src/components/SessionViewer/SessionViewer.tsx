@@ -27,6 +27,12 @@ import {
   updateSessionFact,
 } from "../../lib/api";
 import { LoadMoreTrigger } from "../../lib/load-more";
+import {
+  formatHistorianDuration,
+  formatHistorianProviderModel,
+  formatHistorianTokens,
+} from "./historian-format";
+import { formatCompartmentDateSpan } from "./session-dates";
 import type { HarnessFilter } from "./session-filter";
 import { parseStoredHarnessFilter, sessionHarnessOptions } from "./session-filter";
 
@@ -700,7 +706,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
             class="section-title"
             style={{
               display: "flex",
-              "align-items": "flex-start",
+              "align-items": "center",
               gap: "8px",
               "min-width": 0,
               "flex-wrap": "wrap",
@@ -718,7 +724,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
               <span
                 style={{
                   display: "inline-flex",
-                  "align-items": "flex-start",
+                  "align-items": "center",
                   gap: "8px",
                   "min-width": 0,
                   flex: "1 1 0",
@@ -950,12 +956,30 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                   {detail().project_display}
                 </span>
               </div>
-              <div class="card-meta">
+              <div
+                class="card-meta"
+                style={{ "min-width": "0", "align-items": "stretch", "flex-direction": "column" }}
+              >
                 <span class="id-text selectable">{detail().session_id}</span>
                 <Show when={detail().pi_jsonl_path}>
                   {(path) => (
-                    <span>
-                      JSONL: <span class="id-text selectable">{path()}</span>
+                    <span
+                      style={{
+                        display: "flex",
+                        "align-items": "center",
+                        gap: "6px",
+                        "min-width": "0",
+                        "max-width": "100%",
+                      }}
+                    >
+                      <span style={{ "flex-shrink": "0" }}>JSONL:</span>
+                      <span
+                        class="id-text selectable"
+                        title={path()}
+                        style={{ display: "block", flex: "1 1 auto", "min-width": "0" }}
+                      >
+                        {path()}
+                      </span>
                     </span>
                   )}
                 </Show>
@@ -1211,17 +1235,25 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 legacy
                               </span>
                             ) : null}
-                            {comp.start_time && comp.end_time && (
-                              <span
-                                style={{
-                                  color: "var(--text-muted)",
-                                  "font-size": "11px",
-                                  "margin-left": "8px",
-                                }}
-                              >
-                                {formatDateTime(comp.start_time)} → {formatDateTime(comp.end_time)}
-                              </span>
-                            )}
+                            <Show
+                              when={formatCompartmentDateSpan(
+                                comp.start_time,
+                                comp.end_time,
+                                comp.created_at,
+                              )}
+                            >
+                              {(dateSpan) => (
+                                <span
+                                  style={{
+                                    color: "var(--text-muted)",
+                                    "font-size": "11px",
+                                    "margin-left": "8px",
+                                  }}
+                                >
+                                  {dateSpan()}
+                                </span>
+                              )}
+                            </Show>
                           </div>
                           <span style={{ "font-size": "11px", color: "var(--text-muted)" }}>
                             {expandedCompartment() === comp.id ? "▲" : "▼"}
@@ -1711,12 +1743,12 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
               when={historianInvocations().length > 0}
               fallback={<div class="empty-state">No historian invocations recorded</div>}
             >
-              <table class="kv-table">
+              <table class="kv-table historian-table">
                 <thead>
                   <tr>
                     <th>Started</th>
                     <th>Subagent</th>
-                    <th>Model</th>
+                    <th>Provider / Model</th>
                     <th>Status</th>
                     <th>Duration</th>
                     <th>Tokens</th>
@@ -1728,8 +1760,22 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                     {(row) => (
                       <tr style={{ "padding-left": row.parent_invocation_id ? "16px" : undefined }}>
                         <td>{formatDateTime(row.started_at)}</td>
-                        <td>{row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}</td>
-                        <td>{row.model_id ?? row.provider_id ?? "—"}</td>
+                        <td>
+                          {row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}
+                          <Show when={row.task === "fallback" || row.task === "fallback-session"}>
+                            <span
+                              class="pill gray historian-fallback"
+                              title={
+                                row.task === "fallback-session"
+                                  ? "Session model used as the final fallback"
+                                  : "Configured fallback model"
+                              }
+                            >
+                              fallback
+                            </span>
+                          </Show>
+                        </td>
+                        <td>{formatHistorianProviderModel(row.provider_id, row.model_id)}</td>
                         <td>
                           {row.status === "timed_out"
                             ? "Timed out"
@@ -1737,16 +1783,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               ? "Empty output"
                               : row.status}
                         </td>
-                        <td>
-                          {row.ended_at
-                            ? `${Math.max(0, row.ended_at - row.started_at).toLocaleString()}ms`
-                            : "—"}
-                        </td>
+                        <td>{formatHistorianDuration(row.started_at, row.ended_at)}</td>
                         <td
-                          title={`in ${row.input_tokens.toLocaleString()} · out ${row.output_tokens.toLocaleString()} · cache ${row.cache_read_tokens.toLocaleString()}/${row.cache_write_tokens.toLocaleString()}`}
+                          title={`Input: ${row.input_tokens.toLocaleString()} · Output: ${row.output_tokens.toLocaleString()} · Cache read: ${row.cache_read_tokens.toLocaleString()} · Cache write: ${row.cache_write_tokens.toLocaleString()}`}
                         >
-                          input: {row.input_tokens.toLocaleString()} · output:{" "}
-                          {row.output_tokens.toLocaleString()}
+                          {formatHistorianTokens(row.input_tokens, row.output_tokens)}
                         </td>
                         <td>{row.error ?? "—"}</td>
                       </tr>
