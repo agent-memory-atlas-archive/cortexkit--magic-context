@@ -10,6 +10,7 @@ import {
 	buildPiCompactionSummary,
 	findFirstKeptEntryId,
 } from "./pi-historian-runner";
+import { resolvePiRawOrdinalOffset } from "./pi-ordinal-alignment";
 
 /**
  * Advance the Pi native compaction marker to the latest compartment boundary
@@ -54,6 +55,7 @@ export function stagePiRecompMarker(args: {
 		firstKeptEntryId = findFirstKeptEntryId(
 			args.branchEntries,
 			last.endMessage,
+			resolvePiRawOrdinalOffset(args.db, args.sessionId, args.branchEntries),
 		);
 	} catch {
 		firstKeptEntryId = null;
@@ -98,9 +100,11 @@ export function queueAndApplyPiRecompMarker(args: {
 
 	let firstKeptEntryId: string | null = null;
 	try {
+		const branchEntries = readBranchEntries();
 		firstKeptEntryId = findFirstKeptEntryId(
-			readBranchEntries(),
+			branchEntries,
 			last.endMessage,
+			resolvePiRawOrdinalOffset(args.db, args.sessionId, branchEntries),
 		);
 	} catch {
 		firstKeptEntryId = null;

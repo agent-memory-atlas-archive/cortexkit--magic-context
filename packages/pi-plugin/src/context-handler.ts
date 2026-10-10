@@ -337,6 +337,14 @@ import {
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
 import {
+	clearPiOrdinalAlignmentSession,
+	isPiOrdinalAlignmentUnanchored,
+	type PiOrdinalAlignment,
+	piRawOrdinalOffsetSource,
+	resolvePiOrdinalAlignment,
+	resolvePiOrdinalAlignmentForContext,
+} from "./pi-ordinal-alignment";
+import {
 	clearPiLiveUsageClassification,
 	formatPiPressureForLog,
 	isPiLiveUsageRawBranchEstimate,
@@ -908,18 +916,21 @@ function resolvePiContextModelKey(ctx: ExtensionContext): string | undefined {
 function readPiSessionMessageById(
 	ctx: ExtensionContext,
 	messageId: string,
+	ordinalOffset = 0,
 ): ReturnType<typeof readPiSessionMessages>[number] | null {
 	return (
-		readPiSessionMessages(ctx).find((message) => message.id === messageId) ??
-		null
+		readPiSessionMessages(ctx, ordinalOffset).find(
+			(message) => message.id === messageId,
+		) ?? null
 	);
 }
 
 function convertLocatedPiUserEntry(
 	branchEntries: readonly unknown[],
 	messageId: string,
+	ordinalOffset = 0,
 ): ReturnType<typeof readPiSessionMessages>[number] | null {
-	let rawOrdinal = 0;
+	let rawOrdinal = ordinalOffset > 0 ? ordinalOffset : 0;
 	let pendingToolStart = -1;
 	for (let index = 0; index < branchEntries.length; index += 1) {
 		const entry = branchEntries[index];
@@ -3277,16 +3288,26 @@ export function registerPiContextHandler(
 					assertCurrentPass,
 				});
 			let rawOrdinalCount: number | undefined;
+			// Stored ordinals may sit ahead of this branch walk; derive the offset
+			// once per pass, on first use, from the same entries every reader below
+			// numbers (pi-ordinal-alignment.ts).
+			let passOrdinalAlignment: PiOrdinalAlignment | undefined;
+			const ordinalAlignment = (): PiOrdinalAlignment =>
+				(passOrdinalAlignment ??=
+					branchEntries !== null
+						? resolvePiOrdinalAlignment(options.db, sessionId, branchEntries)
+						: resolvePiOrdinalAlignmentForContext(options.db, sessionId, ctx));
+			const ordinalOffset = (): number => ordinalAlignment().offset;
 			const rawMessageProvider = {
 				getMessageCount: () =>
 					(rawOrdinalCount ??=
 						branchEntries !== null
-							? countPiRawMessages(branchEntries)
-							: readPiSessionMessages(ctx).length),
+							? countPiRawMessages(branchEntries, ordinalOffset())
+							: readPiSessionMessages(ctx, ordinalOffset()).length),
 				readMessages: () =>
 					branchEntries !== null
-						? convertEntriesToRawMessages(branchEntries)
-						: readPiSessionMessages(ctx),
+						? convertEntriesToRawMessages(branchEntries, ordinalOffset())
+						: readPiSessionMessages(ctx, ordinalOffset()),
 				readMessagePage: (
 					afterOrdinal: number,
 					limit: number,
@@ -3298,15 +3319,17 @@ export function registerPiContextHandler(
 								afterOrdinal,
 								limit,
 								finalWatermark,
+								ordinalOffset(),
 							)
 						: readPiSessionMessagePage(
 								ctx,
 								afterOrdinal,
 								limit,
 								finalWatermark,
+								ordinalOffset(),
 							),
 				readMessageById: (messageId: string) =>
-					readPiSessionMessageById(ctx, messageId),
+					readPiSessionMessageById(ctx, messageId, ordinalOffset()),
 			};
 			rawMessageProviderUnregistersBySession.get(sessionId)?.();
 			const unregisterRaw = setRawMessageProvider(
@@ -3550,7 +3573,11 @@ export function registerPiContextHandler(
 			const tMessageIndexScheduling = performance.now();
 			if (latestUser) {
 				const located = branchEntries
-					? convertLocatedPiUserEntry(branchEntries, latestUser.messageId)
+					? convertLocatedPiUserEntry(
+							branchEntries,
+							latestUser.messageId,
+							ordinalOffset(),
+						)
 					: null;
 				scheduleIncrementalIndex(
 					options.db,
@@ -3558,7 +3585,7 @@ export function registerPiContextHandler(
 					latestUser.messageId,
 					located ??
 						((_sessionId, messageId) =>
-							readPiSessionMessageById(ctx, messageId)),
+							readPiSessionMessageById(ctx, messageId, ordinalOffset())),
 				);
 			}
 			logTransformTiming(
@@ -4434,6 +4461,7 @@ export function registerPiContextHandler(
 						isFirstContextPassForSession,
 						activeTags: result.activeTags,
 						rawMessageProvider,
+						ordinalAlignment: ordinalAlignment(),
 						taggerFloor,
 						sessionMeta,
 						piUsage,
@@ -5755,6 +5783,11 @@ function maybeFireHistorian(args: {
 		) => ReturnType<typeof readPiSessionMessages>;
 		getMessageCount?: () => number;
 	};
+	/**
+	 * Where the session's stored ordinals sit relative to the branch the
+	 * provider numbers. Derived from the live branch when absent.
+	 */
+	ordinalAlignment?: PiOrdinalAlignment;
 	taggerFloor?: number;
 	sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
 	/** The transform and reclaim already admitted this request-pressure pair. */
@@ -5782,6 +5815,15 @@ function maybeFireHistorian(args: {
 		sessionLog(sessionId, "historian trigger eval: in-flight, skipping");
 		return;
 	}
+
+	// Every boundary the historian computes and every compartment it writes is
+	// an ordinal. When the stored ordinals cannot be placed on this branch,
+	// any range it chose would be a guess, so it does not run. The alignment
+	// module logs the numbers once per change.
+	const ordinalAlignment =
+		args.ordinalAlignment ??
+		resolvePiOrdinalAlignmentForContext(db, sessionId, ctx);
+	if (isPiOrdinalAlignmentUnanchored(ordinalAlignment)) return;
 
 	if (isWrapupInProgress(db, sessionId)) {
 		// /ctx-wrapup owns compartment-state publication while this marker is live.
@@ -5929,13 +5971,21 @@ function maybeFireHistorian(args: {
 	// via the standard `readRawSessionMessages` etc. helpers. The
 	// provider stays registered while the historian runs and
 	// unregisters in finally.
+	const offsetSource = piRawOrdinalOffsetSource(db, sessionId);
 	const provider = args.rawMessageProvider ?? {
-		readMessages: () => readPiSessionMessages(ctx),
+		readMessages: () => readPiSessionMessages(ctx, offsetSource),
 		readMessagePage: (
 			afterOrdinal: number,
 			limit: number,
 			finalWatermark: number,
-		) => readPiSessionMessagePage(ctx, afterOrdinal, limit, finalWatermark),
+		) =>
+			readPiSessionMessagePage(
+				ctx,
+				afterOrdinal,
+				limit,
+				finalWatermark,
+				offsetSource,
+			),
 	};
 	const modelKey = liveModelBySession.get(sessionId);
 	const triggerInputs = resolvePiHistorianTriggerInputs({
@@ -9309,6 +9359,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
 	piAlignmentMismatchLoggedSessions.delete(sessionId);
+	clearPiOrdinalAlignmentSession(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiMuralProcessCache(sessionId);
 	// The content memo is shared across sessions, not owned by one session id.

@@ -37,6 +37,7 @@ import {
 } from "@magic-context/core/tools/ctx-expand/render";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
+import { piRawOrdinalOffsetSource } from "../pi-ordinal-alignment";
 import { readPiSessionMessages } from "../read-session-pi";
 
 const ParamsSchema = Type.Object(
@@ -131,7 +132,11 @@ export function createCtxExpandTool(
 			const unregister = hasRawMessageProvider(sessionId)
 				? () => {}
 				: setRawMessageProvider(sessionId, {
-						readMessages: () => readPiSessionMessages(ctx),
+						readMessages: () =>
+							readPiSessionMessages(
+								ctx,
+								piRawOrdinalOffsetSource(deps.db, sessionId),
+							),
 					});
 
 			try {

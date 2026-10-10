@@ -1,5 +1,6 @@
 import { scheduleIncrementalIndex } from "@magic-context/core/features/magic-context/message-index-async";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { resolvePiRawOrdinalOffset } from "./pi-ordinal-alignment";
 import { convertPiAssistantEntryById } from "./read-session-pi";
 
 export interface PiMessageEndIndexDeps {
@@ -65,7 +66,11 @@ export function schedulePiAssistantIndexOnMessageEnd(
 			const branch = session.readBranch();
 			const entryId = storedId ?? findEntryIdForMessage(branch, endedMessage);
 			if (!entryId || !branch) return null;
-			return convertPiAssistantEntryById(branch, entryId);
+			return convertPiAssistantEntryById(
+				branch,
+				entryId,
+				resolvePiRawOrdinalOffset(db, sessionId, branch),
+			);
 		},
 	);
 }

@@ -44,6 +44,12 @@
  * Pi session because `getBranch()` returns the linear sequence from
  * root to leaf — entries are append-only on the active branch.
  *
+ * One exception: when the session's stored compartments prove the walk no
+ * longer starts where it did when they were written (the walk lost entries
+ * in front of them), readers pass an ordinal offset and the branch is
+ * numbered from offset + 1, behind empty slots for the unreachable ordinals.
+ * `pi-ordinal-alignment.ts` derives that offset.
+ *
  * # Entry types we skip
  *
  * `getBranch()` may return non-message entries (thinking_level_change,
@@ -159,8 +165,27 @@ export interface PiSessionSnapshot {
 	rawMessages: RawMessage[];
 }
 
+/**
+ * How many ordinals the session's stored coordinates place before the first
+ * message of the branch walk (see `pi-ordinal-alignment.ts`). Either a known
+ * count, or a function that derives it from the branch entries the reader
+ * itself loaded, so the count always describes the entries being numbered.
+ */
+export type PiOrdinalOffsetSource =
+	| number
+	| ((branchEntries: readonly unknown[]) => number);
+
+function resolveOrdinalOffset(
+	source: PiOrdinalOffsetSource,
+	entries: readonly unknown[],
+): number {
+	const value = typeof source === "function" ? source(entries) : source;
+	return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 export function readPiSessionSnapshot(
 	ctx: ExtensionContext,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
 ): PiSessionSnapshot {
 	const sm = ctx.sessionManager;
 	if (sm === undefined) return { branchEntries: [], rawMessages: [] };
@@ -179,12 +204,18 @@ export function readPiSessionSnapshot(
 
 	return {
 		branchEntries: entries,
-		rawMessages: convertEntriesToRawMessages(entries),
+		rawMessages: convertEntriesToRawMessages(
+			entries,
+			resolveOrdinalOffset(ordinalOffset, entries),
+		),
 	};
 }
 
-export function readPiSessionMessages(ctx: ExtensionContext): RawMessage[] {
-	return readPiSessionSnapshot(ctx).rawMessages;
+export function readPiSessionMessages(
+	ctx: ExtensionContext,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
+): RawMessage[] {
+	return readPiSessionSnapshot(ctx, ordinalOffset).rawMessages;
 }
 
 export function readPiSessionMessagePage(
@@ -192,6 +223,7 @@ export function readPiSessionMessagePage(
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset: PiOrdinalOffsetSource = 0,
 ): RawMessage[] {
 	const sessionManager = ctx.sessionManager;
 	const getBranch = (
@@ -206,6 +238,7 @@ export function readPiSessionMessagePage(
 					afterOrdinal,
 					limit,
 					finalWatermark,
+					resolveOrdinalOffset(ordinalOffset, entries),
 				)
 			: [];
 	} catch {
@@ -346,11 +379,22 @@ function attachPiPartVersion(
 	});
 }
 
+/**
+ * The slot for an ordinal the stored coordinates count but the branch walk no
+ * longer reaches (see `pi-ordinal-alignment.ts`). It has no id and no content:
+ * like a protocol entry it keeps the numbering dense, and readers that need
+ * text (historian chunks, the search index, ctx_expand) find nothing in it.
+ */
+export function unreachablePiOrdinalSlot(ordinal: number): RawMessage {
+	return { ordinal, id: "", role: "system", parts: [] };
+}
+
 export function* iterateEntriesToRawMessageRange(
 	entries: Iterable<unknown>,
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset = 0,
 ): Generator<RawMessage> {
 	let emitted = 0;
 	const normalizedAfter = Math.max(0, Math.floor(afterOrdinal));
@@ -359,7 +403,20 @@ export function* iterateEntriesToRawMessageRange(
 		normalizedAfter,
 		Math.floor(finalWatermark),
 	);
-	let nextOrdinal = 1;
+	const prefix =
+		Number.isSafeInteger(ordinalOffset) && ordinalOffset > 0
+			? ordinalOffset
+			: 0;
+	// Ordinals 1..prefix belong to messages the branch walk cannot reach; emit
+	// their empty slots before numbering the branch from prefix + 1.
+	const prefixEnd = Math.min(prefix, normalizedWatermark);
+	for (let ordinal = normalizedAfter + 1; ordinal <= prefixEnd; ordinal++) {
+		emitted++;
+		yield unreachablePiOrdinalSlot(ordinal);
+		if (emitted >= normalizedLimit) return;
+	}
+	if (prefix >= normalizedWatermark) return;
+	let nextOrdinal = prefix + 1;
 	let pendingToolResults: Array<{ msg: unknown; version: string | number }> =
 		[];
 	const buildToolParts = (
@@ -509,6 +566,7 @@ export function* iterateEntriesToRawMessageRange(
 /** Pure full conversion exposed for callers that need an entire Pi branch. */
 export function convertEntriesToRawMessages(
 	entries: readonly unknown[],
+	ordinalOffset = 0,
 ): RawMessage[] {
 	return [
 		...iterateEntriesToRawMessageRange(
@@ -516,6 +574,7 @@ export function convertEntriesToRawMessages(
 			0,
 			Number.MAX_SAFE_INTEGER,
 			Number.MAX_SAFE_INTEGER,
+			ordinalOffset,
 		),
 	];
 }
@@ -524,6 +583,7 @@ export function convertEntriesToRawMessages(
 export function convertPiAssistantEntryById(
 	entries: readonly unknown[],
 	entryId: string,
+	ordinalOffset = 0,
 ): RawMessage | null {
 	for (let index = 0; index < entries.length; index++) {
 		const entry = entries[index];
@@ -533,14 +593,20 @@ export function convertPiAssistantEntryById(
 			entryId.startsWith(SYNTH_USER_ID_PREFIX)
 		) {
 			return (
-				convertEntriesToRawMessages(entries).find(
+				convertEntriesToRawMessages(entries, ordinalOffset).find(
 					(message) => message.id === entryId,
 				) ?? null
 			);
 		}
 		const raw = convertEntriesToRawMessages([entry])[0];
 		return raw
-			? { ...raw, ordinal: countPiRawMessages(entries.slice(0, index + 1)) }
+			? {
+					...raw,
+					ordinal: countPiRawMessages(
+						entries.slice(0, index + 1),
+						ordinalOffset,
+					),
+				}
 			: null;
 	}
 	return null;
@@ -552,6 +618,7 @@ export function convertEntriesToRawMessagePage(
 	afterOrdinal: number,
 	limit: number,
 	finalWatermark: number,
+	ordinalOffset = 0,
 ): RawMessage[] {
 	return [
 		...iterateEntriesToRawMessageRange(
@@ -559,6 +626,7 @@ export function convertEntriesToRawMessagePage(
 			afterOrdinal,
 			limit,
 			finalWatermark,
+			ordinalOffset,
 		),
 	];
 }
@@ -685,8 +753,14 @@ function synthesizeToolResultParts(msg: unknown): unknown[] {
 }
 
 /** Count folded ordinals without constructing historical tool output or copying content. */
-export function countPiRawMessages(entries: readonly unknown[]): number {
-	let count = 0;
+export function countPiRawMessages(
+	entries: readonly unknown[],
+	ordinalOffset = 0,
+): number {
+	let count =
+		Number.isSafeInteger(ordinalOffset) && ordinalOffset > 0
+			? ordinalOffset
+			: 0;
 	let pendingTools = false;
 	for (const entry of entries) {
 		if (!isMessageEntry(entry)) continue;
@@ -707,4 +781,57 @@ export function countPiRawMessages(entries: readonly unknown[]): number {
 		count++;
 	}
 	return count + Number(pendingTools);
+}
+
+/**
+ * The branch-walk ordinal (numbered from 1, no offset) of each requested raw
+ * message id that the branch contains, synthetic folded-tool ids included.
+ * Counts exactly as `iterateEntriesToRawMessageRange` numbers, without
+ * building any message content; ids the branch does not contain are absent
+ * from the result.
+ */
+export function locatePiRawOrdinals(
+	entries: Iterable<unknown>,
+	wanted: ReadonlySet<string>,
+): Map<string, number> {
+	const found = new Map<string, number>();
+	if (wanted.size === 0) return found;
+	let ordinal = 0;
+	let pendingFirstId: string | null = null;
+	const note = (id: string): void => {
+		if (wanted.has(id) && !found.has(id)) found.set(id, ordinal);
+	};
+	for (const entry of entries) {
+		if (!isMessageEntry(entry)) continue;
+		const message = entry.message as { role?: unknown; toolCallId?: unknown };
+		if (message.role === "toolResult") {
+			if (
+				typeof message.toolCallId === "string" &&
+				message.toolCallId.length > 0 &&
+				pendingFirstId === null
+			) {
+				pendingFirstId = entry.id;
+			}
+			continue;
+		}
+		if (message.role === "user") {
+			ordinal++;
+			note(entry.id);
+			pendingFirstId = null;
+		} else {
+			if (message.role === "assistant" && pendingFirstId !== null) {
+				ordinal++;
+				note(`${SYNTH_USER_ID_PREFIX}${pendingFirstId}`);
+				pendingFirstId = null;
+			}
+			ordinal++;
+			note(entry.id);
+		}
+		if (found.size === wanted.size) return found;
+	}
+	if (pendingFirstId !== null) {
+		ordinal++;
+		note(`${SYNTH_USER_ID_PREFIX}${pendingFirstId}`);
+	}
+	return found;
 }
