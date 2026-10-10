@@ -2,11 +2,10 @@
 
 import { Database as UnwrappedDatabase } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database, mayChangeTagIdentity } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
+import { createTestTempDir } from "../../shared/test-temp-dir";
 import { initializeDatabase } from "./storage-db";
 import {
     backfillTagTokenCounts,
@@ -94,7 +93,7 @@ function addTag(
 
 describe("tag owner summary", () => {
     it("matches a full read through appends, owner changes, removals and other connections", () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-tag-owner-"));
+        const { dir: directory, cleanup } = createTestTempDir("mc-tag-owner-");
         const path = join(directory, "context.db");
         const db = new Database(path);
         // A connection opened without Magic Context's wrapper stands in for
@@ -152,7 +151,7 @@ describe("tag owner summary", () => {
         } finally {
             other?.close();
             db.close();
-            rmSync(directory, { recursive: true, force: true });
+            cleanup();
         }
     });
 

@@ -815,13 +815,26 @@ function foldTagOwnerRow(summary: TagOwnerSummary, row: TagOwnerRow): void {
 const TAG_OWNER_COLUMNS =
     "id, type, message_id, tool_owner_message_id, tag_number, reasoning_token_count";
 
+/**
+ * Whether the connection has a transaction open. A handle whose state cannot be
+ * read (a wrapping proxy, for instance) is treated as in a transaction, which
+ * only means the summary is read in full and not kept.
+ */
+function connectionInTransaction(db: Database): boolean {
+    try {
+        const state = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
+        return state.inTransaction !== false && state.isTransaction !== false;
+    } catch {
+        return true;
+    }
+}
+
 function readTagOwnerSummary(
     db: Database,
     sessionId: string,
     proseRatio?: number,
 ): TagOwnerSummary {
-    const state = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
-    const inTransaction = state.inTransaction === true || state.isTransaction === true;
+    const inTransaction = connectionInTransaction(db);
     const dataVersion = inTransaction
         ? -1
         : ((db.prepare("PRAGMA data_version").get() as { data_version?: number } | null)

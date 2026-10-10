@@ -1,11 +1,10 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { searchMessageHistoryOffThread } from "../../hooks/magic-context/auto-search-worker-client";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDir } from "../../shared/test-temp-dir";
 import { ensureMessagesIndexed } from "./message-index";
 import { createUnifiedSearchDiagnostics, type UnifiedSearchOptions, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
@@ -50,7 +49,7 @@ const QUERY = "where does cache_timeout in src/config.json reach the worker pool
 
 describe("message search off the serving thread", () => {
     it("returns the in-process results and ranking from a worker", async () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-search-worker-"));
+        const { dir: directory, cleanup } = createTestTempDir("mc-search-worker-");
         const db = new Database(join(directory, "context.db"));
         try {
             initializeDatabase(db);
@@ -88,12 +87,12 @@ describe("message search off the serving thread", () => {
             }
         } finally {
             db.close();
-            rmSync(directory, { recursive: true, force: true });
+            cleanup();
         }
     }, 60_000);
 
     it("runs no message FTS statement on the caller's connection when delegated", async () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-search-worker-"));
+        const { dir: directory, cleanup } = createTestTempDir("mc-search-worker-");
         const db = new Database(join(directory, "context.db"));
         try {
             initializeDatabase(db);
@@ -118,7 +117,7 @@ describe("message search off the serving thread", () => {
             expect(statements.filter((sql) => sql.includes("message_history_fts"))).toEqual([]);
         } finally {
             db.close();
-            rmSync(directory, { recursive: true, force: true });
+            cleanup();
         }
     }, 60_000);
 
