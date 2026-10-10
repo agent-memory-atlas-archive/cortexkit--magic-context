@@ -30,12 +30,18 @@
 import { expect, it, setSystemTime, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
+import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
+import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import * as logger from "@magic-context/core/shared/logger";
 import { buildSessionContext } from "pi-coding-agent-087";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 } from "../../../src/context-handler";
+import {
+	capturePiServedArray,
+	clearPiServedArraySession,
+} from "../../../src/served-array-ledger";
 import { createFakePi, createTestDb } from "../../../src/test-utils.test";
 
 type Entry = Record<string, unknown> & {
@@ -164,8 +170,69 @@ const DB_PATH = process.env.MC_ALIGN_DB;
 const FROM = Number(process.env.MC_ALIGN_FROM ?? 0);
 const TO = Number(process.env.MC_ALIGN_TO ?? 99);
 // "default" abandons the duplicate pair on a side branch; "kept-duplicates"
-// keeps it across a compaction, where the visible array shifts left.
+// keeps it across a compaction, where the visible array shifts left;
+// "issue-650" seeds a second tag row for an already served tool call, the
+// duplicate-identity state behind GitHub issue 650 (see issue650 below).
 const SCENARIO = process.env.MC_ALIGN_SCENARIO ?? "default";
+
+/**
+ * Second half of the "issue-650" scenario (passes 2-7). A tool call is served
+ * once under its real assistant entry; then a second tag row for the same
+ * call is seeded under a temporary `pi-msg-*` owner, as an older build could
+ * leave it, and the process "restarts" (in-memory served array cleared, the
+ * durable served-number ledger kept, both numbers recorded as served). Every
+ * later pass must serve: one declared identity repair, then stable numbers
+ * through a context_edit omission, a compaction and appends. An earlier
+ * extension also edits the assistant's prose in every event copy: in issue
+ * 650 that edit is how the call lost its link to its real assistant entry,
+ * which led to the second tag.
+ */
+async function issue650(
+	s: ScriptedSession,
+	serve: (label: string) => Promise<void>,
+	seedDuplicate: () => void,
+): Promise<void> {
+	s.message({ role: "user", content: "Run the build." });
+	s.message(
+		assistant("Running it.", "rt", {
+			content: [
+				{ type: "text", text: "Running it." },
+				{ type: "toolCall", id: "call-650", name: "bash", arguments: {} },
+			],
+			stopReason: "toolUse",
+		}),
+	);
+	s.message({
+		role: "toolResult",
+		toolCallId: "call-650",
+		toolName: "bash",
+		content: [{ type: "text", text: "build ok" }],
+		isError: false,
+	});
+	s.message(assistant("Build is green.", "r2"));
+	await serve("tool-call");
+	seedDuplicate();
+	s.message({ role: "user", content: "Again." });
+	s.message(assistant("Still green.", "r3"));
+	await serve("after-restart-with-duplicate");
+	const failed = s.message(
+		assistant("", "r4", { stopReason: "error", errorMessage: "overloaded" }),
+	);
+	s.omit(failed);
+	const retry = s.message({ role: "user", content: "Retry please." });
+	s.message(assistant("Retried.", "r5"));
+	await serve("context-edit-omission");
+	s.compaction("Earlier work summarized.", retry);
+	s.message({ role: "user", content: "After compaction." });
+	s.message(assistant("Noted.", "r6"));
+	await serve("compaction");
+	s.message({ role: "user", content: "One more." });
+	s.message(assistant("Done.", "r7"));
+	await serve("append-after-compaction");
+	s.message({ role: "user", content: "Last." });
+	s.message(assistant("Bye.", "r8"));
+	await serve("append");
+}
 
 /**
  * Second half of the "kept-duplicates" scenario (passes 2-7). Pi omits a
@@ -249,6 +316,22 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 				shape === "systems" ||
 				(message as { role?: unknown }).role !== "system",
 		);
+		if (SCENARIO === "issue-650") {
+			// An earlier extension rewrites the tool-calling assistant's prose in
+			// the event copy only; the persisted entry keeps its original text.
+			for (const message of messages as {
+				role?: string;
+				content?: { type: string; text?: string; id?: string }[];
+			}[]) {
+				const parts = Array.isArray(message.content) ? message.content : [];
+				if (
+					message.role === "assistant" &&
+					parts.some((part) => part.id === "call-650")
+				)
+					for (const part of parts)
+						if (part.type === "text") part.text = `${part.text} (annotated)`;
+			}
+		}
 		const ctx = {
 			cwd: "/nonexistent/align-diff",
 			hasUI: false,
@@ -305,6 +388,39 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 			await keptDuplicates(s, a1, serve);
 			return lines;
 		}
+		if (SCENARIO === "issue-650") {
+			await issue650(s, serve, () => {
+				const real = db
+					.prepare(
+						"SELECT tag_number AS n, tool_owner_message_id AS owner FROM tags WHERE session_id = ? AND type = 'tool' AND message_id = 'call-650'",
+					)
+					.get(sessionId) as { n: number; owner: string };
+				const duplicate = 500;
+				insertTag(
+					db,
+					sessionId,
+					"call-650",
+					"tool",
+					100,
+					duplicate,
+					0,
+					"bash",
+					0,
+					`pi-msg-9-${(s.byId.get(real.owner)?.message as { timestamp: number }).timestamp}-assistant`,
+				);
+				// Both numbers were served by some earlier build; then the process
+				// restarted, so no in-memory served array survives.
+				capturePiServedArray(sessionId, [], {
+					servedTagNumbers: [real.n, duplicate],
+				});
+				clearPiServedArraySession(sessionId);
+				resetLkgSlotsForTest();
+				lines.push(
+					`${SCENARIO} ${shape} seeded duplicate real=${real.n} fallback=${duplicate}`,
+				);
+			});
+			return lines;
+		}
 		// Two identical user messages stamped in the same millisecond: their
 		// content fingerprints collide, so only positions can tell them apart.
 		s.message({ role: "user", content: "continue" });
@@ -347,7 +463,10 @@ it.skipIf(!process.env.MC_ALIGN_DIFF)(
 	async () => {
 		const lines = [...(await replay("pi087")), ...(await replay("systems"))];
 		for (const line of lines) console.log(`ALIGN_DIFF ${line}`);
-		expect(lines.length).toBe(2 * (Math.min(TO, 8) - Math.min(FROM, 8)));
+		const seeded = SCENARIO === "issue-650" ? 2 : 0;
+		expect(lines.length).toBe(
+			2 * (Math.min(TO, 8) - Math.min(FROM, 8)) + seeded,
+		);
 	},
 	60_000,
 );
