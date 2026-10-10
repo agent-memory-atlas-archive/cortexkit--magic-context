@@ -157,3 +157,51 @@ Each first asserted a refusal that the ruling replaces with a served result:
   identity-write generation.
 - The checkout-claim removal dropped the claim branch from the Pi refusal
   notice; the identity-conflict branch stays.
+
+## Third review (`issue-650-review-r3.md`): seven findings
+
+All eleven `test.failing` witnesses in `issue-650-review-r3.test.ts` are now
+ordinary tests.
+
+1. **Failed decision writes.** Every identity-decision write goes through one
+   contained helper (`freezeIdentityDecision` in `pi-tag-identity-repair.ts`):
+   any exception, not only a busy store, returns "not written". The planner
+   then serves the duplicate unmerged; the fold's savepoint is undone on any
+   failure with production options and the turn is served with the rows as
+   they were. A byte-safe proven fold also stays unmerged when the guard
+   cannot be written or the identity is already recorded as served unmerged,
+   so rows do not flip between turns.
+2. **Damaged outer ledger.** `readPiIdentityDecisions` returns null (logged
+   once per session) for a field that is not JSON, not an array or has a
+   non-string member. Identity decisions then serve unmerged; the
+   reminder-strip and seam-strip replays read through it too and replay
+   nothing. Nothing writes the field while it is unreadable: every write path
+   reads it first and stops, and the rebuild acknowledgement validates the
+   array and writes only with a compare-and-set on the exact old value. The
+   damaged value, which may still hold other decisions, is left untouched.
+3. **Dropped message proof.** `piCachedMessageSurvivor` accepts a dropped row
+   whose served part is exactly `[dropped §N§]`, like the tool proof, so the
+   dropped number is kept with no rebuild and the dropped content stays off
+   the wire.
+4. **Identical unsaved messages.** `settlePiFallbackOccurrences` (in
+   `runPipeline`) checks the stored occurrences of each content digest. When a
+   copy has disappeared, the survivors take the stored occurrences with the
+   newest numbers instead of shifting into the vanished copy's id; the change
+   is declared once per digest as a `tag_identity_repair` rebuild (guard
+   `["message-occurrence", <digest>]`) and later passes keep the same choice.
+5. **Message guard key.** The message once guard is `["message",
+   <fingerprint>, <part ordinal>]`, so it survives the move from a fallback id
+   to a real entry id; the target-id key earlier builds wrote is honoured. The
+   pending rebuild record keeps its per-target key.
+6. **Dropped-input placeholder.** Only tool-call arguments that are exactly
+   `{ dropped: "[dropped §N§]" }` count as a rendered tag.
+7. **Recurrence with a full ledger.** `recordPiIdentityRecurrence` returns
+   whether to log: true when it wrote the record, or once per process,
+   session and identity (an in-memory set) when it cannot. Recurrence records
+   may use a small reserved allowance beyond the ledger cap
+   (`PI_IDENTITY_RECURRENCE_ALLOWANCE`, 64), so a full ledger still records
+   the recurrence the review's witness expects; past that allowance only the
+   log fires, once.
+
+The served-number JSONL fence is unchanged: a failed identity publication
+still refuses, as the review recommends.
