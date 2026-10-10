@@ -169,13 +169,51 @@ export class SqliteRuntimeUnavailableError extends Error {
     }
 }
 
+// Node requests this warning during node:sqlite's module evaluation, although
+// warning delivery happens later. Intercept only the request while importing;
+// replacing warning listeners would not suppress the default stderr output.
+function isNodeSqliteExperimentalWarning(args: unknown[]): boolean {
+    const [warning, options] = args;
+    const message = warning instanceof Error ? warning.message : warning;
+    const type =
+        typeof options === "string"
+            ? options
+            : options && typeof options === "object"
+              ? (options as { type?: unknown }).type
+              : undefined;
+    return (
+        type === "ExperimentalWarning" &&
+        typeof message === "string" &&
+        message.startsWith("SQLite is an experimental feature")
+    );
+}
+
+async function importSqliteModuleForRuntime(
+    runtime: SqliteRuntime,
+    specifier: string,
+    importer: (specifier: string) => Promise<SqliteModule>,
+): Promise<SqliteModule> {
+    if (runtime !== "Node.js") return importer(specifier);
+
+    const originalEmitWarning = process.emitWarning;
+    process.emitWarning = function (this: unknown, ...args: unknown[]): void {
+        if (isNodeSqliteExperimentalWarning(args)) return;
+        Reflect.apply(originalEmitWarning, this, args);
+    } as typeof process.emitWarning;
+    try {
+        return await importer(specifier);
+    } finally {
+        process.emitWarning = originalEmitWarning;
+    }
+}
+
 export async function loadSqliteModule(
     runtime: SqliteRuntime = detectSqliteRuntime(),
     importer: (specifier: string) => Promise<SqliteModule> = importSqliteModule,
 ): Promise<SqliteModule> {
     const specifier = runtime === "Bun" ? bunSpec : nodeSpec;
     try {
-        return await importer(specifier);
+        return await importSqliteModuleForRuntime(runtime, specifier, importer);
     } catch (error) {
         if (isModuleNotFoundError(error, specifier)) {
             throw new SqliteRuntimeUnavailableError(runtime, specifier, error);
