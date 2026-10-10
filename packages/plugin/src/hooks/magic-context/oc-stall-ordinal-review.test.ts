@@ -113,12 +113,12 @@ describe("stall review ordinal differential", () => {
         "insert-before-tie",
         "finish-summary",
     ] as const) {
-        test.failing(`${edit}: a surviving watermark must match the old count`, () =>
+        test(`${edit}: a surviving watermark must match the old count`, () =>
             prefixEdit(edit, false));
         test(`${edit}: explicit invalidation restores the old count`, () => prefixEdit(edit, true));
     }
 
-    test.failing("external-prefix-write: another indexer's commit must invalidate the watermark", () => {
+    test("external-prefix-write: another indexer's commit must invalidate the watermark", () => {
         externalPrefixWrite(false);
     });
     test("external-prefix-write: reopening the reader restores canonical ordinals", () => {
@@ -240,7 +240,7 @@ function randomizedDifferential(invalidate: boolean): void {
     }
 }
 
-test.failing("randomized differential: mixed prefix writes must preserve the old whole-session count", () => {
+test("randomized differential: mixed prefix writes must preserve the old whole-session count", () => {
     randomizedDifferential(false);
 });
 test("randomized differential: invalidating each write matches the old whole-session count", () => {

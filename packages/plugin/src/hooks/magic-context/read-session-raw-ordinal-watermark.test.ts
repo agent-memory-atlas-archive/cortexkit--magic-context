@@ -251,15 +251,16 @@ describe("canonical ordinal watermark", () => {
         }
     });
 
-    it("visits only the rows after the watermark, however long the session is", () => {
-        const visitedFor = (sessionLength: number): number => {
+    it("reuses a proven count only while the store is unchanged, and recounts after any write", () => {
+        const visitedFor = (sessionLength: number): { unchanged: number; afterWrite: number } => {
             const db = createStore();
             try {
                 const insert = db.prepare("INSERT INTO message VALUES (?, ?, ?, ?, ?)");
+                const id = (index: number) => `msg_${String(index).padStart(7, "0")}`;
                 db.transaction(() => {
-                    for (let index = 0; index < sessionLength; index += 1) {
+                    for (let index = 0; index < sessionLength + 3; index += 1) {
                         insert.run(
-                            `msg_${String(index).padStart(7, "0")}`,
+                            id(index),
                             SESSION,
                             index,
                             index,
@@ -271,19 +272,9 @@ describe("canonical ordinal watermark", () => {
                         );
                     }
                 })();
-                const last = `msg_${String(sessionLength - 1).padStart(7, "0")}`;
-                // First lookup counts the session once and leaves a watermark.
-                readRawSessionMessageByIdFromDb(db, SESSION, last);
-                for (let index = sessionLength; index < sessionLength + 3; index += 1) {
-                    insert.run(
-                        `msg_${String(index).padStart(7, "0")}`,
-                        SESSION,
-                        index,
-                        index,
-                        JSON.stringify({ role: "user" }),
-                    );
-                }
-                const appended = `msg_${String(sessionLength + 2).padStart(7, "0")}`;
+                // First lookup counts the prefix once and leaves a watermark.
+                readRawSessionMessageByIdFromDb(db, SESSION, id(sessionLength - 1));
+                const appended = id(sessionLength + 2);
                 const statements: string[] = [];
                 const prepare = db.prepare.bind(db);
                 db.prepare = ((sql: string) => {
@@ -292,7 +283,7 @@ describe("canonical ordinal watermark", () => {
                 }) as typeof db.prepare;
                 resetRawSessionOrdinalRowsVisitedForTest();
                 const message = readRawSessionMessageByIdFromDb(db, SESSION, appended);
-                const visited = getRawSessionOrdinalRowsVisitedForTest();
+                const unchanged = getRawSessionOrdinalRowsVisitedForTest();
                 db.prepare = prepare;
                 expect(message?.ordinal).toBe(frozenPointLookupOrdinal(db, appended));
                 // Every message statement must seek an index, never scan the table.
@@ -304,15 +295,24 @@ describe("canonical ordinal watermark", () => {
                     ).join(" | ");
                     expect(plan).not.toMatch(/SCAN message\b/);
                 }
-                return visited;
+                // Any write, even one after the target, moves the store stamp.
+                insert.run(id(sessionLength + 3), SESSION, sessionLength + 3, 0, "{}");
+                resetRawSessionOrdinalRowsVisitedForTest();
+                expect(readRawSessionMessageByIdFromDb(db, SESSION, appended)?.ordinal).toBe(
+                    frozenPointLookupOrdinal(db, appended),
+                );
+                return { unchanged, afterWrite: getRawSessionOrdinalRowsVisitedForTest() };
             } finally {
                 closeQuietly(db);
             }
         };
         const short = visitedFor(2_000);
         const long = visitedFor(40_000);
-        // The watermark row itself plus the three appended rows.
-        expect(short).toBe(4);
-        expect(long).toBe(short);
+        // Unchanged store: only the three rows after the watermark.
+        expect(short.unchanged).toBe(3);
+        expect(long.unchanged).toBe(3);
+        // After a write: the whole prefix through the target.
+        expect(short.afterWrite).toBe(2_003);
+        expect(long.afterWrite).toBe(40_003);
     });
 });
