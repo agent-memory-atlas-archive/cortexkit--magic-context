@@ -160,8 +160,8 @@ Each first asserted a refusal that the ruling replaces with a served result:
 
 ## Third review (`issue-650-review-r3.md`): seven findings
 
-All eleven `test.failing` witnesses in `issue-650-review-r3.test.ts` are now
-ordinary tests.
+All eleven `test.failing` witnesses in `issue-650-review-r3.test.ts` (one or
+more per finding below) are now ordinary tests.
 
 1. **Failed decision writes.** Every identity-decision write goes through one
    contained helper (`freezeIdentityDecision` in `pi-tag-identity-repair.ts`):
@@ -203,5 +203,7 @@ ordinary tests.
    the recurrence the review's witness expects; past that allowance only the
    log fires, once.
 
-The served-number JSONL fence is unchanged: a failed identity publication
-still refuses, as the review recommends.
+The served-number JSONL fence is unchanged: when the served array's tag
+numbers cannot be published, the turn still refuses rather than serving an
+array whose numbers were never recorded (the review classifies this as a
+storage fence, not an identity refusal).

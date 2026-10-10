@@ -24,8 +24,8 @@ export interface PiIdentityRebuild {
  *   `legacyKeys`). The caller must not repair it again and must not refuse
  *   the turn either: it leaves the rows unmerged and serves the identity the
  *   way tagging would without any repair.
- * - `unpersisted`: the guard could not be written (for example a full decision
- *   ledger). Without a durable guard a repair could repeat on every pass, so
+ * - `unpersisted`: the guard could not be read or written (a full or damaged
+ *   decision ledger, a rejected write). Without a durable guard a repair could repeat on every pass, so
  *   the caller treats it like `recurring`.
  */
 export type PiIdentityRepairClaim = "claimed" | "recurring" | "unpersisted";
