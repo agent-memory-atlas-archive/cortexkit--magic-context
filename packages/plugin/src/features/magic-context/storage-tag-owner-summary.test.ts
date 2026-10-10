@@ -6,8 +6,13 @@ import { join } from "node:path";
 import { Database, mayChangeTagIdentity } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { createTestTempDir } from "../../shared/test-temp-dir";
+import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
-import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
+import { deleteSessionScopedRows } from "./storage-session-tables";
+import {
+    installTagIdentityRevisionTrigger,
+    tagIdentityRevisionKey,
+} from "./storage-tag-identity-revision";
 import {
     backfillTagTokenCounts,
     deleteTagsByMessageId,
@@ -451,6 +456,71 @@ describe("tag identity write classification", () => {
             "ALTER TABLE tags ADD COLUMN extra TEXT",
         ]) {
             expect({ sql, changes: mayChangeTagIdentity(sql) }).toEqual({ sql, changes: true });
+        }
+    });
+});
+
+describe("tag identity revision rows on session deletion", () => {
+    const revisionOf = (db: Database, sessionId: string) =>
+        (
+            db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(tagIdentityRevisionKey(sessionId)) as { value: string } | null
+        )?.value ?? null;
+
+    it("removes the session's revision row with its tags, and keeps it while another harness's tags remain", () => {
+        const db = new Database(":memory:");
+        try {
+            initializeDatabase(db);
+            runMigrations(db);
+            addTag(db, 1, "m-1", "message", 10);
+            db.prepare(
+                "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number, harness) VALUES (?, 'm-2', 'message', 10, 2, 'pi')",
+            ).run(SESSION);
+            db.prepare("UPDATE tags SET reasoning_token_count = 20 WHERE session_id = ?").run(
+                SESSION,
+            );
+            expect(revisionOf(db, SESSION)).toBe("2");
+            // Only the opencode harness's rows go; the pi row keeps the revision.
+            expect(deleteSessionScopedRows(db, [SESSION], "opencode")).toBe(1);
+            expect(revisionOf(db, SESSION)).toBe("2");
+            expect(deleteSessionScopedRows(db, [SESSION])).toBe(1);
+            expect(revisionOf(db, SESSION)).toBeNull();
+        } finally {
+            db.close();
+        }
+    });
+
+    it("rebuilds a warm summary of a session deleted by another connection", () => {
+        const { dir: directory, cleanup } = createTestTempDir("mc-tag-owner-delete-");
+        const path = join(directory, "context.db");
+        const db = new Database(path);
+        let other: Database | undefined;
+        try {
+            initializeDatabase(db);
+            runMigrations(db);
+            addTag(db, 1, "m-1", "message", 10);
+            addTag(db, 2, "m-2", "message", 30);
+            db.prepare(
+                "UPDATE tags SET reasoning_token_count = 40 WHERE session_id = ? AND tag_number = 1",
+            ).run(SESSION);
+            expectMatchesFullRead(db, 1);
+            expect(revisionOf(db, SESSION)).not.toBeNull();
+            // Session cleanup on a second connection deletes the tags first and
+            // then the revision row.
+            other = new Database(path);
+            deleteSessionScopedRows(other, [SESSION]);
+            expect(revisionOf(db, SESSION)).toBeNull();
+            // The missing revision differs from the cached one, and the count fell
+            // to zero: either way the summary is rebuilt, not reused.
+            resetTagOwnerRowsReadForTest();
+            expect(new Map(getMaxTagNumberByOwnerMessage(db, SESSION))).toEqual(new Map());
+            expect(getTagOwnerShapeChecksForTest()).toBeLessThanOrEqual(1);
+            expectMatchesFullRead(db, 1);
+        } finally {
+            other?.close();
+            db.close();
+            cleanup();
         }
     });
 });

@@ -49,3 +49,19 @@ const TRIGGER_SQL = `CREATE TEMP TRIGGER IF NOT EXISTS mc_tag_identity_revision_
 export function installTagIdentityRevisionTrigger(db: Database): void {
     db.exec(TRIGGER_SQL);
 }
+
+/**
+ * Drop the revision rows of sessions that no longer have any tags. A row is
+ * kept while tags of the session remain (for example another harness's rows
+ * after a harness-scoped cleanup): a tag summary that cached the old value
+ * would otherwise read the restarted count as unchanged. Once no tags remain,
+ * dropping it is harmless: a summary that cached any tag of the session sees
+ * the session's tag count change and rebuilds, and rows added later are read
+ * as new rows with their current values.
+ */
+export function deleteTagIdentityRevisions(db: Database, sessionIds: readonly string[]): void {
+    const statement = db.prepare(
+        "DELETE FROM schema_migrations_meta WHERE key = ? AND NOT EXISTS (SELECT 1 FROM tags WHERE session_id = ?)",
+    );
+    for (const sessionId of sessionIds) statement.run(tagIdentityRevisionKey(sessionId), sessionId);
+}

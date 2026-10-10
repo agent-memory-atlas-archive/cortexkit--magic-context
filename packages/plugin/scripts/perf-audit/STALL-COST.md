@@ -208,6 +208,24 @@ reasoning backfill, the rebase fold, Pi's fallback adoption, the tool-owner
 backfill, migrations, raw SQL), and commits or rolls back with the write.
 Status, drop-mode, size and token-count writes do not bump it.
 
+The trigger fires once per updated row. A backfill of `reasoning_token_count`
+over 10,000 tags of a session in one UPDATE took 2.4 ms without it and
+5.5–5.8 ms with it (median of 7, two runs, Linux 8 vCPUs, WAL file store;
+`scripts/perf-audit/tag-revision-trigger-cost.ts`): about 0.3 µs per row. Over
+100,000 rows: 47 ms without, 82 ms with.
+
+Session deletion (`deleteSessionScopedRows`, through `deleteSessionActivity`)
+drops the session's `tag_identity_revision:` row with its
+`retrospective_activity:` row, once no tag of the session remains, so the rows
+do not accumulate. A row is kept while tags remain (a harness-scoped cleanup
+that leaves another harness's tags of the same session): a summary that cached
+the old value would otherwise read a restarted revision as unchanged. Once no
+tag remains, a summary that cached any of the session's tags sees the count
+change and rebuilds, and tags added later are read as new rows with their
+current values, so a missing row is never mistaken for "unchanged". Tests:
+`tag identity revision rows on session deletion` in
+`storage-tag-owner-summary.test.ts`.
+
 Named limitations:
 
 - a connection that never ran `initializeDatabase` (a tool editing
