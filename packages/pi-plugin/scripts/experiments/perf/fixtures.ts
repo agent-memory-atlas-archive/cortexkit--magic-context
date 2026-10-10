@@ -28,7 +28,7 @@ interface SyntheticOptions {
 	 * The entry is not counted in `messages`.
 	 */
 	systemEntry?: boolean;
-	/** Repeat count for each tool result's filler line (default 12-16). */
+	/** Times each tool result repeats its "result line " filler text (default 12-16). */
 	toolResultRepeat?: number;
 }
 

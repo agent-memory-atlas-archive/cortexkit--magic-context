@@ -2188,8 +2188,9 @@ function readPiFallbackFingerprintHeaders(
 	return headers;
 }
 
-// Content hashes computed by piMessageEntryFingerprint. Read only by tests that
-// bound the per-pass work, which must not grow with session length.
+// Number of piMessageEntryFingerprint calls (each hashes one message's content).
+// Tests read it to check that an append pass hashes the same number of messages
+// regardless of session length.
 let piEntryFingerprintCount = 0;
 
 function piMessageEntryFingerprint(message: unknown): string | null {
@@ -6644,8 +6645,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// Existing fallback rows may match any old real-id message. Once the
 		// indexed gate is empty, only the newly observed tail needs fingerprints.
 		hasFallbackMessageTags,
-		// Read after the preflight revision: a fallback row committed later
-		// changes the revision, and adoption then rebuilds with fresh headers.
+		// Read after preflightRevision. A fallback row committed after that point
+		// changes the revision, and adoptPiFallbackTags then rebuilds this map
+		// from headers it re-reads while holding the writer.
 		hasFallbackMessageTags
 			? readPiFallbackFingerprintHeaders(args.db, args.sessionId)
 			: undefined,

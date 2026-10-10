@@ -51,11 +51,11 @@ interface RunnerOptions {
 	 * emitContext withholds system messages from `context` handlers.
 	 */
 	pi087: boolean;
-	/** Seed one unadoptable `pi-msg-*` message tag before the first pass. */
+	/** Seed one `pi-msg-*` fallback message tag whose fingerprint matches no live message. */
 	lingeringFallback: boolean;
 	/**
-	 * Seed this many compacted tags for history that is no longer in the
-	 * context projection, as a long-lived session accumulates.
+	 * Seed this many tags with status 'compacted' for old messages that Pi no
+	 * longer sends, as a long-lived session accumulates them.
 	 */
 	historicalTags: number;
 	toolResultRepeat?: number;
