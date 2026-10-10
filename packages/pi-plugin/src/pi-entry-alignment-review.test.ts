@@ -9,10 +9,9 @@ import {
 import { createFakePi, createTestDb } from "./test-utils.test";
 
 // Pi entry-id resolution: the visible-only positional lane with per-position
-// header checks, and the header filter on fallback-tag adoption. The review
-// (docs/reports/pi-entry-alignment-review.md) wrote its two findings as
-// `test.failing`; both now hold and run as ordinary tests, each with the
-// closest neighbouring case as its partner directly below.
+// header checks, and the header filter on fallback-tag adoption. Each case is
+// followed by a partner: the closest neighbouring case, so a reader can see the
+// boundary. docs/reports/pi-entry-alignment-review.md describes each case.
 
 type Entry = Record<string, unknown> & {
 	id: string;
@@ -304,10 +303,9 @@ describe("Pi entry alignment review: context_edit omissions", () => {
 		}
 	});
 
-	// Before context_edit omissions were applied to the projection, this test
-	// pinned that the omission forced the fingerprint lane with correct ids.
-	// The omitted session now aligns positionally (test above), so the
-	// off-lane case is reached with one extra message from another extension.
+	// Ids stay correct when the omitted session is also resolved off the
+	// positional lane: here one extra message from another extension makes the
+	// event longer than the projection.
 	it("still resolves every id off the positional lane after the omission", () => {
 		const { s, visibleIds } = sessionWithOmittedAttempt(true);
 		try {
