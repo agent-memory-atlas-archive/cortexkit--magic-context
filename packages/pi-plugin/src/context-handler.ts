@@ -485,6 +485,7 @@ export const __test = {
 	adoptPiFallbackTags,
 	buildEntryFingerprintMap,
 	readPiEntryFingerprintCount: () => piEntryFingerprintCount,
+	resolvePiEventEntryIds,
 	buildPiToolOwnerMap,
 	readPiBranchEntriesForContext,
 	getTaggedStableMessageIdsForTests(sessionId: string): ReadonlySet<string> {
@@ -825,6 +826,27 @@ interface PiBranchEntryLookup {
 	 * so its event arrays align with this list rather than `alignedEntryIds`.
 	 */
 	alignedVisibleEntryIds: (string | undefined)[];
+	/** What the context message built from each emitted entry must look like. */
+	alignmentChecks: Map<string, PiAlignmentCheck>;
+	/** How many emitted entries share each header key. */
+	alignmentHeaderCounts: Map<string, number>;
+}
+
+/**
+ * The non-content fields of the context message Pi builds from one branch
+ * entry (session-manager.js sessionEntryToContextMessages), used to check a
+ * positional entry-id assignment without hashing message content.
+ */
+interface PiAlignmentCheck {
+	responseId: string | null;
+	timestamp: number | string | null;
+	role: string;
+	toolCallId: string | null;
+	/** The four fields above, serialized, to count entries that share them. */
+	headerKey: string;
+	entry: { type: string; message?: unknown; [key: string]: unknown };
+	/** Content fingerprint of the expected message, computed on first need. */
+	fingerprint?: string | null;
 }
 
 interface PiBranchProjectionCache {
@@ -1777,11 +1799,188 @@ export function collectMessageEntryIdsByRef(
 	return result;
 }
 
+function piContextHeaderFields(message: unknown): {
+	responseId: string | null;
+	timestamp: number | string | null;
+	role: string;
+	toolCallId: string | null;
+} | null {
+	if (!message || typeof message !== "object") return null;
+	const record = message as {
+		responseId?: unknown;
+		timestamp?: unknown;
+		role?: unknown;
+		toolCallId?: unknown;
+	};
+	if (typeof record.role !== "string") return null;
+	return {
+		responseId:
+			typeof record.responseId === "string" ? record.responseId : null,
+		timestamp:
+			typeof record.timestamp === "number" ||
+			typeof record.timestamp === "string"
+				? record.timestamp
+				: null,
+		role: record.role,
+		toolCallId:
+			typeof record.toolCallId === "string" ? record.toolCallId : null,
+	};
+}
+
+/**
+ * Header of the context message Pi derives from an emitted entry. Custom
+ * messages and branch summaries are built by createCustomMessage and
+ * createBranchSummaryMessage, which stamp `new Date(entry.timestamp).getTime()`.
+ */
+function piAlignmentCheckForEntry(entry: unknown): PiAlignmentCheck | null {
+	if (!isPiContextEmitEligible(entry)) return null;
+	const row = entry as PiAlignmentCheck["entry"] & { timestamp?: unknown };
+	const header =
+		row.type === "message"
+			? piContextHeaderFields(row.message)
+			: {
+					responseId: null,
+					timestamp: new Date(row.timestamp as string).getTime(),
+					role: row.type === "custom_message" ? "custom" : "branchSummary",
+					toolCallId: null,
+				};
+	if (!header) return null;
+	return {
+		...header,
+		headerKey: JSON.stringify([
+			header.responseId,
+			header.timestamp,
+			header.role,
+			header.toolCallId,
+		]),
+		entry: row,
+	};
+}
+
+/**
+ * Whether a context message carries the content of the entry it was aligned
+ * to. Used only where the header cannot tell entries apart, because it reads
+ * (and, for messages, hashes) the content.
+ */
+function piAlignedContentMatches(
+	check: PiAlignmentCheck,
+	message: unknown,
+): boolean {
+	const entry = check.entry;
+	if (entry.type === "branch_summary") {
+		const summary = message as { summary?: unknown; fromId?: unknown };
+		return summary.summary === entry.summary && summary.fromId === entry.fromId;
+	}
+	if (entry.type === "custom_message") {
+		const custom = message as { customType?: unknown };
+		if (custom.customType !== entry.customType) return false;
+	}
+	if (check.fingerprint === undefined) {
+		check.fingerprint =
+			entry.type === "message"
+				? piMessageEntryFingerprint(entry.message)
+				: piMessageEntryFingerprint({
+						role: check.role,
+						timestamp: check.timestamp,
+						content: entry.content ?? [],
+					});
+	}
+	return (
+		check.fingerprint !== null &&
+		piMessageEntryFingerprint(message) === check.fingerprint
+	);
+}
+
+/**
+ * Index of the first event message that does not match the entry its
+ * position assigns, or -1 when every position matches. An extension earlier
+ * in Pi's context chain can replace or reorder messages without changing the
+ * count; trusting positions then would give a message another entry's id.
+ * Each position compares the header fields; only entries whose header another
+ * emitted entry shares (two messages stamped in the same millisecond, for
+ * example) also compare content, since a swap of those keeps every header.
+ */
+function findPiAlignmentMismatch(
+	lookup: PiBranchEntryLookup,
+	entryIds: readonly (string | undefined)[],
+	messages: readonly unknown[],
+): number {
+	for (let index = 0; index < entryIds.length; index += 1) {
+		const id = entryIds[index];
+		// Slots Pi fills without an entry (the compaction summary and its system
+		// snapshot) stay unresolved either way.
+		if (id === undefined) continue;
+		const check = lookup.alignmentChecks.get(id);
+		const header = piContextHeaderFields(messages[index]);
+		if (
+			!check ||
+			!header ||
+			header.role !== check.role ||
+			!Object.is(header.timestamp, check.timestamp) ||
+			header.responseId !== check.responseId ||
+			header.toolCallId !== check.toolCallId
+		)
+			return index;
+		if (
+			(lookup.alignmentHeaderCounts.get(check.headerKey) ?? 0) > 1 &&
+			!piAlignedContentMatches(check, messages[index])
+		)
+			return index;
+	}
+	return -1;
+}
+
+const piAlignmentMismatchLoggedSessions = new Set<string>();
+
+/**
+ * Entry id for each event message. Pi builds the context from the branch
+ * projection, so an event with the projection's length normally lines up
+ * position by position; that lane is used only after every position passes
+ * findPiAlignmentMismatch. Otherwise each message is matched by content
+ * fingerprint in collectMessageEntryIdsByRef, leaving ambiguous ones unresolved.
+ */
+function resolvePiEventEntryIds(
+	ctx: ExtensionContext,
+	messages: readonly PiAgentMessage[],
+	sessionId: string,
+	branchEntries: readonly unknown[] | null,
+): readonly (string | undefined)[] | null {
+	if (branchEntries === null) return null;
+	const lookup = getPiBranchEntryLookup(branchEntries);
+	// Pi 0.87+ never shows system messages to `context` handlers, so an event
+	// without any must be aligned against the projection without them.
+	// Otherwise every pass of a session that persisted a system entry misses
+	// this lane and hashes every message in the fallback below.
+	const aligned = (messages as readonly unknown[]).some(isPiSystemEntry)
+		? lookup.alignedEntryIds
+		: lookup.alignedVisibleEntryIds;
+	if (aligned.length === messages.length) {
+		const mismatch = findPiAlignmentMismatch(lookup, aligned, messages);
+		if (mismatch < 0) return aligned;
+		if (!piAlignmentMismatchLoggedSessions.has(sessionId)) {
+			piAlignmentMismatchLoggedSessions.add(sessionId);
+			sessionLog(
+				sessionId,
+				`pi entry alignment: message ${mismatch} of ${messages.length} does not match its projected entry; resolving ids by content fingerprint (logged once per session)`,
+			);
+		}
+	}
+	return collectMessageEntryIdsByRef(ctx, messages, sessionId, branchEntries);
+}
+
 function addPiBranchEntryToLookup(
 	lookup: PiBranchEntryLookup,
 	entry: unknown,
 ): void {
 	if (!entry || typeof entry !== "object") return;
+	const check = piAlignmentCheckForEntry(entry);
+	if (check) {
+		lookup.alignmentChecks.set((entry as { id: string }).id, check);
+		lookup.alignmentHeaderCounts.set(
+			check.headerKey,
+			(lookup.alignmentHeaderCounts.get(check.headerKey) ?? 0) + 1,
+		);
+	}
 	const row = entry as { type?: unknown; id?: unknown; message?: unknown };
 	if (
 		row.type !== "message" ||
@@ -1793,6 +1992,7 @@ function addPiBranchEntryToLookup(
 	}
 	lookup.entryIdByMessageRef.set(row.message as object, row.id);
 	const fingerprint = piMessageEntryFingerprint(row.message);
+	if (check) check.fingerprint = fingerprint;
 	if (!fingerprint) return;
 	const bucket = lookup.entryIdsByFingerprint.get(fingerprint);
 	if (bucket) bucket.push(row.id);
@@ -1969,6 +2169,8 @@ function getPiBranchEntryLookup(
 		entryIdsByFingerprint: new Map(),
 		alignedEntryIds: aligned.all,
 		alignedVisibleEntryIds: aligned.visible,
+		alignmentChecks: new Map(),
+		alignmentHeaderCounts: new Map(),
 	};
 	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
 	piBranchLookupByProjection.set(entries, lookup);
@@ -2854,34 +3056,16 @@ export function registerPiContextHandler(
 			);
 			rawMessageProviderUnregistersBySession.set(sessionId, unregisterRaw);
 			scheduleReconciliation(options.db, sessionId, readRawSessionMessages);
-			// Pi builds the context from this exact branch projection before cloning
-			// messages for extension handlers. A compaction-aware projection with the
-			// same length is therefore the lossless O(1) alignment lane. If another
-			// extension changed the message count, fall back to conservative fingerprint
-			// matching and leave ambiguous messages unresolved.
-			const branchLookup =
-				branchEntries === null ? null : getPiBranchEntryLookup(branchEntries);
-			const alignedEntryIds = branchLookup?.alignedEntryIds ?? null;
-			// Pi 0.87+ never shows system messages to `context` handlers, so an
-			// event without any must be aligned against the projection without
-			// them. Otherwise every pass of a session that persisted a system entry
-			// misses this lane and hashes every message in the fallback below.
-			const eventAlignedEntryIds =
-				branchLookup &&
-				!(event.messages as readonly unknown[]).some(isPiSystemEntry)
-					? branchLookup.alignedVisibleEntryIds
-					: alignedEntryIds;
-			const resolvedEntryIds =
-				eventAlignedEntryIds?.length === event.messages.length
-					? eventAlignedEntryIds
-					: branchEntries === null
-						? null
-						: collectMessageEntryIdsByRef(
-								ctx,
-								event.messages as readonly PiAgentMessage[],
-								sessionId,
-								branchEntries,
-							);
+			const alignedEntryIds =
+				branchEntries === null
+					? null
+					: getPiBranchEntryLookup(branchEntries).alignedEntryIds;
+			const resolvedEntryIds = resolvePiEventEntryIds(
+				ctx,
+				event.messages as readonly PiAgentMessage[],
+				sessionId,
+				branchEntries,
+			);
 			const strictEntryIds = resolvedEntryIds ? [...resolvedEntryIds] : null;
 			const lkgEntryIds = reconcilePiLkgEntryIds(
 				strictEntryIds,
@@ -8865,6 +9049,7 @@ export function clearContextHandlerSession(sessionId: string): void {
 	piTagToolTokenCacheBySession.delete(sessionId);
 	piTextIdentitySourceCacheBySession.delete(sessionId);
 	piBranchProjectionBySession.delete(sessionId);
+	piAlignmentMismatchLoggedSessions.delete(sessionId);
 	clearPiInjectionTokenCountCache(sessionId);
 	clearPiMuralProcessCache(sessionId);
 	// The content memo is shared across sessions, not owned by one session id.
