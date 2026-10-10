@@ -347,9 +347,10 @@ describe("tag owner summary after other connections' commits", () => {
                         "UPDATE tags SET message_id = 'm-rekeyed' WHERE session_id = ? AND tag_number = 1000",
                     )
                     .run(SESSION);
-                // Count and highest id are unchanged, so the summary is kept. Only
-                // the process serving a session re-keys its tags; this process's own
-                // re-keys move the identity-write generation and rebuild.
+                // The raw connection does not bump the identity revision and the
+                // count and highest id are unchanged, so the summary is kept. The
+                // same re-key on this process's own connection moves its
+                // identity-write generation and rebuilds.
                 expect(readCost(db)).toEqual({ rows: 0, checks: 1 });
                 expect(getMaxTagNumberByOwnerMessage(db, SESSION).get("m-rekeyed")).toBeUndefined();
                 db.prepare(

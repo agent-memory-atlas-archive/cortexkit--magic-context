@@ -45,10 +45,12 @@ function withStore(run: (reader: Database, foreign: ForeignDatabase, path: strin
 }
 
 /**
- * `foreign`: another Magic Context connection (one that ran initializeDatabase
- * installs the identity-revision trigger), outside this process's identity-write
- * generation. `raw`: a connection that is not Magic Context's and never
- * installed the trigger.
+ * Who writes the backfill. `local`: the reader's own connection, whose writes
+ * this process counts itself (getTagIdentityWriteGeneration). `foreign`: a
+ * plain connection given the identity-revision trigger that initializeDatabase
+ * installs on every Magic Context connection, so it acts like another Magic
+ * Context process. `raw`: a plain connection without that trigger, like a
+ * tool editing the file directly.
  */
 function backfillAndAppend(writerKind: "local" | "foreign" | "raw"): void {
     withStore((reader, foreign) => {
@@ -86,8 +88,9 @@ test("a foreign append plus reasoning backfill must refresh existing estimates e
     backfillAndAppend("foreign"));
 test("append plus reasoning backfill: the same-process identity generation refreshes estimates", () =>
     backfillAndAppend("local"));
-// Named limitation: a writer that is not a Magic Context connection does not
-// bump the identity revision, so an append-shaped commit hides its backfill.
+// Documented limitation: a raw connection does not bump the identity revision,
+// so a warm summary keeps the old estimate when the backfill arrives in the
+// same commit as an append.
 test("limitation: a raw connection's append plus reasoning backfill is not seen by a warm summary", () =>
     backfillAndAppend("raw"));
 

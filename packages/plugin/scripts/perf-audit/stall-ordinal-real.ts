@@ -231,8 +231,9 @@ const targetTime = 1_700_000_000_000 + targetIndex * 10;
     resetRawSessionOrdinalJsonRowsReadForTest();
     const sessionCount = time(() => countRawSessionMessageOrdinalsFromDb(reader, SESSION));
     const sessionCountJson = getRawSessionOrdinalJsonRowsReadForTest();
-    // Cost of the read transaction the indexed count runs in: 2,000 warm session
-    // counts, each in its own BEGIN/ROLLBACK, against the bare statements.
+    // Cost of the read transaction each indexed count runs in: the mean of
+    // 2,000 warm session counts, and the extra time of BEGIN/ROLLBACK around a
+    // trivial SELECT compared with the SELECT alone.
     const counts = time(() => {
         for (let step = 0; step < 2_000; step += 1) countRawSessionMessageOrdinalsFromDb(reader, SESSION);
     });

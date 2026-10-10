@@ -1274,7 +1274,8 @@ function countCanonicalOrdinalsIndexed(
         return withReadSnapshot(db, () => {
             // Inside one read snapshot no other connection's commit can land
             // between validating the remembered rows, reading the rows above
-            // them and counting, so the floor check below can only fail when the
+            // them and counting. The check that the remembered top row still
+            // holds the same message id (floorId) can then only fail when the
             // caller's own open transaction wrote in between.
             for (let attempt = 0; attempt < STABLE_STORE_ATTEMPTS; attempt += 1) {
                 const view = summaryCandidatesOf(db, sessionId);

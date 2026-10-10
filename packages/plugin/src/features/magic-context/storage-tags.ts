@@ -995,8 +995,11 @@ function readTagOwnerSummary(
         lastRowId: 0,
         rowCount: 0,
         unownedToolRows: new Set(),
-        // Read before the rows: a rewrite landing in between makes the next
-        // check rebuild once more, never miss it.
+        // Read the revision before the rows. A rewrite committed between the two
+        // reads is already in the rows, and the revision check after the next
+        // foreign commit sees the newer revision and rebuilds once more; the
+        // other order could store a revision that already includes a rewrite
+        // the rows miss.
         identityRevision: readTagIdentityRevision(db, sessionId),
         maxTagByOwner: new Map(),
         reasoningEstimatesByRatio: new Map(

@@ -30,8 +30,10 @@ const BUMP = (session: string) => `INSERT INTO schema_migrations_meta (key, valu
  * of the stored schema, so every Magic Context connection that can write tags
  * installs it when it opens (from `initializeDatabase`). It runs inside the
  * writing statement, so the bump commits or rolls back with the write itself.
- * Writes from connections that never ran `initializeDatabase` (another tool
- * editing the file directly) are not counted.
+ * It counts UPDATEs that assign any of the columns listed above, including the
+ * update half of an upsert; inserts and deletes are not counted (they change
+ * the session's tag count instead). Writes from connections that never ran
+ * `initializeDatabase` (another tool editing the file directly) are not counted.
  */
 const TRIGGER_SQL = `CREATE TEMP TRIGGER IF NOT EXISTS mc_tag_identity_revision_au
     AFTER UPDATE OF id, session_id, message_id, tag_number, type, tool_owner_message_id, reasoning_token_count

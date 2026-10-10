@@ -105,9 +105,10 @@ test("mixed tuple write: scalar identity assignments refresh the reasoning cutof
  * connections bump the session's tag identity revision on such a write (see
  * storage-tag-identity-revision.ts); this one does not, so the summary keeps its
  * cached owners. Re-reading the session on every foreign commit instead would
- * cost a whole-session read on nearly every pass of a busy host. The test
- * records the gap and the ways it closes: a new connection, or any identity
- * write by this process.
+ * cost a whole-session read on nearly every pass of a busy host. The update
+ * changes no row count and no id, so the count and highest id still fit "only
+ * appends". The test records the gap and the two things that close it: a new
+ * connection, or an identity write by this process.
  */
 test("external process writes (residual): an in-place re-key keeping count and highest id is seen only after invalidation", async () => {
     const { dir, cleanup } = createTestTempDir("mc-stall-cache-review-");

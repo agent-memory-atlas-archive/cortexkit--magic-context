@@ -108,7 +108,7 @@ statement:
   no other connection's commit can land between them. Without it, a commit that
   deleted the top row and reused its rowid for a finished summary between the
   validation and the scan made the scan adopt the new row as its top without
-  reading it as a candidate, and that wrong set persisted (review r2, P1). The
+  reading it as a candidate, and that wrong set persisted. The
   transaction only reads and ends with ROLLBACK; inside a transaction the caller
   already holds, that one is used.
 
@@ -158,8 +158,8 @@ candidates in one statement, so rows written during or after it lie above its
 top remembered row (or replace it) and are read by the next count. Callers:
 
 - concurrent calls for one store and session share one worker, and every
-  connection that awaited it installs the result on itself (review r2, P2: the
-  second connection was reported warm without being warmed);
+  connection that awaited it installs the result on itself (before, a second
+  connection was reported warm without being warmed);
 - the transform awaits it at the start of every pass (instant once warm), so
   no stage reached from `experimental.chat.messages.transform` (protected-tail
   boundary, compartment trigger, module-state sync, chunk reads) scans the
@@ -250,6 +250,29 @@ means the files' page cache was dropped with `posix_fadvise(DONTNEED)` first
 The ordinals agreed with the old statement (149,850 at the target, 149,860
 after the appends). The remaining cold cost of a lookup is the index range of
 150k entries and the 150 summary rows' pages.
+
+Rerun after the read-snapshot, shared-warm-up and identity-revision changes
+(same driver, fixture and host, 8 vCPUs; the tag writer connection had the
+identity-revision trigger installed, as every Magic Context connection does):
+
+| Measure | Before those changes | After |
+|---|---|---|
+| Ordinal after another connection appended, cold | 221–295 ms | 214–222 ms |
+| Same, warm | 7.5–11.7 ms | 7.4–11.4 ms |
+| Session count, warm | 4.6–5.6 ms | 4.7 ms (mean of 2,000: 4.8 ms) |
+| BEGIN/ROLLBACK around a statement | — | 0.8 µs extra per count |
+| First pass after a restart, cold: longest block | 164 ms | 163 ms (in-thread: 14,446 ms) |
+| Tag summary after a foreign append, cold / warm | 62–78 ms / 3.0–3.9 ms | 60–61 ms / 2.8–2.9 ms, 1 row |
+| Tag summary after a foreign status write, warm | 2.9–4.9 ms | 2.6–2.8 ms, 0 rows |
+
+The old whole-prefix count measured 15.2 s cold and 366 ms warm in this run;
+all ordinals still agreed (149,850 and 149,860). The read snapshot costs
+nothing measurable, and the revision read is one primary-key lookup in the
+shape statement.
+
+The r2 review's differential (`oc-stall-r2-ordinal-review.test.ts`, six seeds
+x 1,000 steps per variant, two WAL connections, 18,000 steps in all) passes;
+its session-move variant remains the expected failure listed above.
 
 Work-bound tests: `read-session-raw-indexed-ordinal.test.ts` (JSON rows per
 lookup are the new rows plus the summaries at 2,000 and 20,000 messages with
