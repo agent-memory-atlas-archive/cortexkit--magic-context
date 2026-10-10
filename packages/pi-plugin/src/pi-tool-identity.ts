@@ -40,13 +40,13 @@ export function piAssistantToolIdentity(message: unknown): string | undefined {
 
 const LEADING_TAG = /^§(\d+)§/;
 const LEADING_SENTINEL = /^\[(?:dropped|truncated) §(\d+)§\]/;
-const DROPPED_SENTINEL = /\[dropped §(\d+)§\]/g;
+const DROPPED_INPUT_VALUE = /^\[dropped §(\d+)§\]$/;
 
 /**
  * Tag numbers that the served array shows in a position where Magic Context
  * renders a tag: the start of a text part (or of string content), a leading
- * `[dropped §N§]` / `[truncated §N§]` placeholder, or the dropped-input
- * placeholder inside a tool call's arguments.
+ * `[dropped §N§]` / `[truncated §N§]` placeholder, or a tool call whose
+ * arguments were replaced by the dropped-input placeholder.
  *
  * Magic Context writes tags only there, and `prependTag` strips any existing
  * leading tag notation before writing its own, so a number found there is the
@@ -73,14 +73,15 @@ export function piRenderedTagNumbers(
 		for (const part of contentParts(message)) {
 			if (part.type === "text") readText(part.text);
 			else if (part.type === "toolCall") {
-				let args: string;
-				try {
-					args = JSON.stringify(part.arguments ?? null);
-				} catch {
-					continue;
-				}
-				for (const match of args.matchAll(DROPPED_SENTINEL))
-					numbers.add(Number(match[1]));
+				// Only the dropped-input placeholder itself counts: arguments that are
+				// exactly `{ dropped: "[dropped §N§]" }` (droppedInputMarker). The
+				// same text inside ordinary arguments is something the model wrote.
+				const args = record(part.arguments);
+				const keys = args ? Object.keys(args) : [];
+				const value = keys.length === 1 ? args?.dropped : undefined;
+				const match =
+					typeof value === "string" ? DROPPED_INPUT_VALUE.exec(value) : null;
+				if (match) numbers.add(Number(match[1]));
 			}
 		}
 	}

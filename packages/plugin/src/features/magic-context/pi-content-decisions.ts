@@ -3,6 +3,12 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 
 const PREFIX = "pi-content-replay-v1:";
 export const PI_CONTENT_DECISION_LIMIT = 4096;
+/**
+ * Extra room only `tag-identity-recurring` records may use once the ledger is
+ * full. Pi records at most one per tag identity that came back after its one
+ * repair, so this bounds a rare diagnostic without evicting replay choices.
+ */
+export const PI_IDENTITY_RECURRENCE_ALLOWANCE = 64;
 export type PiContentDecisionKind =
     | "reminder-strip"
     | "seam-temporal-strip"
@@ -97,9 +103,13 @@ export function freezePiContentDecision(
                                 : ownsTag.get(sessionId, decision[1]))
                         );
                     });
+                    const limit =
+                        kind === "tag-identity-recurring"
+                            ? PI_CONTENT_DECISION_LIMIT + PI_IDENTITY_RECURRENCE_ALLOWANCE
+                            : PI_CONTENT_DECISION_LIMIT;
                     if (
                         kept.filter((value) => decodePiContentDecision(value) !== null).length >=
-                        PI_CONTENT_DECISION_LIMIT
+                        limit
                     )
                         return false;
                     kept.push(entry);

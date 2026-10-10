@@ -247,8 +247,10 @@ test("issue 650 r3: a message duplicate that recurs after its repair is served w
 		clearPiServedArraySession(sessionId);
 		const again = adoptReal(db, sessionId, fingerprint);
 		expect(again.rebuilds.map((repair) => repair.kept)).toEqual([440]);
+		// The once guard is keyed on the message itself (fingerprint and part
+		// ordinal), not on the id its rows currently sit under.
 		expect(readPiIdentityRecurrences(db, sessionId)).toEqual([
-			JSON.stringify(["message", "real:p0"]),
+			JSON.stringify(["message", fingerprint, 0]),
 		]);
 		expect(messageNumbers(db, sessionId)).toEqual([
 			{ tag_number: 440, message_id: "real:p0" },

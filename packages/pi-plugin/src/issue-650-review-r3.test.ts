@@ -35,9 +35,8 @@ import {
     userMessage,
 } from "./test-utils.test";
 
-// ISSUE_650_EXPECT_RED runs ordinary tests so assertion failures are reported
-// instead of being accepted as the expected failures of test.failing.
-const finding = process.env.ISSUE_650_EXPECT_RED === "1" ? test : test.failing;
+// Each "finding" was pinned as an expected failure (test.failing) by the review
+// that found it; the fix made all of them ordinary passing tests.
 const sessions: string[] = [];
 afterEach(() => {
     resetLkgSlotsForTest();
@@ -137,7 +136,7 @@ for (const damaged of [
     JSON.stringify({ decisions: [] }),
     JSON.stringify([17]),
 ] as const) {
-    finding(
+    test(
         `review 650 r3 finding: damaged outer ledger ${damaged} must not repeatedly refuse an identity conflict`,
         async () => {
             const db = createTestDb();
@@ -155,7 +154,7 @@ for (const damaged of [
     );
 }
 for (const kind of ["tag-identity-repair-once", "tag-identity-repair-pending"] as const) {
-    finding(
+    test(
         `review 650 r3 finding: failed ${kind} write must serve unmerged rather than repeatedly refuse`,
         async () => {
             const db = createTestDb();
@@ -217,7 +216,7 @@ test("review 650 r3 partner: full and one-free-slot ledgers serve duplicates wit
         }
     }
 });
-finding(
+test(
     "review 650 r3 finding: a full ledger must record and log recurrence once, not on every turn",
     async () => {
         const db = createTestDb();
@@ -274,7 +273,7 @@ test("review 650 r3 partner: a bare tag quote in model arguments does not veto t
         db.close();
     }
 });
-finding(
+test(
     "review 650 r3 finding: a dropped receipt quoted inside model arguments must not trigger an unproven repair",
     () => {
         const db = createTestDb();
@@ -334,7 +333,7 @@ test("review 650 r3 partner: an active cached message keeps the older proven num
         db.close();
     }
 });
-finding(
+test(
     "review 650 r3 finding: a cached dropped message must keep proven 20 without rebuilding to 440",
     () => {
         const db = createTestDb();
@@ -406,7 +405,7 @@ test("review 650 r3 partner: a recurring message with the same fallback key gets
         db.close();
     }
 });
-finding(
+test(
     "review 650 r3 finding: a repaired fallback message gaining a real entry id must not buy a second rebuild",
     () => {
         const db = createTestDb();
@@ -420,7 +419,7 @@ finding(
     },
 );
 
-finding(
+test(
     "review 650 r3 finding: a proven dropped message changes cached bytes on the next turn",
     async () => {
         const db = createTestDb();
@@ -503,7 +502,7 @@ test("review 650 r3 partner: removing an unrelated unsaved note does not change 
     const result = await rewindUnsavedNotes(false);
     expect(result.actual).toEqual(result.expected);
 });
-finding(
+test(
     "review 650 r3 finding: removing the first identical unsaved note must not transfer its dropped tag to the second",
     async () => {
         const result = await rewindUnsavedNotes(true);

@@ -66,8 +66,9 @@ function textParts(message: Record<string, unknown>): string[] {
  *
  * Exactly one candidate must be rendered as a tag anywhere in the array (see
  * piRenderedTagNumbers), and a served message with this entry's header
- * (response id, timestamp, role, tool call id) must carry it as the leading tag
- * of the same text part. The served content is not compared with the entry:
+ * (response id, timestamp, role, tool call id) must carry it on the same text
+ * part: as the leading tag when that row is active, or as the whole
+ * `[dropped §N§]` placeholder when it is dropped. The served content is not compared with the entry:
  * Magic Context rewrites served text (stripped reminders, reasoning or caveman
  * rewrites, placeholders), so a content comparison would fail for exactly the
  * messages it changed. Matching the header and the rendered number is enough:
@@ -87,11 +88,19 @@ export function piCachedMessageSurvivor(
 	const rendered = piRenderedTagNumbers(cached.messages);
 	const present = rows.filter((row) => rendered.has(row.tagNumber));
 	const winner = present[0];
-	if (present.length !== 1 || !winner || winner.status !== "active") return;
+	if (present.length !== 1 || !winner) return;
+	if (winner.status !== "active" && winner.status !== "dropped") return;
+	// Same rule as the tool proof: an active part leads with its tag, a dropped
+	// part is exactly its placeholder. A dropped survivor must be accepted, or
+	// the fold would keep the other (active) number and put dropped content
+	// back on the wire.
+	const shows = (text: string | undefined) =>
+		winner.status === "dropped"
+			? text === `[dropped §${winner.tagNumber}§]`
+			: text?.startsWith(`§${winner.tagNumber}§ `) === true;
 	const carriers = cached.messages.filter(
 		(message) =>
-			messageHeader(message) === header &&
-			textParts(message)[ordinal]?.startsWith(`§${winner.tagNumber}§ `),
+			messageHeader(message) === header && shows(textParts(message)[ordinal]),
 	);
 	return carriers.length === 1 ? winner.tagNumber : undefined;
 }

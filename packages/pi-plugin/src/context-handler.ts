@@ -57,7 +57,6 @@ import { isPrefixBoundThinkingModel } from "@magic-context/core/features/magic-c
 import {
 	decodePiContentDecision,
 	encodePiContentDecision,
-	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	computeProtectionWindow,
@@ -374,6 +373,7 @@ import {
 	PI_TAG_IDENTITY_REPAIR_REASON,
 	type PiIdentityRebuild,
 	queuePiIdentityRebuild,
+	readPiIdentityDecisions,
 	readPiIdentityRebuilds,
 	recordPiIdentityRecurrence,
 } from "./pi-tag-identity-repair";
@@ -2956,6 +2956,105 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 	}
 }
 
+const PI_CONTENT_FALLBACK_PARTS = /^pi-msg-c([0-9a-f]{16})o(\d+)(-.*)?$/;
+
+/**
+ * Keep exact-duplicate unmapped messages from inheriting each other's tags.
+ *
+ * piContentFallbackIds numbers byte-identical copies `o0`, `o1`, … in the
+ * order they appear in this pass. When a copy disappears (a host rebuilds or
+ * rewinds the context) the remaining ones shift down, and a survivor would
+ * take the vanished copy's id, number and status, a dropped status included.
+ * Identical copies cannot say which one survived, so that correspondence is
+ * treated as unknown and never followed: when stored rows exist for an
+ * occurrence this pass no longer has, the survivors take the stored
+ * occurrences with the newest tag numbers (the one-time repair rule), in
+ * order. If that changes any copy's id, the change is declared once per
+ * message as a `tag_identity_repair` rebuild under the once guard
+ * `["message-occurrence", <digest>]`; later passes keep the same choice
+ * without declaring again. Failures to read or record leave the ids as
+ * computed and never refuse the turn.
+ */
+function settlePiFallbackOccurrences(
+	db: ContextDatabase,
+	sessionId: string,
+	ids: (string | undefined)[],
+): (string | undefined)[] {
+	const groups = new Map<string, { suffix: string; indices: number[] }>();
+	ids.forEach((id, index) => {
+		const match = id ? PI_CONTENT_FALLBACK_PARTS.exec(id) : null;
+		if (!match?.[1]) return;
+		const group = groups.get(match[1]) ?? {
+			suffix: match[3] ?? "",
+			indices: [],
+		};
+		group.indices.push(index);
+		groups.set(match[1], group);
+	});
+	if (!groups.size) return ids;
+	let result = ids;
+	for (const [digest, { suffix, indices }] of groups) {
+		let rows: { id: string; n: number }[];
+		try {
+			rows = db
+				.prepare(
+					"SELECT message_id AS id, tag_number AS n FROM tags WHERE session_id = ? AND type = 'message' AND message_id >= ? AND message_id < ?",
+				)
+				.all(sessionId, `pi-msg-c${digest}o`, `pi-msg-c${digest}p`) as {
+				id: string;
+				n: number;
+			}[];
+		} catch {
+			continue;
+		}
+		const newestByOccurrence = new Map<number, number>();
+		for (const row of rows) {
+			const occurrence = Number(
+				PI_CONTENT_FALLBACK_PARTS.exec(row.id.replace(/:p\d+$/, ""))?.[2],
+			);
+			if (!Number.isSafeInteger(occurrence)) continue;
+			newestByOccurrence.set(
+				occurrence,
+				Math.max(newestByOccurrence.get(occurrence) ?? 0, row.n),
+			);
+		}
+		const present = indices.length;
+		if (
+			![...newestByOccurrence.keys()].some(
+				(occurrence) => occurrence >= present,
+			)
+		)
+			continue;
+		const chosen = [...newestByOccurrence]
+			.sort((left, right) => right[1] - left[1])
+			.slice(0, present)
+			.sort((left, right) => left[0] - right[0]);
+		let fresh = Math.max(...newestByOccurrence.keys()) + 1;
+		const occurrences = indices.map((_, i) => chosen[i]?.[0] ?? fresh++);
+		if (result === ids) result = [...ids];
+		indices.forEach((index, i) => {
+			result[index] = `pi-msg-c${digest}o${occurrences[i]}${suffix}`;
+		});
+		if (occurrences.every((occurrence, i) => occurrence === i)) continue;
+		const guardKey = JSON.stringify(["message-occurrence", digest]);
+		if (claimPiIdentityRepair(db, sessionId, guardKey) !== "claimed") continue;
+		const kept = Math.max(...chosen.map(([, number]) => number));
+		if (
+			queuePiIdentityRebuild(db, sessionId, {
+				key: guardKey,
+				kept,
+				removed: [],
+				kind: "message",
+			})
+		)
+			sessionLog(
+				sessionId,
+				`tag identity repair without last-served evidence: session=${sessionId} identical unmapped messages lost a copy; survivors keep the newest numbers kept=${chosen.map(([, number]) => number).join(",")}`,
+			);
+	}
+	return result;
+}
+
 /**
  * Thrown inside the savepoint that merges duplicate tag rows, to undo a repair
  * whose pending-rebuild record could not be written.
@@ -3176,13 +3275,18 @@ function adoptPiFallbackTags(
 	 * or null to leave the rows unmerged and serve the identity as tagging does.
 	 *
 	 * - Proven (a cached survivor, or exactly one served number): fold with no
-	 *   byte change. The once-guard is recorded but never consulted.
+	 *   byte change. The once-guard is recorded but its spent state is not
+	 *   consulted. Exception: when identity decisions cannot be read or the
+	 *   guard cannot be written, or the identity is already recorded as served
+	 *   unmerged, it stays unmerged.
 	 * - Unproven, first time for this identity: one declared repair that keeps
 	 *   the newest number, whether or not a last served array is in memory. A
 	 *   cached array that proves nothing (a quoted old number, rewritten
 	 *   text, numbers that were never served) is no better evidence than none.
 	 * - Unproven again after that repair, or the guard cannot be persisted:
 	 *   no second repair and no refusal; recorded as a recurring identity.
+	 * Every decision read and write here is contained (see
+	 * pi-tag-identity-repair.ts): a failure leaves the rows unmerged.
 	 * Low-level callers without `allowUnprovenRebuild` keep failing closed in
 	 * selectPiTagSurvivor.
 	 */
@@ -3196,6 +3300,29 @@ function adoptPiFallbackTags(
 		const proven =
 			cached !== undefined ||
 			rows.filter((row) => served.has(row.tagNumber)).length === 1;
+		if (proven && options.allowUnprovenRebuild) {
+			// Even a byte-safe fold needs readable, writable identity decisions:
+			// an identity this session already serves unmerged (its repair was
+			// spent or could not be recorded) stays unmerged rather than changing
+			// which rows exist from one turn to the next.
+			const decisions = readPiIdentityDecisions(db, sessionId);
+			let unmerged =
+				decisions === null ||
+				decisions.has(encodePiContentDecision("tag-identity-recurring", key));
+			if (!unmerged && !claimed.has(key)) {
+				unmerged =
+					claimPiIdentityRepair(db, sessionId, key, legacyKeys) ===
+					"unpersisted";
+				claimed.add(key);
+			}
+			if (!unmerged) return { rebuilding: undefined };
+			recurrences.push({
+				key,
+				numbers: rows.map((row) => row.tagNumber).sort((x, y) => x - y),
+				fresh: recordPiIdentityRecurrence(db, sessionId, key),
+			});
+			return null;
+		}
 		if (proven || !options.allowUnprovenRebuild) {
 			if (!claimed.has(key)) {
 				claimPiIdentityRepair(db, sessionId, key, legacyKeys);
@@ -3223,15 +3350,21 @@ function adoptPiFallbackTags(
 	/**
 	 * Run one fold. A repair's pending-rebuild record is written inside the same
 	 * savepoint, so a fold whose rebuild cannot be recorded (a full decision
-	 * ledger) is undone and the identity is served unmerged instead of
-	 * changing bytes without a declared rebuild.
+	 * ledger, a rejected write) is undone and the identity is served unmerged
+	 * instead of changing bytes without a declared rebuild. With production
+	 * options any other failure inside the savepoint is contained the same
+	 * way: the turn is served with the rows as they were. `recordKey` names the
+	 * rebuild record (one per target part); `guardKey` is the identity's
+	 * once-guard key, under which an unrecorded repair is noted.
 	 */
 	const fold = (
 		run: () => ReturnType<typeof adoptPiFallbackMessageTag>,
-		key: string,
+		recordKey: string,
+		guardKey: string,
 		kind: "tool" | "message",
 		rebuilding: number | undefined,
 	): ReturnType<typeof adoptPiFallbackMessageTag> => {
+		const key = recordKey;
 		let repair: PiIdentityRebuild | undefined;
 		let adoption: ReturnType<typeof adoptPiFallbackMessageTag>;
 		try {
@@ -3252,8 +3385,21 @@ function adoptPiFallbackTags(
 				})
 				.immediate();
 		} catch (error) {
-			if (!(error instanceof PiIdentityRebuildUnrecorded)) throw error;
-			recurrences.push({ key, numbers: [], fresh: true });
+			if (
+				!(error instanceof PiIdentityRebuildUnrecorded) &&
+				!options.allowUnprovenRebuild
+			)
+				throw error;
+			if (!(error instanceof PiIdentityRebuildUnrecorded))
+				sessionLog(
+					sessionId,
+					`tag identity fold failed; serving the duplicate unmerged: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			recurrences.push({
+				key: guardKey,
+				numbers: [],
+				fresh: recordPiIdentityRecurrence(db, sessionId, guardKey),
+			});
 			return { action: "skipped" };
 		}
 		if (adoption.action === "folded") {
@@ -3319,9 +3465,19 @@ function adoptPiFallbackTags(
 						collisionRows,
 					)
 				: undefined;
+			// The rebuild record names the target part; the once guard names the
+			// message itself (its header-and-content fingerprint and part
+			// ordinal), so the guard still holds when the same message later
+			// moves from a fallback id to a real entry id. The target-id key
+			// earlier builds wrote is still honoured.
 			const repairKey = JSON.stringify(["message", realContentId]);
+			const guardKey = JSON.stringify([
+				"message",
+				fingerprint,
+				Number(ordinalMatch[1]),
+			]);
 			const decision = canonical.length
-				? plan(collisionRows, repairKey, [], served, cachedSurvivor)
+				? plan(collisionRows, guardKey, [repairKey], served, cachedSurvivor)
 				: { rebuilding: undefined };
 			// The duplicate came back after its one repair: leave the fallback row
 			// and the target's row as they are; tagging serves the target's row.
@@ -3351,6 +3507,7 @@ function adoptPiFallbackTags(
 						rebuilding,
 					),
 				repairKey,
+				guardKey,
 				"message",
 				rebuilding,
 			);
@@ -3583,6 +3740,7 @@ function adoptPiFallbackTags(
 							cachedSurvivor,
 							rebuilding,
 						),
+					repairKey,
 					repairKey,
 					"tool",
 					rebuilding,
@@ -7192,7 +7350,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			args.entryIds,
 			args.entryIdByRef ?? undefined,
 		);
-	const passFallbackIds = piContentFallbackIds(args.messages, realStableId);
+	const passFallbackIds = settlePiFallbackOccurrences(
+		args.db,
+		args.sessionId,
+		piContentFallbackIds(args.messages, realStableId),
+	);
 	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
 		realStableId(msg, index) ??
 		passFallbackIds[index] ??
@@ -7325,7 +7487,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		: new Map<string, string>();
 	// Older versions removed a gap at a compaction seam. Preserve those already
 	// served choices; new seams no longer create a position-dependent removal.
-	for (const entry of getPiContentDecisions(args.db, args.sessionId)) {
+	for (const entry of readPiIdentityDecisions(args.db, args.sessionId) ?? []) {
 		const decision = decodePiContentDecision(entry);
 		if (decision?.[0] === "seam-temporal-strip")
 			temporalCandidates.set(decision[1], "");
