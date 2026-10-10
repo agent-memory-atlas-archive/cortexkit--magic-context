@@ -142,7 +142,10 @@ test("issue 650 message: pre-compaction fingerprint copies cannot orphan the ret
 	}
 });
 
-test("issue 650 message: active duplicate fingerprints refuse instead of guessing an entry", () => {
+// First asserted a refusal from the allocation guard. No identity conflict may
+// refuse more than one turn, so the guard now reports the unresolved id (the
+// pass logs it and allocates) and still guesses no entry.
+test("issue 650 message: active duplicate fingerprints are reported instead of guessing an entry", () => {
 	const db = createTestDb();
 	try {
 		const message = raw();
@@ -173,13 +176,13 @@ test("issue 650 message: active duplicate fingerprints refuse instead of guessin
 			null,
 			fingerprint,
 		);
-		expect(() =>
+		expect(
 			__test.guardPiMessageAllocations(
 				db,
 				"ambiguous",
 				new Map([["pi-msg-0-1700000000000-user", fingerprint]]),
 			),
-		).toThrow(PiTagIdentityConflictError);
+		).toEqual([{ kind: "message", id: "pi-msg-0-1700000000000-user" }]);
 		expect(db.prepare("SELECT COUNT(*) AS n FROM tags").get()).toEqual({
 			n: 1,
 		});
@@ -222,6 +225,12 @@ test("issue 650 message: adoption cannot pick between two real entries sharing a
 	}
 });
 
+// "both-cached" (440 quoted inside another message's text) and
+// "wrong-fingerprint" (the served copy's text differs from the entry) first
+// refused here. The cached proof now reads only numbers rendered as tags and
+// matches the served message by header, so both prove 20. "both-rendered"
+// (440 rendered as another message's leading tag) and "wrong-header" (the
+// served copy has another timestamp) keep the refusing side of that proof.
 for (const evidence of [
 	"sole20",
 	"current20",
@@ -229,8 +238,10 @@ for (const evidence of [
 	"reshape",
 	"cold",
 	"both-cached",
-	"no-proof",
 	"wrong-fingerprint",
+	"both-rendered",
+	"no-proof",
+	"wrong-header",
 	"wrong-ordinal",
 	"unserved-lkg",
 ] as const) {
@@ -274,9 +285,12 @@ for (const evidence of [
 				.content;
 			content[0]!.text = `§${winner}§ ${content[0]!.text}`;
 			if (evidence === "wrong-fingerprint") content[0]!.text += " edited";
+			if (evidence === "wrong-header")
+				(cached as { timestamp: number }).timestamp += 1;
 			const cachedArray = [
 				cached,
 				...(evidence === "both-cached" ? [userMessage("quoted §440§")] : []),
+				...(evidence === "both-rendered" ? [userMessage("§440§ quoted")] : []),
 			];
 			if (evidence !== "sole20")
 				capturePiServedArray(sessionId, [], { servedTagNumbers: [20, 440] });
@@ -310,9 +324,15 @@ for (const evidence of [
 					new Map([["real", fingerprint]]),
 				);
 			if (
-				["sole20", "current20", "current440", "reshape", "cold"].includes(
-					evidence,
-				)
+				[
+					"sole20",
+					"current20",
+					"current440",
+					"reshape",
+					"cold",
+					"both-cached",
+					"wrong-fingerprint",
+				].includes(evidence)
 			) {
 				adopt();
 				expect(

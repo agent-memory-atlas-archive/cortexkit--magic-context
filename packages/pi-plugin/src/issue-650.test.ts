@@ -303,18 +303,22 @@ test("issue 650: recovery and subsequent defer passes replay identical dropped t
 	}
 });
 
-test("issue 650: unresolved existing owner refuses rather than allocating again", () => {
+// The two guard tests below first asserted a refusal. No identity conflict may
+// refuse more than one turn, so the guard now reports the allocation it cannot
+// tie to an existing tag (the pass logs it and tags as before the guard
+// existed) and writes nothing itself.
+test("issue 650: unresolved existing owner is reported instead of refusing", () => {
 	const db = createTestDb();
 	try {
 		insertTag(db, "guard", "call", "tool", 1, 8, 0, "bash", 0, "real");
-		expect(() =>
+		expect(
 			__test.guardPiToolAllocations(
 				db,
 				"guard",
 				[assistantToolCall("call", "bash", {}, 20)],
 				() => "pi-msg-0-20-assistant",
 			),
-		).toThrow(PiTagIdentityConflictError);
+		).toEqual([{ kind: "tool", id: "pi-msg-0-20-assistant/call" }]);
 		expect(db.prepare("SELECT COUNT(*) AS count FROM tags").get()).toEqual({
 			count: 1,
 		});
@@ -323,7 +327,7 @@ test("issue 650: unresolved existing owner refuses rather than allocating again"
 	}
 });
 
-test("issue 650: ambiguous or timestamp-less fallback evidence cannot allocate a real-owner duplicate", () => {
+test("issue 650: ambiguous or timestamp-less fallback evidence is reported for a real-owner allocation", () => {
 	const db = createTestDb();
 	try {
 		insertTag(
@@ -338,14 +342,14 @@ test("issue 650: ambiguous or timestamp-less fallback evidence cannot allocate a
 			0,
 			"pi-msg-0-assistant",
 		);
-		expect(() =>
+		expect(
 			__test.guardPiToolAllocations(
 				db,
 				"ambiguous",
 				[assistantToolCall("call", "bash", {}, 20)],
 				() => "real",
 			),
-		).toThrow(PiTagIdentityConflictError);
+		).toEqual([{ kind: "tool", id: "real/call" }]);
 		expect(db.prepare("SELECT COUNT(*) AS count FROM tags").get()).toEqual({
 			count: 1,
 		});

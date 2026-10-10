@@ -75,8 +75,10 @@
  *      sessionId. Different storage, different lifecycle.
  */
 
+import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
+import { stableStringify } from "@magic-context/core/shared/stable-json";
 
 /**
  * Prefix for the synthetic-user RawMessage id emitted when a run of `toolResult`
@@ -134,6 +136,24 @@ export function resolvePiStableId(
 	entryIdByRef?: ReadonlyMap<object, string>,
 ): string | undefined {
 	if (!msg || typeof msg !== "object") return undefined;
+	const real = resolvePiRealStableId(msg, index, entryIds, entryIdByRef);
+	if (real !== undefined) return real;
+	// 3. Unstable index id — last resort (synthetic / unresolved messages only).
+	const m = msg as { role?: string; timestamp?: number };
+	const role = m.role ?? "unknown";
+	return typeof m.timestamp === "number"
+		? `pi-msg-${index}-${m.timestamp}-${role}`
+		: `pi-msg-${index}-${role}`;
+}
+
+/** Lanes 1 and 2 of resolvePiStableId: the real SessionEntry id, or undefined. */
+export function resolvePiRealStableId(
+	msg: unknown,
+	index: number,
+	entryIds?: readonly (string | undefined)[],
+	entryIdByRef?: ReadonlyMap<object, string>,
+): string | undefined {
+	if (!msg || typeof msg !== "object") return undefined;
 	// 1. Reference identity — preferred, splice-safe (misses cloned objects).
 	const byRef = entryIdByRef?.get(msg as object);
 	if (typeof byRef === "string" && byRef.length > 0) return byRef;
@@ -141,12 +161,73 @@ export function resolvePiStableId(
 	const positional = entryIds?.[index];
 	if (typeof positional === "string" && positional.length > 0)
 		return positional;
-	// 3. Unstable index id — last resort (synthetic / unresolved messages only).
-	const m = msg as { role?: string; timestamp?: number };
-	const role = m.role ?? "unknown";
-	return typeof m.timestamp === "number"
-		? `pi-msg-${index}-${m.timestamp}-${role}`
-		: `pi-msg-${index}-${role}`;
+	return undefined;
+}
+
+const PI_CONTENT_FALLBACK_ID = /^pi-msg-c[0-9a-f]{16}o\d+-/;
+
+/** True for an id made by piContentFallbackIds (position-independent). */
+export function isPiContentFallbackId(id: string): boolean {
+	return PI_CONTENT_FALLBACK_ID.test(id);
+}
+
+/**
+ * True for the older index-bearing fallback form `pi-msg-<index>-…`, whose id
+ * changes whenever the message's array position changes.
+ */
+export function isPiIndexFallbackId(id: string): boolean {
+	return /^pi-msg-\d+-/.test(id);
+}
+
+/**
+ * Position-independent fallback ids for the messages of one context pass that
+ * have no real SessionEntry id: `pi-msg-c<digest>o<occurrence>-<ts>-<role>`.
+ *
+ * The digest covers the message header (response id, timestamp, role, tool
+ * call id) and its content, so the same message gets the same id wherever it
+ * sits in the array. The index-bearing form changed as soon as something ahead
+ * of the message appeared or disappeared (a compaction, a custom message, a
+ * request-built message), and its tags were then orphaned or refused. The
+ * occurrence counter separates exact duplicates in one array: the k-th
+ * unresolved message with a given digest gets `o<k>`. The timestamp and role
+ * suffix keep the shape `parsePiFallbackToolOwnerId` reads.
+ *
+ * Compute this once per pass on the input array, before any stage rewrites
+ * message content: the digest is of the raw message, so later consumers must
+ * read the id by index from the returned array rather than recompute it from
+ * an edited copy. Entries with a real id are undefined.
+ */
+export function piContentFallbackIds(
+	messages: readonly unknown[],
+	resolveReal: (msg: unknown, index: number) => string | undefined,
+): (string | undefined)[] {
+	const occurrences = new Map<string, number>();
+	return messages.map((message, index) => {
+		if (!message || typeof message !== "object") return undefined;
+		if (resolveReal(message, index) !== undefined) return undefined;
+		const m = message as Record<string, unknown>;
+		const role = typeof m.role === "string" ? m.role : "unknown";
+		const digest = createHash("sha256")
+			.update(
+				stableStringify([
+					typeof m.responseId === "string" ? m.responseId : null,
+					typeof m.timestamp === "number" || typeof m.timestamp === "string"
+						? m.timestamp
+						: null,
+					role,
+					typeof m.toolCallId === "string" ? m.toolCallId : null,
+					m.content ?? null,
+				]),
+			)
+			.digest("hex")
+			.slice(0, 16);
+		const occurrence = occurrences.get(digest) ?? 0;
+		occurrences.set(digest, occurrence + 1);
+		const base = `pi-msg-c${digest}o${occurrence}`;
+		return typeof m.timestamp === "number"
+			? `${base}-${m.timestamp}-${role}`
+			: `${base}-${role}`;
+	});
 }
 
 /**

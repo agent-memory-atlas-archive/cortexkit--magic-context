@@ -38,11 +38,61 @@ export function piAssistantToolIdentity(message: unknown): string | undefined {
 	return JSON.stringify([m.timestamp, ids]);
 }
 
+const LEADING_TAG = /^§(\d+)§/;
+const LEADING_SENTINEL = /^\[(?:dropped|truncated) §(\d+)§\]/;
+const DROPPED_SENTINEL = /\[dropped §(\d+)§\]/g;
+
+/**
+ * Tag numbers that the served array shows in a position where Magic Context
+ * renders a tag: the start of a text part (or of string content), a leading
+ * `[dropped §N§]` / `[truncated §N§]` placeholder, or the dropped-input
+ * placeholder inside a tool call's arguments.
+ *
+ * Magic Context writes tags only there, and `prependTag` strips any existing
+ * leading tag notation before writing its own, so a number found there is the
+ * number decorating that part. A `§N§` anywhere else is text a tool or the
+ * model wrote, such as the `Queued: drop §8§.` receipt ctx_reduce returns or a
+ * reply quoting an old tag. That text says nothing about which number this
+ * call or message carries, so it must not veto a survivor the tag positions
+ * prove.
+ */
+export function piRenderedTagNumbers(
+	messages: readonly Record<string, unknown>[],
+): Set<number> {
+	const numbers = new Set<number>();
+	const readText = (text: unknown) => {
+		if (typeof text !== "string") return;
+		const match = LEADING_TAG.exec(text) ?? LEADING_SENTINEL.exec(text);
+		if (match) numbers.add(Number(match[1]));
+	};
+	for (const message of messages) {
+		if (typeof message.content === "string") {
+			readText(message.content);
+			continue;
+		}
+		for (const part of contentParts(message)) {
+			if (part.type === "text") readText(part.text);
+			else if (part.type === "toolCall") {
+				let args: string;
+				try {
+					args = JSON.stringify(part.arguments ?? null);
+				} catch {
+					continue;
+				}
+				for (const match of args.matchAll(DROPPED_SENTINEL))
+					numbers.add(Number(match[1]));
+			}
+		}
+	}
+	return numbers;
+}
+
 /**
  * A saved last-known-good (LKG) array may have been captured but never returned
  * to Pi. Its digest must match the last returned array before its bytes can
- * authorize removing a duplicate tag. Marker text quoted outside this call's
- * structured tool result can veto a deletion, but cannot identify the kept tag.
+ * authorize removing a duplicate tag. A candidate number rendered as a tag
+ * anywhere else vetoes the proof; a number quoted inside text does not (see
+ * piRenderedTagNumbers).
  */
 export function piCachedToolSurvivor(
 	sessionId: string,
@@ -52,7 +102,7 @@ export function piCachedToolSurvivor(
 ): number | undefined {
 	const cached = readPiServedCachedArray(sessionId);
 	if (!cached) return;
-	const { jsonPrefix, messages } = cached;
+	const { messages } = cached;
 	const owners = messages.filter(
 		(m) =>
 			m.role === "assistant" &&
@@ -67,9 +117,8 @@ export function piCachedToolSurvivor(
 			.length !== 1
 	)
 		return;
-	const present = rows.filter((row) =>
-		jsonPrefix.includes(`§${row.tagNumber}§`),
-	);
+	const rendered = piRenderedTagNumbers(messages);
+	const present = rows.filter((row) => rendered.has(row.tagNumber));
 	const winner = present[0];
 	if (present.length !== 1 || !winner) return;
 	const { tagNumber: number, status } = winner;

@@ -7,7 +7,6 @@
  */
 import { describe, expect, it } from "bun:test";
 import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
-import { PiTagIdentityConflictError } from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { __test } from "./context-handler";
 import {
@@ -116,7 +115,7 @@ describe("issue 650: identical same-millisecond pair adoption", () => {
 			).toEqual([[20, "drop"]]);
 			expect(tagger.getTag(sessionId, "real-first:p0", "message")).toBe(20);
 			expect(tagger.getTag(sessionId, "real-second:p0", "message")).toBe(11);
-			expect(guard).not.toThrow();
+			expect(guard()).toEqual([]);
 		} finally {
 			clearPiServedArraySession(sessionId);
 			db.close();
@@ -151,7 +150,11 @@ describe("issue 650: identical same-millisecond pair adoption", () => {
 		}
 	});
 
-	it("refuses rather than move a newest pair the model never saw", () => {
+	// This test first asserted that the allocation guard refuses the pass. No
+	// identity conflict may refuse more than one turn, so the guard now reports
+	// both real ids as unresolved and tagging allocates for them (one logged
+	// cache change); the unserved newest pair is still not moved.
+	it("reports rather than move a newest pair the model never saw", () => {
 		const sessionId = "identical-pair-unserved-newest";
 		const { db, adopt, rows, guard } = setUp(sessionId, {
 			newestStatus: "active",
@@ -164,7 +167,10 @@ describe("issue 650: identical same-millisecond pair adoption", () => {
 			adopt();
 			expect(rows()).toEqual(before);
 			expect(getPendingOps(db, sessionId)).toEqual([]);
-			expect(guard).toThrow(PiTagIdentityConflictError);
+			expect(guard()).toEqual([
+				{ kind: "message", id: "real-first" },
+				{ kind: "message", id: "real-second" },
+			]);
 		} finally {
 			clearPiServedArraySession(sessionId);
 			db.close();

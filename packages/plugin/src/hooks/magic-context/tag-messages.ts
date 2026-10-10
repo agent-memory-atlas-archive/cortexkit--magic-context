@@ -268,6 +268,14 @@ export type TagTarget = {
     thinkingDropProtected?: boolean;
     /** A rewrite here would invalidate a later protected signed block. */
     thinkingRewriteProtected?: boolean;
+    /**
+     * Pi only: the number a duplicate tag identity was just folded into. This
+     * pass keeps the bytes already served for it, so drops are withheld like
+     * `thinkingDropProtected`, but unlike that flag it does not keep a pending
+     * flush signal alive: the flush is consumed on this pass and the queued
+     * drop waits for the next pass that busts for its own reason.
+     */
+    identityRepairProtected?: boolean;
     /** Non-mutating count of current and replacement token-bearing fields for a planned drop. */
     measureReclaim?: (skeleton: boolean) => {
         beforeTools: number;

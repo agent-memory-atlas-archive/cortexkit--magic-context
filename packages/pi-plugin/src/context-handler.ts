@@ -375,12 +375,12 @@ import {
 	type PiIdentityRebuild,
 	queuePiIdentityRebuild,
 	readPiIdentityRebuilds,
+	recordPiIdentityRecurrence,
 } from "./pi-tag-identity-repair";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
 import {
 	piAssistantToolIdentity,
 	piCachedToolSurvivor,
-	readPiServedCachedArray,
 } from "./pi-tool-identity";
 import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
@@ -395,8 +395,12 @@ import {
 	convertEntriesToRawMessages,
 	countPiRawMessages,
 	findRestartModelSeedFromBranch,
+	isPiContentFallbackId,
+	isPiIndexFallbackId,
+	piContentFallbackIds,
 	readPiSessionMessagePage,
 	readPiSessionMessages,
+	resolvePiRealStableId,
 	resolvePiStableId,
 } from "./read-session-pi";
 import {
@@ -2139,7 +2143,51 @@ function resolvePiEventEntryIds(
 		return anchored;
 	}
 	piEntryAlignmentLaneCounts.fingerprint += 1;
-	return collectMessageEntryIdsByRef(ctx, messages, sessionId, branchEntries);
+	return fillPiEntryIdsByUniqueHeader(
+		lookup,
+		collectMessageEntryIdsByRef(ctx, messages, sessionId, branchEntries),
+		messages,
+	);
+}
+
+/**
+ * Give a message the fingerprint lane left unresolved the entry its header
+ * names, when exactly one emitted entry carries that header and no other
+ * message of this pass already took it.
+ *
+ * The positional and anchored lanes identify such a message by this same
+ * header, so a pass on one of those lanes tags it under that entry even when
+ * its event content differs from the persisted entry (an extension or host
+ * rewrite). The fingerprint lane runs only because the anchors were out of
+ * order, which says nothing about a header that names a single entry. Without
+ * this, the same message switched to a temporary id whenever a pass fell to
+ * the fingerprint lane and lost the number it was served with.
+ */
+function fillPiEntryIdsByUniqueHeader(
+	lookup: PiBranchEntryLookup,
+	resolved: readonly (string | undefined)[] | null,
+	messages: readonly unknown[],
+): readonly (string | undefined)[] | null {
+	if (!resolved?.includes(undefined)) return resolved;
+	const result = [...resolved];
+	const used = new Set(result.filter((id) => id !== undefined));
+	for (let index = 0; index < messages.length; index += 1) {
+		if (result[index] !== undefined) continue;
+		const header = piContextHeaderFields(messages[index]);
+		if (!header) continue;
+		const key = JSON.stringify([
+			header.responseId,
+			header.timestamp,
+			header.role,
+			header.toolCallId,
+		]);
+		if (lookup.alignmentHeaderCounts.get(key) !== 1) continue;
+		const id = lookup.alignmentEntryIdByHeader.get(key);
+		if (id === undefined || used.has(id)) continue;
+		result[index] = id;
+		used.add(id);
+	}
+	return result;
 }
 
 function addPiBranchEntryToLookup(
@@ -2709,7 +2757,11 @@ function buildPiToolOwnerMap(
 function parsePiFallbackToolOwnerId(
 	ownerMsgId: string,
 ): { timestamp: number; role: string } | null {
-	const match = /^pi-msg-\d+-(\d+)-(.+)$/.exec(ownerMsgId);
+	// Both the index-bearing `pi-msg-<index>-<ts>-<role>` form and the
+	// position-independent `pi-msg-c<digest>o<n>-<ts>-<role>` form.
+	const match = /^pi-msg-(?:\d+|c[0-9a-f]{16}o\d+)-(\d+)-(.+)$/.exec(
+		ownerMsgId,
+	);
 	if (!match) return null;
 	const timestamp = Number(match[1]);
 	if (!Number.isFinite(timestamp)) return null;
@@ -2767,13 +2819,48 @@ function fallbackPiToolCallIds(
 	return ids;
 }
 
+/**
+ * An allocation the identity guards could not tie to its existing tag: the
+ * call or message already has a row under another id, and nothing proves
+ * which one it is. Tagging then allocates a new number, as it did before the
+ * guards existed. That is one cache change for this identity, which the pass
+ * logs; it never refuses the turn, because a refusal here would repeat on
+ * every turn for as long as the shape persists.
+ */
+interface PiUnresolvedIdentity {
+	kind: "tool" | "message";
+	id: string;
+}
+
+const piUnresolvedIdentityLogged = new Set<string>();
+
+function logPiUnresolvedIdentities(
+	sessionId: string,
+	unresolved: readonly PiUnresolvedIdentity[],
+): void {
+	const fresh = unresolved.filter(
+		(item) =>
+			!piUnresolvedIdentityLogged.has(`${sessionId}\0${item.kind}\0${item.id}`),
+	);
+	if (!fresh.length) return;
+	if (piUnresolvedIdentityLogged.size > 10_000)
+		piUnresolvedIdentityLogged.clear();
+	for (const item of fresh)
+		piUnresolvedIdentityLogged.add(`${sessionId}\0${item.kind}\0${item.id}`);
+	sessionLog(
+		sessionId,
+		`tag identity unresolved: serving with a newly allocated tag number (one cache change per identity) session=${sessionId} ${fresh.map((item) => `${item.kind}=${item.id}`).join(" ")}`,
+	);
+}
+
 function guardPiToolAllocations(
 	db: ContextDatabase,
 	sessionId: string,
 	messages: readonly PiAgentMessage[],
 	resolveId: (msg: unknown, index: number) => string | undefined,
 	tagger?: Tagger,
-): void {
+): PiUnresolvedIdentity[] {
+	const unresolved: PiUnresolvedIdentity[] = [];
 	const fallbackCalls = fallbackPiToolCallIds(db, sessionId);
 	for (let index = 0; index < messages.length; index++) {
 		const message = messages[index];
@@ -2811,19 +2898,19 @@ function guardPiToolAllocations(
 					);
 				})
 			) {
-				throw new PiTagIdentityConflictError(
-					"the tool call's existing owner cannot be safely resolved; no second tag was allocated",
-				);
+				unresolved.push({ kind: "tool", id: `${owner}/${part.id}` });
 			}
 		}
 	}
+	return unresolved;
 }
 
 function guardPiMessageAllocations(
 	db: ContextDatabase,
 	sessionId: string,
 	fingerprints: ReadonlyMap<string, string>,
-): void {
+): PiUnresolvedIdentity[] {
+	const unresolved: PiUnresolvedIdentity[] = [];
 	const hasFallback = hasPersistedPiFallbackMessageTags(db, sessionId);
 	for (const [id, fingerprint] of fingerprints) {
 		if (!id.startsWith("pi-msg-") && !hasFallback) continue;
@@ -2838,12 +2925,10 @@ function guardPiMessageAllocations(
 				(row) => id.startsWith("pi-msg-") || row.id.startsWith("pi-msg-"),
 			)
 		) {
-			throw new PiTagIdentityConflictError(
-				"the message's existing entry cannot be safely resolved; no second tag was allocated",
-				"message",
-			);
+			unresolved.push({ kind: "message", id });
 		}
 	}
+	return unresolved;
 }
 
 function databaseIsInTransaction(db: ContextDatabase): boolean {
@@ -2871,6 +2956,9 @@ function runImmediateTransaction<T>(db: ContextDatabase, fn: () => T): T {
 	}
 }
 
+/** Thrown inside a fold's savepoint to undo a repair whose rebuild record could not be written. */
+class PiIdentityRebuildUnrecorded extends Error {}
+
 interface AdoptPiFallbackTagsOptions {
 	allowUnprovenRebuild?: boolean;
 	messages?: readonly PiAgentMessage[];
@@ -2896,19 +2984,32 @@ function preparePiAdoptionFingerprints(
 	fingerprintById: ReadonlyMap<string, string>,
 ) {
 	const realIdsByFingerprint = new Map<string, string[]>();
+	// Position-independent fallback ids are adoption targets for rows stored
+	// under the older index-bearing form; other fallback ids never are.
+	const fallbackIdsByFingerprint = new Map<string, string[]>();
 	for (const [id, fingerprint] of fingerprintById) {
-		if (id.startsWith("pi-msg-")) continue;
-		const ids = realIdsByFingerprint.get(fingerprint) ?? [];
+		const byFingerprint = !id.startsWith("pi-msg-")
+			? realIdsByFingerprint
+			: isPiContentFallbackId(id)
+				? fallbackIdsByFingerprint
+				: undefined;
+		if (!byFingerprint) continue;
+		const ids = byFingerprint.get(fingerprint) ?? [];
 		ids.push(id);
-		realIdsByFingerprint.set(fingerprint, ids);
+		byFingerprint.set(fingerprint, ids);
 	}
-	const fingerprints = [...realIdsByFingerprint.keys()];
+	const fingerprints = [
+		...new Set([
+			...realIdsByFingerprint.keys(),
+			...fallbackIdsByFingerprint.keys(),
+		]),
+	];
 	const batches: { values: string[]; placeholders: string }[] = [];
 	for (let i = 0; i < fingerprints.length; i += 900) {
 		const values = fingerprints.slice(i, i + 900);
 		batches.push({ values, placeholders: values.map(() => "?").join(",") });
 	}
-	return { realIdsByFingerprint, batches };
+	return { realIdsByFingerprint, fallbackIdsByFingerprint, batches };
 }
 
 function readAdoptablePiFallbackFingerprints(
@@ -2965,11 +3066,23 @@ function pairPiFallbackBases(
 		newestTag.set(base, Math.max(newestTag.get(base) ?? 0, c.tagNumber));
 	}
 	if (newestTag.size < realIds.length) return pairs;
+	// Within one pass, an index-bearing base's index and a position-independent
+	// base's occurrence counter both follow message order; the two schemes are
+	// not comparable with each other, so a mix pairs nothing.
 	const chosen = [...newestTag.entries()]
 		.sort((left, right) => right[1] - left[1])
 		.slice(0, realIds.length)
-		.map(([base]) => ({ base, index: /^pi-msg-(\d+)-/.exec(base)?.[1] }));
+		.map(([base]) => {
+			const indexed = /^pi-msg-(\d+)-/.exec(base)?.[1];
+			const counted = /^pi-msg-c[0-9a-f]{16}o(\d+)-/.exec(base)?.[1];
+			return {
+				base,
+				index: indexed ?? counted,
+				scheme: indexed !== undefined ? "index" : "occurrence",
+			};
+		});
 	if (chosen.some((entry) => entry.index === undefined)) return pairs;
+	if (new Set(chosen.map((entry) => entry.scheme)).size > 1) return pairs;
 	chosen.sort((left, right) => Number(left.index) - Number(right.index));
 	if (new Set(chosen.map((entry) => entry.index)).size !== chosen.length)
 		return pairs;
@@ -3049,51 +3162,105 @@ function adoptPiFallbackTags(
 		rebuilds: pendingRebuilds,
 	};
 	const claimed = new Set<string>();
+	const repairing = new Set<string>();
 	const newRebuilds: PiIdentityRebuild[] = [];
+	const recurrences: { key: string; numbers: number[]; fresh: boolean }[] = [];
+	/**
+	 * Decide how to merge one duplicate identity. Returns `{ rebuilding }` to
+	 * fold (with `rebuilding` set when the newest number is kept without proof),
+	 * or null to leave the rows unmerged and serve the identity as tagging does.
+	 *
+	 * - Proven (a cached survivor, or exactly one served number): fold with no
+	 *   byte change. The once-guard is recorded but never consulted.
+	 * - Unproven, first time for this identity: one declared repair that keeps
+	 *   the newest number, whether or not a last served array is in memory. A
+	 *   cached array that proves nothing (a quoted old number, rewritten
+	 *   text, numbers that were never served) is no better evidence than none.
+	 * - Unproven again after that repair, or the guard cannot be persisted:
+	 *   no second repair and no refusal; recorded as a recurring identity.
+	 * Low-level callers without `allowUnprovenRebuild` keep failing closed in
+	 * selectPiTagSurvivor.
+	 */
 	const plan = (
 		rows: readonly { tagNumber: number }[],
 		key: string,
-		kind: "tool" | "message",
+		legacyKeys: readonly string[],
 		served: ReadonlySet<number>,
 		cached: number | undefined,
-	) => {
-		if (!claimed.has(key)) {
-			claimPiIdentityRepair(db, sessionId, key, kind);
-			claimed.add(key);
+	): { rebuilding: number | undefined } | null => {
+		const proven =
+			cached !== undefined ||
+			rows.filter((row) => served.has(row.tagNumber)).length === 1;
+		if (proven || !options.allowUnprovenRebuild) {
+			if (!claimed.has(key)) {
+				claimPiIdentityRepair(db, sessionId, key, legacyKeys);
+				claimed.add(key);
+			}
+			return { rebuilding: undefined };
 		}
-		const needsProof =
-			cached === undefined &&
-			rows.filter((row) => served.has(row.tagNumber)).length !== 1;
-		const body =
-			needsProof && options.allowUnprovenRebuild
-				? readPiServedCachedArray(sessionId)
-				: undefined;
-		return needsProof && options.allowUnprovenRebuild && !body?.messages.length
-			? Math.max(...rows.map((row) => row.tagNumber))
-			: undefined;
+		const newest = Math.max(...rows.map((row) => row.tagNumber));
+		if (repairing.has(key)) return { rebuilding: newest };
+		const claim = claimed.has(key)
+			? "recurring"
+			: claimPiIdentityRepair(db, sessionId, key, legacyKeys);
+		claimed.add(key);
+		if (claim === "claimed") {
+			repairing.add(key);
+			return { rebuilding: newest };
+		}
+		recurrences.push({
+			key,
+			numbers: rows.map((row) => row.tagNumber).sort((x, y) => x - y),
+			fresh: recordPiIdentityRecurrence(db, sessionId, key),
+		});
+		return null;
 	};
-	const folded = (
-		adoption: ReturnType<typeof adoptPiFallbackMessageTag>,
+	/**
+	 * Run one fold. A repair's pending-rebuild record is written inside the same
+	 * savepoint, so a fold whose rebuild cannot be recorded (a full decision
+	 * ledger) is undone and the identity is served unmerged instead of
+	 * changing bytes without a declared rebuild.
+	 */
+	const fold = (
+		run: () => ReturnType<typeof adoptPiFallbackMessageTag>,
 		key: string,
 		kind: "tool" | "message",
 		rebuilding: number | undefined,
-	) => {
-		if (adoption.action !== "folded") return;
-		outcome.protectedTagNumbers.add(adoption.tagNumber);
-		if (rebuilding === undefined) return;
-		const repair = {
-			key,
-			kept: adoption.tagNumber,
-			removed: adoption.deletedTagNumbers,
-			kind,
-		};
-		queuePiIdentityRebuild(db, sessionId, repair);
-		newRebuilds.push(repair);
+	): ReturnType<typeof adoptPiFallbackMessageTag> => {
+		let repair: PiIdentityRebuild | undefined;
+		let adoption: ReturnType<typeof adoptPiFallbackMessageTag>;
+		try {
+			adoption = db
+				.transaction(() => {
+					const result = run();
+					if (result.action !== "folded" || rebuilding === undefined)
+						return result;
+					repair = {
+						key,
+						kept: result.tagNumber,
+						removed: result.deletedTagNumbers,
+						kind,
+					};
+					if (!queuePiIdentityRebuild(db, sessionId, repair))
+						throw new PiIdentityRebuildUnrecorded();
+					return result;
+				})
+				.immediate();
+		} catch (error) {
+			if (!(error instanceof PiIdentityRebuildUnrecorded)) throw error;
+			recurrences.push({ key, numbers: [], fresh: true });
+			return { action: "skipped" };
+		}
+		if (adoption.action === "folded") {
+			outcome.protectedTagNumbers.add(adoption.tagNumber);
+			if (repair) newRebuilds.push(repair);
+		}
+		return adoption;
 	};
 	// Prepare message identities and SQL bind lists before taking the writer.
 	// Another connection can add a synthetic tag while this work runs, so validate
 	// the discovery revision after BEGIN; never trust an earlier negative read.
-	let { realIdsByFingerprint, batches } =
+	let { realIdsByFingerprint, fallbackIdsByFingerprint, batches } =
 		preparePiAdoptionFingerprints(fingerprintById);
 	const ownerMap =
 		options.messages && options.resolveStableId
@@ -3115,7 +3282,84 @@ function adoptPiFallbackTags(
 				(id) => [id, fingerprint] as const,
 			),
 		);
+	const fallbackTargetsFor = (fingerprints: Iterable<string>) =>
+		[...fingerprints].flatMap((fingerprint) =>
+			(fallbackIdsByFingerprint.get(fingerprint) ?? []).map(
+				(id) => [id, fingerprint] as const,
+			),
+		);
 	const discoveredTargets = targetsFor(discovered);
+
+	/** Move one fallback message's part rows to `targetId`, folding into any rows it already has. */
+	const adoptMessageCandidates = (
+		targetId: string,
+		fingerprint: string,
+		candidates: readonly { tagNumber: number; messageId: string }[],
+	) => {
+		for (const c of candidates) {
+			const ordinalMatch = /:p(\d+)$/.exec(c.messageId);
+			if (!ordinalMatch) continue;
+			const realContentId = `${targetId}:p${ordinalMatch[1]}`;
+			const served = getPiServedTagNumbers(sessionId);
+			const canonical = getPiMessageTagCandidates(db, sessionId, realContentId);
+			const collisionRows = [
+				...getTagsByNumbers(db, sessionId, [c.tagNumber]),
+				...canonical,
+			];
+			const cachedSurvivor = canonical.length
+				? piCachedMessageSurvivor(
+						sessionId,
+						fingerprint,
+						Number(ordinalMatch[1]),
+						collisionRows,
+					)
+				: undefined;
+			const repairKey = JSON.stringify(["message", realContentId]);
+			const decision = canonical.length
+				? plan(collisionRows, repairKey, [], served, cachedSurvivor)
+				: { rebuilding: undefined };
+			// A recurrence after its repair: leave both rows; this pass serves the
+			// target's own number as tagging finds it.
+			if (decision === null) continue;
+			const rebuilding = decision.rebuilding;
+			if (
+				canonical.length &&
+				!collisionRows.some((row) => served.has(row.tagNumber)) &&
+				cachedSurvivor === undefined &&
+				rebuilding === undefined
+			) {
+				throw new PiTagIdentityConflictError(
+					"duplicate message identities have no proven served-byte survivor",
+					"message",
+				);
+			}
+			const adoption = fold(
+				() =>
+					adoptPiFallbackMessageTag(
+						db,
+						sessionId,
+						c.tagNumber,
+						c.messageId,
+						realContentId,
+						served,
+						cachedSurvivor,
+						rebuilding,
+					),
+				repairKey,
+				"message",
+				rebuilding,
+			);
+			if (adoption.action !== "skipped") {
+				// Drop stale fallback and collision aliases, then bind the survivor
+				// under the target key so the same-pass exact lookup hits it.
+				tagger.unbindTag(sessionId, c.messageId);
+				if (adoption.action === "folded") {
+					tagger.unbindTag(sessionId, realContentId);
+				}
+				tagger.bindTag(sessionId, realContentId, adoption.tagNumber);
+			}
+		}
+	};
 
 	runImmediateTransaction(db, () => {
 		const admitted = revision();
@@ -3130,9 +3374,8 @@ function adoptPiFallbackTags(
 		if (expanded && rebuild) {
 			// A new commit may target history omitted by the negative gate. Recover
 			// those pristine fingerprints, not just more rows for the old tail set.
-			({ realIdsByFingerprint, batches } = preparePiAdoptionFingerprints(
-				rebuild(),
-			));
+			({ realIdsByFingerprint, fallbackIdsByFingerprint, batches } =
+				preparePiAdoptionFingerprints(rebuild()));
 		}
 		if (batches.length && hasPersistedPiFallbackMessageTags(db, sessionId)) {
 			// After writer admission the candidate set cannot gain rows from a
@@ -3220,65 +3463,37 @@ function adoptPiFallbackTags(
 					base = pairedBaseByRealId.get(realMessageId) ?? undefined;
 				}
 				if (base === undefined) continue;
-				for (const c of candidates) {
-					if (piFallbackBaseId(c.messageId) !== base) continue;
-					const ordinalMatch = /:p(\d+)$/.exec(c.messageId);
-					if (!ordinalMatch) continue;
-					const realContentId = `${realMessageId}:p${ordinalMatch[1]}`;
-					const served = getPiServedTagNumbers(sessionId);
-					const canonical = getPiMessageTagCandidates(
-						db,
-						sessionId,
-						realContentId,
+				adoptMessageCandidates(
+					realMessageId,
+					fingerprint,
+					candidates.filter((c) => piFallbackBaseId(c.messageId) === base),
+				);
+			}
+			// A message no lane maps keeps a position-independent fallback id
+			// (piContentFallbackIds). Rows an older build stored under the
+			// index-bearing `pi-msg-<index>-…` form move to that id, numbers
+			// unchanged, the way tool owners are re-keyed below. Only a fingerprint
+			// carried by exactly one message of this pass, and by no real entry, is
+			// re-keyed: otherwise the old rows cannot say which copy they tagged.
+			for (const [fallbackId, fingerprint] of fallbackTargetsFor(adoptable)) {
+				if (realIdsByFingerprint.has(fingerprint)) continue;
+				if ((fallbackIdsByFingerprint.get(fingerprint)?.length ?? 0) !== 1)
+					continue;
+				const legacy = findAdoptableFallbackTags(
+					db,
+					sessionId,
+					fingerprint,
+				).filter((c) => isPiIndexFallbackId(piFallbackBaseId(c.messageId)));
+				// Oldest first, so a later duplicate folds into the earlier re-key.
+				legacy.sort((left, right) => left.tagNumber - right.tagNumber);
+				for (const base of new Set(
+					legacy.map((c) => piFallbackBaseId(c.messageId)),
+				))
+					adoptMessageCandidates(
+						fallbackId,
+						fingerprint,
+						legacy.filter((c) => piFallbackBaseId(c.messageId) === base),
 					);
-					const collisionRows = [
-						...getTagsByNumbers(db, sessionId, [c.tagNumber]),
-						...canonical,
-					];
-					const cachedSurvivor = canonical.length
-						? piCachedMessageSurvivor(
-								sessionId,
-								fingerprint,
-								Number(ordinalMatch[1]),
-								collisionRows,
-							)
-						: undefined;
-					const repairKey = JSON.stringify(["message", realContentId]);
-					const rebuilding = canonical.length
-						? plan(collisionRows, repairKey, "message", served, cachedSurvivor)
-						: undefined;
-					if (
-						canonical.length &&
-						!collisionRows.some((row) => served.has(row.tagNumber)) &&
-						cachedSurvivor === undefined &&
-						rebuilding === undefined
-					) {
-						throw new PiTagIdentityConflictError(
-							"duplicate message identities have no proven served-byte survivor",
-							"message",
-						);
-					}
-					const adoption = adoptPiFallbackMessageTag(
-						db,
-						sessionId,
-						c.tagNumber,
-						c.messageId,
-						realContentId,
-						served,
-						cachedSurvivor,
-						rebuilding,
-					);
-					folded(adoption, repairKey, "message", rebuilding);
-					if (adoption.action !== "skipped") {
-						// Drop stale fallback and collision aliases, then bind the survivor
-						// under the real key so the same-pass exact lookup hits it.
-						tagger.unbindTag(sessionId, c.messageId);
-						if (adoption.action === "folded") {
-							tagger.unbindTag(sessionId, realContentId);
-						}
-						tagger.bindTag(sessionId, realContentId, adoption.tagNumber);
-					}
-				}
 			}
 		}
 
@@ -3311,17 +3526,31 @@ function adoptPiFallbackTags(
 									existingNumber,
 								]),
 							);
-				const repairKey = JSON.stringify(["tool", realOwnerId, row.callId]);
-				const rebuilding =
+				// Keyed by the owning assistant's timestamp and the call id, which is
+				// how this loop matched the rows: an unresolved owner's id can change
+				// (its content changed, or an older build's id carried its index), and
+				// a key built from it would let the same call be repaired twice. The
+				// owner-id key earlier builds wrote is still honoured.
+				const repairKey = JSON.stringify([
+					"tool",
+					parsed.timestamp,
+					row.callId,
+				]);
+				const legacyKeys = [JSON.stringify(["tool", realOwnerId, row.callId])];
+				const decision =
 					existingNumber === null
-						? undefined
+						? { rebuilding: undefined }
 						: plan(
 								[{ tagNumber: row.tagNumber }, { tagNumber: existingNumber }],
 								repairKey,
-								"tool",
+								legacyKeys,
 								served,
 								cachedSurvivor,
 							);
+				// A recurrence after its repair: leave both rows; this pass serves the
+				// owner's own number as tagging finds it.
+				if (decision === null) continue;
+				const rebuilding = decision.rebuilding;
 				if (
 					existingNumber !== null &&
 					!served.has(existingNumber) &&
@@ -3333,20 +3562,25 @@ function adoptPiFallbackTags(
 						"duplicate tool identities have no proven served-byte survivor",
 					);
 				}
-				const adoption = adoptPiFallbackToolOwnerTag(
-					db,
-					sessionId,
-					row.tagNumber,
-					row.callId,
-					row.toolOwnerMessageId,
-					realOwnerId,
-					served.size === 0 && cachedSurvivor !== undefined
-						? new Set([cachedSurvivor])
-						: served,
-					cachedSurvivor,
+				const adoption = fold(
+					() =>
+						adoptPiFallbackToolOwnerTag(
+							db,
+							sessionId,
+							row.tagNumber,
+							row.callId,
+							row.toolOwnerMessageId,
+							realOwnerId,
+							served.size === 0 && cachedSurvivor !== undefined
+								? new Set([cachedSurvivor])
+								: served,
+							cachedSurvivor,
+							rebuilding,
+						),
+					repairKey,
+					"tool",
 					rebuilding,
 				);
-				folded(adoption, repairKey, "tool", rebuilding);
 				if (adoption.action !== "skipped") {
 					tagger.unbindToolTag(sessionId, row.toolOwnerMessageId, row.callId);
 					if (adoption.action === "folded") {
@@ -3376,8 +3610,14 @@ function adoptPiFallbackTags(
 			}
 		}
 	});
+	for (const recurrence of recurrences) {
+		if (!recurrence.fresh) continue;
+		sessionLog(
+			sessionId,
+			`tag identity recurred after its one repair: serving without a second rebuild (one cache change) session=${sessionId} identity=${recurrence.key} numbers=${recurrence.numbers.join(",")}`,
+		);
+	}
 	if (newRebuilds.length) {
-		outcome.rebuilds = readPiIdentityRebuilds(db, sessionId);
 		sessionLog(
 			sessionId,
 			`tag identity repair without last-served evidence: session=${sessionId} kept=${newRebuilds.map((repair) => repair.kept).join(",")} removed=${newRebuilds.flatMap((repair) => repair.removed).join(",")}`,
@@ -6935,13 +7175,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	);
 	const protectedSignedPrefix =
 		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
-	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
-		resolvePiStableId(
+	// Messages without a real entry id get a position-independent fallback id
+	// computed once from this pass's input, before any stage edits content.
+	// Every stage below resolves by the index it was given into this same array
+	// (nothing splices it before the post-commit maps), so they all see one id.
+	const realStableId = (msg: unknown, index: number): string | undefined =>
+		resolvePiRealStableId(
 			msg,
 			index,
 			args.entryIds,
 			args.entryIdByRef ?? undefined,
 		);
+	const passFallbackIds = piContentFallbackIds(args.messages, realStableId);
+	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
+		realStableId(msg, index) ??
+		passFallbackIds[index] ??
+		resolvePiStableId(msg, index);
 	let foldingSystemState: PiEffectiveSystemState | null = null;
 	try {
 		// Capture the provider-visible system state before transforming the served
@@ -7544,18 +7793,20 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			});
 		}
 	}
-	guardPiToolAllocations(
-		args.db,
-		args.sessionId,
-		args.messages as PiAgentMessage[],
-		stableIdResolver,
-		args.tagger,
-	);
-	guardPiMessageAllocations(
-		args.db,
-		args.sessionId,
-		entryFingerprintByMessageId,
-	);
+	logPiUnresolvedIdentities(args.sessionId, [
+		...guardPiToolAllocations(
+			args.db,
+			args.sessionId,
+			args.messages as PiAgentMessage[],
+			stableIdResolver,
+			args.tagger,
+		),
+		...guardPiMessageAllocations(
+			args.db,
+			args.sessionId,
+			entryFingerprintByMessageId,
+		),
+	]);
 	logTransformTiming(
 		args.sessionId,
 		"fallbackIdentityAndAdoption",
@@ -7673,9 +7924,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		if (!target) continue;
 		// A drop recovered from the deleted tag remains queued. This request must
 		// keep the active bytes already returned; a later execute may change them.
+		// Its own flag, not thinkingDropProtected: that one also keeps a pending
+		// flush signal alive (thinking retries on the next pass), which would make
+		// the next scheduler-deferred pass apply this queued drop as a second bust.
 		newTargets.set(number, {
 			...target,
-			thinkingDropProtected: true,
+			identityRepairProtected: true,
 			thinkingRewriteProtected: true,
 			canDrop: () => false,
 			drop: () => "incomplete",
@@ -8638,8 +8892,8 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// reassignment), so positional entryIds[i] is still authoritative at build time.
 	//
 	// Two maps because the consumers have DIFFERENT identity contracts:
-	//   1. postCommitStableIdByRef (FULL fallback via resolvePiStableId, incl.
-	//      pi-msg-* index ids) — for stripPiDroppedPlaceholderMessages, which needs
+	//   1. postCommitStableIdByRef (FULL fallback via stableIdResolver, incl.
+	//      the pass's pi-msg-* fallback ids) — for stripPiDroppedPlaceholderMessages, which needs
 	//      a stable id for EVERY message (skip-on-miss + legacy path).
 	//   2. postCommitEntryIdByRef (REAL SessionEntry ids ONLY, no pi-msg-* fallback)
 	//      — for sticky reminder / note nudges / auto-search. These must fall to
@@ -8654,12 +8908,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	for (let i = 0; i < args.messages.length; i++) {
 		const m = args.messages[i];
 		if (!m || typeof m !== "object") continue;
-		const id = resolvePiStableId(
-			m,
-			i,
-			args.entryIds,
-			args.entryIdByRef ?? undefined,
-		);
+		const id = stableIdResolver(m, i);
 		if (id) postCommitStableIdByRef.set(m as object, id);
 		const lkgId = args.lkgEntryIds?.[i];
 		if (lkgId) lkgEntryIdByRef.set(m as object, lkgId);

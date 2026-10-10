@@ -1,8 +1,12 @@
 /**
  * Second independent review of the issue 650 fix (tool and message tag
- * identity on Pi). Each `test.failing` states the behaviour the reviewer
- * expected and currently fails; its partner `test` pins the neighbouring
- * behaviour that does hold, so a fix cannot silently trade one for the other.
+ * identity on Pi). Each finding was pinned as a `test.failing` stating the
+ * behaviour the reviewer expected; the fix round turned them into ordinary
+ * tests ("finding" in the name marks them). Each partner `test` pins the
+ * neighbouring behaviour that held at review time, so a fix cannot silently
+ * trade one for the other. Where the fix's ruling (no tag-identity conflict
+ * may refuse more than one turn) changed what a test may expect, the test says
+ * so in a comment.
  * See docs/reports/issue-650-review-r2.md for the narrative and reproductions;
  * "Finding N" section headers below use that report's numbering, and "field
  * question" refers to its Oh My Pi field-evidence section.
@@ -27,7 +31,10 @@ import {
 	signalPiPendingMaterialization,
 } from "./context-handler";
 import { piMessageEntryFingerprint } from "./pi-message-identity";
-import { readPiIdentityRebuilds } from "./pi-tag-identity-repair";
+import {
+	readPiIdentityRebuilds,
+	readPiIdentityRecurrences,
+} from "./pi-tag-identity-repair";
 import {
 	capturePiServedArray,
 	clearPiServedArraySession,
@@ -152,7 +159,7 @@ test("review 650 r2: without a quoted old number, the cached array proves 154 an
 	}
 });
 
-test.failing("review 650 r2 finding: a ctx_reduce result quoting the dropped number must not block the proven 154 survivor", () => {
+test("review 650 r2 finding: a ctx_reduce result quoting the dropped number must not block the proven 154 survivor", () => {
 	const db = createTestDb();
 	const sessionId = session("quoted");
 	try {
@@ -256,7 +263,7 @@ test("review 650 r2: unquoted reporter state serves the proven 154 on every pass
 	expect(pendingAfterPass).toEqual([[NEWEST], [NEWEST], [NEWEST]]);
 });
 
-test.failing("review 650 r2 finding: reporter state with the ctx_reduce receipt in view should serve rather than refuse every turn", async () => {
+test("review 650 r2 finding: reporter state with the ctx_reduce receipt in view should serve rather than refuse every turn", async () => {
 	const { outcomes } = await servePasses(true, 3);
 	// At the reviewed commit: three refusals in a row; nothing changes the in-memory last served
 	// array, so every later turn in this process refuses the same way.
@@ -280,7 +287,7 @@ test("review 650 r2: a flush raised after the fold pass applies the queued drop 
 	expect(pendingAfterPass).toEqual([[NEWEST], [], []]);
 });
 
-test.failing("review 650 r2 finding: a fold on a /ctx-flush pass must not make the next scheduler-defer pass bust again", async () => {
+test("review 650 r2 finding: a fold on a /ctx-flush pass must not make the next scheduler-defer pass bust again", async () => {
 	const { outcomes, pendingAfterPass } = await servePasses(false, 3, 0);
 	// Pass 0 is the flush pass; it keeps 154 active (the fold protects it) and
 	// leaves the drop queued. At the reviewed commit the flush signal survives because the
@@ -358,7 +365,7 @@ for (const transformed of [false, true]) {
 	const name = transformed
 		? "review 650 r2 finding: a served message whose reminder was stripped must not block its proven survivor"
 		: "review 650 r2: a served message identical to its entry apart from the tag proves the survivor";
-	(transformed ? test.failing : test)(name, () => {
+	test(name, () => {
 		const db = createTestDb();
 		const sessionId = session(transformed ? "msg-transformed" : "msg-exact");
 		try {
@@ -469,7 +476,7 @@ test("review 650 r2: every served :pN part without a cached array is repaired on
 	}
 });
 
-test.failing("review 650 r2 finding: a served :pN part whose cached text was transformed must not refuse the whole message", () => {
+test("review 650 r2 finding: a served :pN part whose cached text was transformed must not refuse the whole message", () => {
 	// Mixed evidence: part 0 is proven by the cached array, part 1's served
 	// text differs (a stripped reminder). At the reviewed commit the whole pass refuses.
 	const db = createTestDb();
@@ -590,7 +597,7 @@ test("review 650 r2: an unmapped message that keeps its index keeps its number a
 	expect(noteTag(second)).toBe(noteTag(first));
 });
 
-test.failing("review 650 r2 finding: an unmapped message whose index shifts must keep its number instead of refusing", async () => {
+test("review 650 r2 finding: an unmapped message whose index shifts must keep its number instead of refusing", async () => {
 	const { first, second, noteTag } = await serveUnmapped(true);
 	expect(first.startsWith("[")).toBe(true);
 	// At the reviewed commit the guard refuses this pass with: "refused: Magic
@@ -698,7 +705,7 @@ test("review 650 r2: a content-rewritten message mapped by header keeps its numb
 	});
 });
 
-test.failing("review 650 r2 finding: a switch to the fingerprint lane must not refuse a message the header lanes already mapped", async () => {
+test("review 650 r2 finding: a switch to the fingerprint lane must not refuse a message the header lanes already mapped", async () => {
 	const { first, second, mTag } = await serveLaneSwitch(true);
 	expect(first.startsWith("[")).toBe(true);
 	// At the reviewed commit the guard refuses this pass with: "refused: Magic
@@ -742,11 +749,16 @@ function adoptAt(
 }
 
 for (const ownerKind of ["real", "unresolved"] as const) {
+	// These two tests first asserted a refusal by the once guard. The fix ruled
+	// that no identity conflict may refuse more than one turn, so a recurrence
+	// after the one repair is now served unmerged and recorded instead; what
+	// still matters is that the guard recognises the recurrence (no second
+	// rebuild), also when the unresolved owner's index-bearing id moved.
 	const name =
 		ownerKind === "real"
-			? "review 650 r2: a recurring duplicate on a real-entry owner is refused by the once guard"
-			: "review 650 r2 finding: a recurring duplicate on an unresolved owner whose index moved should be refused by the once guard";
-	(ownerKind === "real" ? test : test.failing)(name, () => {
+			? "review 650 r2: a recurring duplicate on a real-entry owner is served without a second rebuild"
+			: "review 650 r2 finding: a recurring duplicate on an unresolved owner whose index moved is served without a second rebuild";
+	test(name, () => {
 		const db = createTestDb();
 		const sessionId = session(`guard-${ownerKind}`);
 		const owner = (index: number) =>
@@ -763,9 +775,18 @@ for (const ownerKind of ["real", "unresolved"] as const) {
 			seedToolDuplicate(db, sessionId, 300, "pi-msg-9-20-assistant");
 			capturePiServedArray(sessionId, [], { servedTagNumbers: [300] });
 			clearPiServedArraySession(sessionId);
-			expect(() => adoptAt(db, sessionId, 2, owner)).toThrow(
-				PiTagIdentityConflictError,
-			);
+			const second = adoptAt(db, sessionId, 2, owner);
+			// Only the first repair (still awaiting a served pass) is reported.
+			expect(second.rebuilds.map((repair) => repair.kept)).toEqual([NEWEST]);
+			expect(readPiIdentityRecurrences(db, sessionId)).toEqual([
+				JSON.stringify(["tool", 20, "call"]),
+			]);
+			// The recurring row is left as written rather than folded again.
+			expect(
+				(toolRows(db, sessionId) as { tag_number: number }[]).map(
+					(row) => row.tag_number,
+				),
+			).toEqual([NEWEST, 300]);
 		} finally {
 			db.close();
 		}
@@ -805,15 +826,16 @@ function classify(reason: string, materialized: boolean) {
 
 test("review 650 r2: the classifier names an existing materialize reason it knows", () => {
 	expect(classify("model_change", true)).toBe("accounted_hard_model_change");
-	// The classifier counts the pass as explained, but files it under existing
-	// classes that do not name the identity repair.
-	expect(classify("tag_identity_repair", false)).toBe(
-		"accounted_soft_m1_execute",
+	// This partner first pinned that a repair pass was filed under classes
+	// that do not name it (soft m1 execute, generic hard fold). With the
+	// identity-repair class both states now name the repair.
+	expect(classify("tag_identity_repair", true)).toBe(
+		"accounted_tag_identity_repair",
 	);
-	expect(classify("tag_identity_repair", true)).toBe("accounted_hard_fold");
+	expect(classify("model_change", false)).toBe("accounted_soft_m1_execute");
 });
 
-test.failing("review 650 r2 finding: an identity-repair pass should get its own cache-bust class", () => {
+test("review 650 r2 finding: an identity-repair pass should get its own cache-bust class", () => {
 	expect(classify("tag_identity_repair", false)).toMatch(/identity/);
 });
 
@@ -827,7 +849,7 @@ for (const bodyPresent of [false, true]) {
 	const name = bodyPresent
 		? "review 650 r2 finding: never-served duplicates must not refuse just because a served array is in memory"
 		: "review 650 r2: never-served duplicates with no served array in memory are repaired";
-	(bodyPresent ? test.failing : test)(name, () => {
+	test(name, () => {
 		const db = createTestDb();
 		const sessionId = session(bodyPresent ? "unserved-body" : "unserved-none");
 		try {

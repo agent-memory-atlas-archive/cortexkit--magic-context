@@ -191,6 +191,7 @@ async function issue650(
 	s: ScriptedSession,
 	serve: (label: string) => Promise<void>,
 	seedDuplicate: () => void,
+	setEventEdit: (edit: ((messages: unknown[]) => void) | undefined) => void,
 ): Promise<void> {
 	s.message({ role: "user", content: "Run the build." });
 	s.message(
@@ -232,6 +233,93 @@ async function issue650(
 	s.message({ role: "user", content: "Last." });
 	s.message(assistant("Bye.", "r8"));
 	await serve("append");
+	await issue650Field(s, serve, setEventEdit);
+}
+
+/**
+ * Passes 8-13 of the "issue-650" scenario: the Oh My Pi and pi-rewind shapes
+ * from the second 650 review's field evidence. Every pass must serve (a
+ * refusal would throw out of serve), and the counters on each line show at
+ * most the one declared repair of the seeded duplicate.
+ *
+ * - An Oh My Pi request-built note: a user message in the context event that
+ *   is not a branch entry, so no lane maps it (stable timestamp and text).
+ * - An event-only custom message ahead of it, which moves its index.
+ * - A lane switch: a message whose event copy has more content than its entry
+ *   (an attachment note) is mapped by header; then a persisted custom message
+ *   is emitted out of projection order, so the pass falls to the fingerprint
+ *   lane.
+ * - A pi-rewind `/rewind` (`navigateTree` with a summary) back to the turn
+ *   just before the note.
+ */
+async function issue650Field(
+	s: ScriptedSession,
+	serve: (label: string) => Promise<void>,
+	setEventEdit: (edit: ((messages: unknown[]) => void) | undefined) => void,
+): Promise<void> {
+	const note = {
+		role: "user",
+		content: [{ type: "text", text: "Context notes: build is green" }],
+		timestamp: START + 5,
+	};
+	const beforeLastUser = (messages: unknown[], extra: unknown[]) => {
+		const last = messages.findLastIndex(
+			(message) => (message as { role?: string }).role === "user",
+		);
+		messages.splice(last < 0 ? messages.length : last, 0, ...extra);
+	};
+	s.message({ role: "user", content: "Check the deploy." });
+	setEventEdit((messages) => beforeLastUser(messages, [structuredClone(note)]));
+	await serve("omp-request-built");
+	s.message(assistant("Deploy looks fine.", "r9"));
+	s.message({ role: "user", content: "And the logs?" });
+	setEventEdit((messages) => {
+		messages.unshift({
+			role: "custom",
+			customType: "omp-context",
+			content: [{ type: "text", text: "request-built" }],
+			display: false,
+			timestamp: START + 4,
+		});
+		beforeLastUser(messages, [structuredClone(note)]);
+	});
+	await serve("custom-shifts-index");
+	s.custom("note", "A persisted note.");
+	const attached = s.message({ role: "user", content: "look at this" });
+	const withAttachment = (messages: unknown[]) => {
+		const entry = s.byId.get(attached)?.message as { timestamp: number };
+		for (const message of messages as {
+			role?: string;
+			timestamp?: number;
+			content?: unknown;
+		}[])
+			if (message.role === "user" && message.timestamp === entry.timestamp)
+				message.content = "look at this [image: 1 attachment]";
+	};
+	setEventEdit((messages) => {
+		withAttachment(messages);
+		beforeLastUser(messages, [structuredClone(note)]);
+	});
+	await serve("content-rewrite-header-lane");
+	const rewindTarget = s.message(assistant("A screenshot.", "r10"));
+	s.message({ role: "user", content: "Thanks." });
+	setEventEdit((messages) => {
+		withAttachment(messages);
+		const custom = messages.findIndex(
+			(message) => (message as { role?: string }).role === "custom",
+		);
+		if (custom >= 0) messages.push(...messages.splice(custom, 1));
+		beforeLastUser(messages, [structuredClone(note)]);
+	});
+	await serve("lane-switch-fingerprint");
+	s.message(assistant("You're welcome.", "r11"));
+	s.branchWithSummary(rewindTarget, "Rewound past a thank-you.");
+	s.message({ role: "user", content: "Rewound; continue." });
+	await serve("pi-rewind");
+	s.message(assistant("Continuing after rewind.", "r12"));
+	s.message({ role: "user", content: "Final." });
+	await serve("append-after-rewind");
+	setEventEdit(undefined);
 }
 
 /**
@@ -298,6 +386,7 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 	const s = new ScriptedSession();
 	const lines: string[] = [];
 	let pass = 0;
+	let eventEdit: ((messages: unknown[]) => void) | undefined;
 	const serve = async (label: string) => {
 		setSystemTime(new Date(s.tick(10)));
 		if (pass < FROM || pass >= TO) {
@@ -316,6 +405,7 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 				shape === "systems" ||
 				(message as { role?: unknown }).role !== "system",
 		);
+		eventEdit?.(messages);
 		if (SCENARIO === "issue-650") {
 			// An earlier extension rewrites the tool-calling assistant's prose in
 			// the event copy only; the persisted entry keeps its original text.
@@ -358,14 +448,22 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 		const out = served?.messages ?? messages;
 		const json = JSON.stringify(out);
 		const tags = [...json.matchAll(/§(\d+)§/g)].map((match) => match[1]);
+		const countLines = (text: string) =>
+			logLines.filter((line) => line.includes(text)).length;
 		const collect = logLines.filter((line) =>
 			line.includes("collectMessageEntryIdsByRef: resolved="),
 		).length;
 		const mismatch = logLines.filter((line) =>
 			line.startsWith("pi entry alignment:"),
 		).length;
+		// Identity counters, shown only for the scenario that exercises them so
+		// the other scenarios' lines stay comparable with older builds.
+		const identity =
+			SCENARIO === "issue-650"
+				? ` repairs=${countLines("tag identity repair without last-served evidence")} recurring=${countLines("tag identity recurred after its one repair")} unresolved=${countLines("tag identity unresolved:")} note=${/§(\d+)§ Context notes/.exec(json)?.[1] ?? "-"} attached=${/§(\d+)§ look at this/.exec(json)?.[1] ?? "-"}`
+				: "";
 		lines.push(
-			`${SCENARIO} ${shape} pass=${pass++} ${label} in=${messages.length} out=${out.length} sha256=${createHash("sha256").update(json).digest("hex")} tags=${tags.join(",")} collect=${collect} mismatch=${mismatch}`,
+			`${SCENARIO} ${shape} pass=${pass++} ${label} in=${messages.length} out=${out.length} sha256=${createHash("sha256").update(json).digest("hex")} tags=${tags.join(",")} collect=${collect} mismatch=${mismatch}${identity}`,
 		);
 		updateSessionMeta(db, sessionId, {
 			lastResponseTime: s.clock,
@@ -389,36 +487,43 @@ async function replay(shape: "pi087" | "systems"): Promise<string[]> {
 			return lines;
 		}
 		if (SCENARIO === "issue-650") {
-			await issue650(s, serve, () => {
-				const real = db
-					.prepare(
-						"SELECT tag_number AS n, tool_owner_message_id AS owner FROM tags WHERE session_id = ? AND type = 'tool' AND message_id = 'call-650'",
-					)
-					.get(sessionId) as { n: number; owner: string };
-				const duplicate = 500;
-				insertTag(
-					db,
-					sessionId,
-					"call-650",
-					"tool",
-					100,
-					duplicate,
-					0,
-					"bash",
-					0,
-					`pi-msg-9-${(s.byId.get(real.owner)?.message as { timestamp: number }).timestamp}-assistant`,
-				);
-				// Both numbers were served by some earlier build; then the process
-				// restarted, so no in-memory served array survives.
-				capturePiServedArray(sessionId, [], {
-					servedTagNumbers: [real.n, duplicate],
-				});
-				clearPiServedArraySession(sessionId);
-				resetLkgSlotsForTest();
-				lines.push(
-					`${SCENARIO} ${shape} seeded duplicate real=${real.n} fallback=${duplicate}`,
-				);
-			});
+			await issue650(
+				s,
+				serve,
+				() => {
+					const real = db
+						.prepare(
+							"SELECT tag_number AS n, tool_owner_message_id AS owner FROM tags WHERE session_id = ? AND type = 'tool' AND message_id = 'call-650'",
+						)
+						.get(sessionId) as { n: number; owner: string };
+					const duplicate = 500;
+					insertTag(
+						db,
+						sessionId,
+						"call-650",
+						"tool",
+						100,
+						duplicate,
+						0,
+						"bash",
+						0,
+						`pi-msg-9-${(s.byId.get(real.owner)?.message as { timestamp: number }).timestamp}-assistant`,
+					);
+					// Both numbers were served by some earlier build; then the process
+					// restarted, so no in-memory served array survives.
+					capturePiServedArray(sessionId, [], {
+						servedTagNumbers: [real.n, duplicate],
+					});
+					clearPiServedArraySession(sessionId);
+					resetLkgSlotsForTest();
+					lines.push(
+						`${SCENARIO} ${shape} seeded duplicate real=${real.n} fallback=${duplicate}`,
+					);
+				},
+				(edit) => {
+					eventEdit = edit;
+				},
+			);
 			return lines;
 		}
 		// Two identical user messages stamped in the same millisecond: their
@@ -464,9 +569,34 @@ it.skipIf(!process.env.MC_ALIGN_DIFF)(
 		const lines = [...(await replay("pi087")), ...(await replay("systems"))];
 		for (const line of lines) console.log(`ALIGN_DIFF ${line}`);
 		const seeded = SCENARIO === "issue-650" ? 2 : 0;
+		const passes = SCENARIO === "issue-650" ? 14 : 8;
 		expect(lines.length).toBe(
-			2 * (Math.min(TO, 8) - Math.min(FROM, 8)) + seeded,
+			2 * (Math.min(TO, passes) - Math.min(FROM, passes)) + seeded,
 		);
+		if (SCENARIO === "issue-650" && FROM === 0 && TO >= passes) {
+			for (const shape of ["pi087", "systems"]) {
+				const own = lines.filter((line) => line.includes(` ${shape} pass=`));
+				const count = (key: string) =>
+					own.reduce(
+						(sum, line) =>
+							sum + Number(new RegExp(` ${key}=(\\d+)`).exec(line)?.[1] ?? 0),
+						0,
+					);
+				// One seeded duplicate identity: exactly one declared repair, and
+				// no identity is ever repaired twice or left to recur.
+				expect(count("repairs")).toBe(1);
+				expect(count("recurring")).toBe(0);
+				// The request-built note and the rewritten message keep the number
+				// they were first served with on every pass that shows them.
+				for (const key of ["note", "attached"]) {
+					const numbers = own
+						.map((line) => new RegExp(` ${key}=(\\d+)`).exec(line)?.[1])
+						.filter((value) => value !== undefined);
+					expect(numbers.length).toBeGreaterThan(0);
+					expect(new Set(numbers).size).toBe(1);
+				}
+			}
+		}
 	},
 	60_000,
 );

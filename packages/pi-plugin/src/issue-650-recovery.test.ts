@@ -9,7 +9,6 @@ import { getPendingOps } from "@magic-context/core/features/magic-context/storag
 import { saveSourceContent } from "@magic-context/core/features/magic-context/storage-source";
 import {
 	insertTag,
-	PiTagIdentityConflictError,
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage-tags";
 import { __test as decisions } from "@magic-context/core/features/magic-context/transform-decision-log";
@@ -22,10 +21,7 @@ import {
 	signalPiPendingMaterialization,
 } from "./context-handler";
 import { piMessageEntryFingerprint } from "./pi-message-identity";
-import {
-	PI_TAG_IDENTITY_REPAIR_ONCE_GUARD,
-	readPiIdentityRebuilds,
-} from "./pi-tag-identity-repair";
+import { readPiIdentityRebuilds } from "./pi-tag-identity-repair";
 import {
 	capturePiServedArray,
 	clearPiServedArraySession,
@@ -197,7 +193,10 @@ for (const kind of ["tool", "message"] as const) {
 						.get(newest),
 				).toEqual({ status: "dropped" });
 				expect(getPendingOps(db, sessionId)).toEqual([]);
-				// A faulty writer reintroducing the same identity cannot buy repeated rebuilds.
+				// A faulty writer reintroducing the same identity cannot buy repeated
+				// rebuilds. This first asserted that the pass then refuses under the
+				// once guard; no identity conflict may refuse more than one turn, so
+				// the pass now serves, with no second repair.
 				insertTag(
 					db,
 					sessionId,
@@ -213,8 +212,23 @@ for (const kind of ["tool", "message"] as const) {
 				);
 				clearPiServedArraySession(sessionId);
 				resetLkgSlotsForTest();
-				await expect(pass()).rejects.toThrow(PI_TAG_IDENTITY_REPAIR_ONCE_GUARD);
-				await expect(pass()).rejects.toBeInstanceOf(PiTagIdentityConflictError);
+				const repairsBefore = repairLines.length;
+				for (let n = 0; n < 2; n++) {
+					const again = await pass();
+					expect(JSON.stringify(again.messages)).toBe(
+						JSON.stringify(execute.messages),
+					);
+					expect(decisions.getPendingPi(sessionId)?.materializeReason).not.toBe(
+						"tag_identity_repair",
+					);
+				}
+				expect(
+					repairLog.mock.calls.filter(([, line]) =>
+						String(line).includes(
+							"tag identity repair without last-served evidence",
+						),
+					),
+				).toHaveLength(repairsBefore);
 			} finally {
 				repairLog.mockRestore();
 				clearContextHandlerSession(sessionId);
@@ -255,15 +269,16 @@ test("issue 650 recovery: a timestamp-less orphan cannot enable probes for unrel
 				() => "real",
 			);
 		expect(guardPrepares).toBe(0);
+		// Reported, no longer refused: the pass logs it and allocates.
 		for (let n = 0; n < 2; n++)
-			expect(() =>
+			expect(
 				__test.guardPiToolAllocations(
 					db,
 					"guard-cost",
 					[assistantToolCall("orphan", "bash", {}, 20)],
 					() => "real",
 				),
-			).toThrow(PiTagIdentityConflictError);
+			).toEqual([{ kind: "tool", id: "real/orphan" }]);
 		expect(guardPrepares).toBe(1);
 		spy.mockRestore();
 	} finally {

@@ -7,6 +7,7 @@ export type CacheBustDivergenceClass =
     | "accounted_hard_pressure_refold"
     | "accounted_hard_marker_drain"
     | "accounted_hard_fold"
+    | "accounted_tag_identity_repair"
     | "accounted_execute_published_history"
     | "accounted_soft_m1_execute"
     | "accounted_ctx_reduce"
@@ -175,6 +176,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         divergenceClass: "accounted_hard_fold",
         accounted: true,
         rule: "matched pass records another materialized HARD/m0 fold; tiny mid-history defer/first_render seams are excluded",
+    },
+    {
+        divergenceClass: "accounted_tag_identity_repair",
+        accounted: true,
+        rule: "matched pass records materialize_reason=tag_identity_repair (Pi kept the newest of two tag numbers for one call or message and rebuilt once)",
     },
     {
         divergenceClass: "accounted_ctx_reduce",
@@ -391,6 +397,10 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         return "accounted_hard_marker_drain";
     }
     if (usageMissing) return "usage_missing";
+    // A declared Pi tag-identity repair rebuilds the array whether or not m[0]
+    // was rematerialized; without this class an unmaterialized repair read as an
+    // m1 refresh and a materialized one as an unnamed fold.
+    if (materializeReason === "tag_identity_repair") return "accounted_tag_identity_repair";
     if (decision.materialized) {
         if (materializeReason === "model_change") return "accounted_hard_model_change";
         if (materializeReason === "system_hash") return "accounted_hard_system_hash";

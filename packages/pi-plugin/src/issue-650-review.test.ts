@@ -32,6 +32,7 @@ import {
 import { contextHost } from "./pi-context-host.test";
 import { registerPiGuardedContext } from "./pi-context-refusal";
 import { PiStorageBusyError } from "./pi-raw-fallback";
+import { readPiIdentityRebuilds } from "./pi-tag-identity-repair";
 import { piCachedToolSurvivor } from "./pi-tool-identity";
 import {
 	capturePiServedArray,
@@ -478,7 +479,13 @@ test("review 650: two branch entries sharing timestamp and call ids are never me
 // 4. Refusal wording and raw-history safety
 // ---------------------------------------------------------------------------
 
-test("review 650: the real context handler refuses a tool identity conflict with its own message", async () => {
+// This test first asserted that the real host runner refuses this turn with an
+// identity-conflict message. No identity conflict may refuse more than one
+// turn: a served array that renders both numbers proves nothing, which is the
+// same as having no array, so the pass now takes the one declared repair
+// (newest number kept) and serves. The refusal wording itself is still
+// covered by the synthetic-error notice tests.
+test("review 650: the real context handler serves an unprovable tool identity conflict with one repair", async () => {
 	const db = createTestDb();
 	const sessionId = session("handler-refusal");
 	const host = contextHost();
@@ -515,7 +522,7 @@ test("review 650: the real context handler refuses a tool identity conflict with
 			[
 				assistantToolCall("call", "codemode", {}, 20),
 				toolResultMessage("call", "[dropped §8§]", 21),
-				userMessage("quoted §154§", 22),
+				userMessage("§154§ rendered", 22),
 			],
 			[REAL, FALLBACK],
 		);
@@ -536,7 +543,6 @@ test("review 650: the real context handler refuses a tool identity conflict with
 			toolResultMessage("call", "1", 21),
 			userMessage("next", 22),
 		];
-		const before = toolRows(db, sessionId);
 		await host.emit(
 			handler as (...args: never[]) => unknown,
 			structuredClone(input),
@@ -547,14 +553,12 @@ test("review 650: the real context handler refuses a tool identity conflict with
 				input,
 			),
 		);
-		expect(host.controller.signal.aborted).toBe(true);
-		expect(host.entries).toHaveLength(1);
-		const message = (host.entries[0]?.data as { message: string }).message;
-		expect(message).toStartWith("Magic Context tool-tag identity conflict:");
-		expect(message).toMatch(/stage=.+ elapsed=\d+ms recovery=.+/);
-		expect(message).not.toContain("storage is busy");
-		expect(message).not.toContain("send your message again");
-		expect(toolRows(db, sessionId)).toEqual(before);
+		expect(host.controller.signal.aborted).toBe(false);
+		expect(host.entries).toHaveLength(0);
+		expect(toolRows(db, sessionId)).toEqual([
+			{ tag_number: FALLBACK, status: "active", tool_owner_message_id: "real" },
+		]);
+		expect(readPiIdentityRebuilds(db, sessionId)).toEqual([]);
 	} finally {
 		clearContextHandlerSession(sessionId);
 		db.close();
