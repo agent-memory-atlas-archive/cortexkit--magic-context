@@ -1,19 +1,22 @@
 # Host stall profiler
 
-An off-by-default diagnostic in the Magic Context OpenCode plugin (OpenCode 1
-entry only) that names the JavaScript blocking OpenCode's main thread during
+An off-by-default diagnostic in Magic Context's OpenCode 1, Pi and Oh My Pi
+entries that names the JavaScript blocking the host's main thread during
 multi-second host stalls. It was built to follow up the stalls described in
 `docs/reports/ckmc-silent-stalls.md`: native `sample` stacks show synchronous
 work on the main thread but not which in-process plugin (Magic Context,
 Prefrontal, AFT, anthropic-auth, …) made the call.
 
-Code: `packages/plugin/src/plugin/host-stall-profiler.ts` (switch, watchdog,
-report writer) and `host-stall-profiler-report.ts` (owner mapping and
-aggregation). There is no config key; the file switch is the only control.
+Code: `packages/plugin/src/shared/host-stall-profiler.ts` (process singleton
+and runtime selection), `host-stall-profiler-common.ts` (schema, options and
+writer), `host-stall-profiler-report.ts` (shared attribution/aggregation), and
+`host-stall-profiler-{bun,node}.ts` (runtime controllers). OpenCode's original
+`plugin/` module paths remain compatibility exports. There is no config key;
+the file switch is the only control.
 
 ## How it works
 
-- **File switch.** Every 30 s the plugin checks for
+- **File switch.** Every 5 s the plugin checks for
   `<storage>/host-profiler/enable`, where `<storage>` is the Magic Context
   storage directory (`~/.local/share/cortexkit/magic-context` by default;
   `MAGIC_CONTEXT_STORAGE_DIR` or `XDG_DATA_HOME` move it). Creating the file
@@ -26,7 +29,8 @@ aggregation). There is no config key; the file switch is the only control.
   `profile(fn, intervalMicros)`, which leaves the sampler paused when it
   returns; `bun:jsc` has no separate stop call.
 - **Watchdog.** A 250 ms interval measures the real gap between ticks. A gap
-  over the threshold (default 3000 ms) is a stall. Every tick drains the
+  at or above the threshold (default 3000 ms of lateness, excluding the
+  expected 250 ms interval) is a stall. On Bun every tick drains the
   sampler, so samples never pile up between ticks; on a stall the drained
   samples are filtered to the stall window by timestamp (the sampler's clock is
   calibrated against `performance.now()` when the profiler starts). If the
@@ -50,10 +54,10 @@ mkdir -p -m 700 "$dir"
 echo '{"threshold_ms": 3000}' > "$dir/enable"
 ```
 
-Within 30 s the Magic Context log shows
+Within 5 s the Magic Context log shows
 `host stall profiler enabled: threshold 3000ms, sample interval 10ms, clock calibration ok, …`.
 Each stall logs one line naming the top owner and the report path. Edits to
-the enable file are picked up on the next 30 s check. To turn it off:
+the enable file are picked up on the next 5 s check. To turn it off:
 `rm "$dir/enable"` (log: `host stall profiler disabled: enable file removed`).
 
 ## Reading a report
@@ -80,7 +84,7 @@ Owners come from each frame's source URL:
   from a local checkout, such as Magic Context's own `dist/index.js`)
 
 A sample is attributed to its innermost frame that is not `native`, `runtime`
-or `opencode`: a plugin calling a blocking native API is blamed, not the API
+or `opencode` (also excluding `pi` and `omp` host core frames): a plugin calling a blocking native API is blamed, not the API
 and not the host code that invoked the plugin hook. Only when no such frame
 exists does the sample count for `opencode`, then `native`.
 
@@ -196,3 +200,157 @@ with the sampling rate.
   taken or held), and the thread itself remains until the process exits.
 - Frames from minified OpenCode chunks name chunk files, not OpenCode source
   files.
+
+## Pi and Oh My Pi
+
+The Pi entry starts the same process-wide switch after its child-session guards,
+so `/reload` and independent sessions in one process cannot create duplicate
+profilers. Runtime selection uses `process.versions.bun`, not the host's name:
+Node Pi uses V8, Bun OMP uses JavaScriptCore, and Node OMP would use V8. Nothing
+imports `node:inspector` or constructs a session while the switch is absent.
+
+### Node backend
+
+An in-process `node:inspector` `Session` enables V8's CPU profiler, sets the
+sampling interval to **10 ms**, and starts sampling continuously. V8 samples
+from another thread, including while the JS thread is blocked in synchronous
+native work. Starting a profile after observing a stall would be too late.
+The same 250 ms watchdog stops/restarts the profile every **10 s**. Ordinary
+windows are discarded immediately, never written or retained as a history.
+Rotation and stall detection happen in the same callback: a rotation delayed by
+a stall first captures that stall rather than discarding it. Stop/start/check
+operations are serialized; disabling stops profiling and disconnects the session.
+
+The converter reconstructs leaf-first stacks from V8 node IDs and child links,
+and sums `timeDeltas` (microseconds) against the monotonic time when that window
+started. Only samples within the late watchdog gap (plus a small sampling slack)
+enter the shared aggregation. Reports have the same `schema_version: 1`, with
+additive `backend` (`v8` or `jsc`) and `node_version` fields. V8 memory uses
+`process.memoryUsage().heapUsed` and RSS; JSC-specific fields are null. Node's
+before snapshot is from the previous rotation (up to 10 s old under normal
+scheduling), not JSC's once-per-second snapshot. Idle synthetic V8 samples have
+no JS frames and do not contribute to owner percentages.
+
+Attribution additionally recognizes:
+
+- `.pi/agent/extensions/<entry>` and `.omp/agent/extensions/<entry>`: nearest
+  package name (`pkg:<name>`), otherwise `extension:<entry>`;
+- agent `npm/.../node_modules/<pkg>` installations: `npm:<pkg>`, including scoped
+  and nested packages;
+- Pi core `@earendil-works/pi-{coding-agent,agent-core,ai,tui}` (and legacy
+  `@mariozechner` scope): `pi`; OMP `@oh-my-pi` core packages: `omp`;
+- Magic Context's Pi package: `pkg:@cortexkit/pi-magic-context`, including npm
+  installs. Host/runtime/native frames are skipped when a JS extension caller
+  can explain the sample.
+
+### Real Pi verification and overhead
+
+Local macOS arm64: Pi **0.87.1**, Node **26.10.0**, built Pi extension. The
+repeatable probe is `packages/pi-plugin/scripts/verify-host-stall-profiler.mjs`:
+
+```sh
+# Build locally because this probe runs the resulting bundle on this Mac.
+(cd packages/pi-plugin && bun run build)
+root="$TMPDIR/magic-context/host-profiler-probe"
+mkdir -p "$root/home"
+HOME="$root/home" npm install --prefix "$root/install" --no-audit --no-fund \
+  @earendil-works/pi-coding-agent@0.87.1 @oh-my-pi/pi-coding-agent@latest
+HOST_PROFILER_TEST_ROOT="$root" node packages/pi-plugin/scripts/verify-host-stall-profiler.mjs pi
+HOST_PROFILER_TEST_ROOT="$root" node packages/pi-plugin/scripts/verify-host-stall-profiler.mjs omp
+```
+
+The probe runs the real CLI in RPC mode with a loopback mock provider and no
+credentials. Every host environment path (`HOME`, all XDG roots, `OPENCODE_DB`,
+`MAGIC_CONTEXT_STORAGE_DIR`, log, temp and agent directories) points inside the
+throwaway root. It copies the built extension there and injects a hook into that
+copy's **actual context handler**, never into shipped source. `lsof -p <pid>`
+is saved and asserted to contain open databases only under that run's root,
+both at startup and while the synchronous SQLite database is open during a
+stall.
+Raw reports, inspector activity, runtime versions, memory and logs remain in the
+root; `result.json`, `ready.json`, `lsof.txt` and `host-output.txt` are evidence.
+
+| Pi injection | Gap / lag | Window samples | Top owner |
+| --- | --- | --- | --- |
+| 6 s extension busy loop | 6063 / 5813 ms | 505 | `pkg:host-stall-test-extension` 98.8% |
+| 6 s synchronous `node:sqlite` recursive-query loop | 6266 / 6016 ms | 529 | `pkg:host-stall-test-extension` 100% |
+| 6 s hook inside Magic Context's context handler | 6638 / 6388 ms | 610 | `pkg:@cortexkit/pi-magic-context` 87.5% |
+| 6 s extension busy loop after off/on | 6193 / 5943 ms | 526 | `pkg:host-stall-test-extension` 98.8% |
+
+The SQLite report's top JS frame was `deliberateSqliteCaller` (505 samples): V8
+retained the JS caller during native execution. A 20 s switch-absent interval
+recorded **zero inspector connect/post/disconnect activity**. Creating, deleting,
+and recreating the file exercised real polling without restarting the PID;
+there was no further profiler activity after switch-off.
+
+Steady idle process CPU (CPU time / wall time, one core = 100%): **0.069% off**
+and **1.196% on at 10 ms** over 30 s / three rotated windows, about **+1.13
+percentage points** of one core on this shared Mac. During the on interval,
+heap-used snapshots were 57.14, 53.95, 54.03 and 54.12 MB; RSS was 357.14,
+193.47, 193.57 and 193.67 MB. After the first GC, retained heap rose about
+**0.09 MB per 10 s window** and RSS about **0.10 MB per window**, not an
+accumulating profile history. These are whole-host measurements, not a claim
+that every allocation is the profiler's; startup/GC explain the first decrease.
+The 10 ms / 10 s defaults keep steady CPU near 1% of a core and bound ordinary
+sample retention to roughly 1000 samples per window. A long stall can extend
+that window until the event loop returns; only report aggregation is capped at
+20 000 samples. This diagnostic remains opt-in, not production-on by default.
+
+### Real Oh My Pi verification
+
+OMP **18.8.8** installed successfully in the same throwaway install prefix. Its
+CLI declares `#!/usr/bin/env bun` (Pi's declares `#!/usr/bin/env node`), and
+ran on **Bun 1.4.2**, so the shared entry selected **JSC**, not V8. The probe
+selects the CLI's declared runtime instead of inferring it from the host name. The
+second complete run, with sorted report filenames, observed:
+
+| OMP injection | Gap / lag | Window samples | Top owner |
+| --- | --- | --- | --- |
+| 6 s extension busy loop | 6219 / 5969 ms | 501 | `pkg:host-stall-test-extension` 100% |
+| 6 s synchronous SQLite loop via Bun's `node:sqlite` compatibility API | 6254 / 6004 ms | 494 | `pkg:host-stall-test-extension` 100% |
+| 6 s hook in Magic Context's context handler | 6154 / 5904 ms | 506 | `pkg:@cortexkit/pi-magic-context` 98.8% |
+| 6 s extension busy loop after off/on | 6032 / 5782 ms | 502 | `pkg:host-stall-test-extension` 100% |
+
+The native SQLite leaf was `get [native]`; the top JS frame was
+`deliberateSqliteCaller` (494 samples). Switch-absent startup recorded no JSC
+loader/sampler activity and no inspector activity. The same PID disabled and
+re-enabled sampling; disabling JSC pauses its thread rather than destroying it.
+The probe instruments the throwaway bundle's actual loader/constructor/start
+calls, and the final version asserts those instrumentation targets exist so a
+bundle-layout change cannot silently produce an empty activity trace.
+
+OMP's measured idle **on** CPU was **0.72%** at 10 ms. Its first 20 s **off**
+interval was **3.13%**, contaminated by OMP startup work, so that comparison
+cannot establish a negative overhead or a precise incremental CPU cost. During
+30 s of sampling, heap-used grew from 124.451 to 124.467 MB (about **5 KB per
+10 s**) and RSS stayed around 881.4 MB. These are whole-host measurements;
+JSC drains every 250 ms rather than holding 10 s V8 profiles. The previously
+measured OpenCode/Bun comparison above remains the cleaner JSC overhead probe.
+
+A second Pi run measured 0.060% off and 1.405% on; the two Pi observations put
+incremental idle overhead at approximately **1.1–1.35 percentage points of one
+core**, with post-GC retained heap around **0.09–0.12 MB per 10 s**. This is a
+small but nonzero opt-in diagnostic cost, not a zero-overhead profiler.
+
+Isolation evidence for those two runs is under
+`$TMPDIR/magic-context/bg_6caecfa3eae34c90/pi-F11h4o/` (PID 32797) and
+`omp-TQn3Mk/` (PID 38677). `lsof.txt` at startup and `lsof-sqlite.txt` **during
+the native stall** listed only databases under the corresponding run directory:
+Pi's `storage/context.db{,-wal,-shm}` and `storage/probe.db`; OMP additionally
+opened its throwaway `home/.omp/agent/{agent,models,skill-descriptions}.db` and
+`home/.omp/cache/legacy-pi-extension-cache.db` with their WAL/SHM files. No host
+run used the operator's Pi/OMP directory or any live OpenCode/CortexKit store.
+
+### Automated coverage
+
+The original Bun switch/report tests remain in `plugin/host-stall-profiler.test.ts`.
+`shared/host-stall-profiler-node.test.ts` covers canned V8 conversion/native
+caller stacks, Pi/OMP owners (including npm Magic Context), zero inspector work
+while absent, off/on disconnection, a stop during asynchronous session loading,
+lag threshold boundaries, and a stall crossing the normal rotation deadline.
+A controlled mutation bypassing Node's timestamp filter made **only**
+`Node rotation discards ordinary windows and retains only samples inside the detected stall`
+fail (725 unrelated-inclusive samples versus the asserted `< 640`), while the
+other three then-existing Node tests stayed green. The production filter was
+restored from the staged live implementation. The final expanded suites ran
+17 tests with zero failures on Linux.

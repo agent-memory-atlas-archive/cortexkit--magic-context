@@ -123,6 +123,7 @@ import {
 } from "@magic-context/core/shared/provider-response-completion";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
+import { startHostStallProfilerSwitch } from "../../plugin/src/shared/host-stall-profiler";
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -1135,6 +1136,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
+	startHostStallProfilerSwitch();
 	registerPiSubagentHostTools(pi, PI_HARNESS_KIND);
 	const unregisterPiSubagentInitContext = registerPiSubagentInitContext(pi);
 	registerPiSubagentInitContextCleanup(pi, unregisterPiSubagentInitContext);
