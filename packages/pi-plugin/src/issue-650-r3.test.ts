@@ -7,10 +7,11 @@
  * ledger (session_meta's bounded list of durable Pi decisions) too full to
  * record a repair.
  */
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import {
 	encodePiContentDecision,
 	PI_CONTENT_DECISION_LIMIT,
+	PI_IDENTITY_RECURRENCE_ALLOWANCE,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { saveSourceContent } from "@magic-context/core/features/magic-context/storage-source";
@@ -296,3 +297,34 @@ for (const free of [0, 1] as const) {
 		}
 	});
 }
+
+test("issue 650 r3: a ledger with no room even for recurrence records logs the unmerged duplicate once per process", () => {
+	// Past the recurrence allowance nothing can be recorded; the in-memory note
+	// still keeps the log to one line instead of one per turn.
+	const db = createTestDb();
+	const sessionId = session("ledger-overfull");
+	const log = spyOn(logger, "sessionLog");
+	try {
+		fillDecisionLedger(
+			db,
+			sessionId,
+			PI_CONTENT_DECISION_LIMIT + PI_IDENTITY_RECURRENCE_ALLOWANCE,
+		);
+		const fingerprint = piMessageEntryFingerprint(userMessage("same", 7))!;
+		seedMessageRow(db, sessionId, "real:p0", 20, fingerprint);
+		seedMessageRow(db, sessionId, "pi-msg-0-7-user:p0", 440, fingerprint);
+		capturePiServedArray(sessionId, [], { servedTagNumbers: [20, 440] });
+		clearPiServedArraySession(sessionId);
+		for (let n = 0; n < 3; n++)
+			expect(adoptReal(db, sessionId, fingerprint).rebuilds).toEqual([]);
+		expect(readPiIdentityRecurrences(db, sessionId)).toEqual([]);
+		expect(
+			log.mock.calls.filter(([, line]) =>
+				String(line).includes("tag identity recurred after its one repair"),
+			),
+		).toHaveLength(1);
+	} finally {
+		log.mockRestore();
+		db.close();
+	}
+});
