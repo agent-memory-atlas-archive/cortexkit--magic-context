@@ -102,7 +102,15 @@ statement:
   AUTOINCREMENT, so SQLite hands a deleted top rowid to the next insert; a
   remembered row that has gone or now holds another message is passed over for
   a lower one, and only when none survive is the session scanned again;
-- `countRawSessionMessageOrdinalsFromDb` uses the same path with no bounds.
+- `countRawSessionMessageOrdinalsFromDb` uses the same path with no bounds;
+- validating the remembered rows, reading the rows above them and counting run
+  inside one read transaction on the serving connection (one WAL snapshot), so
+  no other connection's commit can land between them. Without it, a commit that
+  deleted the top row and reused its rowid for a finished summary between the
+  validation and the scan made the scan adopt the new row as its top without
+  reading it as a candidate, and that wrong set persisted (review r2, P1). The
+  transaction only reads and ends with ROLLBACK; inside a transaction the caller
+  already holds, that one is used.
 
 OpenCode 1.18 has no index on `message.time_updated` (only
 `message_session_time_created_id_idx (session_id, time_created, id)`), and a
@@ -124,13 +132,23 @@ assumption is that a row carries its `summary` flag from its first insert:
   `time.completed` on rows that are already Magic Context summaries; the clone
   script inserts new rows. No Rust crate writes `message`.
 
-The residual: an in-place edit by some other writer that turns an ordinary row
-into a finished summary is not seen until `forgetRawSessionSummaryRows` runs for
-the session. The review's randomized differential (seed `0x5d0ee2b3`) made
-exactly that edit in its fourth step; its main variant now rewrites rows that
-were inserted with the flag (finishing and unfinishing them), and the original
-arbitrary edit is kept as its own test that calls `forgetRawSessionSummaryRows`
-after each write, plus a named residual test.
+Named limitations:
+
+- an in-place edit by some other writer that turns an ordinary row
+  into a finished summary is not seen until `forgetRawSessionSummaryRows` runs
+  for the session. The first review's randomized differential (seed
+  `0x5d0ee2b3`) made exactly that edit in its fourth step; its main variant now
+  rewrites rows that were inserted with the flag (finishing and unfinishing
+  them), and the original arbitrary edit is kept as its own test that calls
+  `forgetRawSessionSummaryRows` after each write, plus a named residual test;
+- a finished summary moved into another session by changing its `session_id`
+  is not a candidate of the destination session until
+  `forgetRawSessionSummaryRows` runs for it. OpenCode 1.18's message upsert
+  never changes `session_id`, and a session location move changes only the
+  session table. Witnesses: `a finished summary moved into an already warm
+  session must be excluded` and the session-move variant of the r2 6,000-step
+  differential (both expected failures); invalidating the destination restores
+  parity in both.
 
 **Off-thread warm-up.** Finding a session's candidates the first time reads
 every message's JSON once. That scan now runs on a worker
@@ -139,6 +157,9 @@ on the serving connection. The worker's scan reads the top rows and the
 candidates in one statement, so rows written during or after it lie above its
 top remembered row (or replace it) and are read by the next count. Callers:
 
+- concurrent calls for one store and session share one worker, and every
+  connection that awaited it installs the result on itself (review r2, P2: the
+  second connection was reported warm without being warmed);
 - the transform awaits it at the start of every pass (instant once warm), so
   no stage reached from `experimental.chat.messages.transform` (protected-tail
   boundary, compartment trigger, module-state sync, chunk reads) scans the
@@ -169,20 +190,40 @@ that runs when any OpenCode process opens the store gives them owners from
 another process. The `schema_version` is part of the key, so a rebuilt table
 rebuilds the summary.
 
-Residual: another process rewriting a tag's message id, owner, number or
-reasoning count in place, with the session's count and highest id unchanged, is
-not seen until this process makes an identity write or opens a new connection.
-Writers of those columns: the tagger and tag hygiene in the transform (message
-id re-keys, owner adoption, whitespace inerting, reasoning backfill), the
-store-generation rebase fold, and Pi's fallback adoption. All of them write
-only the sessions the same process serves, and this process's own writes move
-its identity-write generation. The CLI (`migrate-session` and `doctor
-repair-db`) does not rewrite tag rows (repair-db replaces the whole file with
-every host stopped), the dashboard has no tag writer, and Rust-mode tags live in
-`store.db` (`mc_tags`). The review test that had another process rewrite
-`tag_number` and `reasoning_token_count` in place is now that named residual
-test. A per-session identity revision would need a schema change, so it waits
-for the migration branch.
+The count and highest id cannot prove that a commit only appended: the r2
+review showed another connection backfilling an old tag's
+`reasoning_token_count` in the same commit as an append, and a second Pi or
+OpenCode host serving the same session is a supported deployment. So every
+Magic Context connection now bumps a per-session tag identity revision in the
+same statement as any write of `id`, `session_id`, `message_id`,
+`tag_number`, `type`, `tool_owner_message_id` or `reasoning_token_count`, and
+the shape statement reads it; a changed revision rebuilds. The revision is the
+`schema_migrations_meta` row `tag_identity_revision:<session>`: that key/value
+table already holds per-session `retrospective_activity:<session>` rows, so no
+schema change is needed (`session_meta` has fixed columns). The bump is a TEMP
+trigger (`storage-tag-identity-revision.ts`) that `initializeDatabase` creates
+on every connection it opens: it is not part of the stored schema, covers
+every writer on that connection (the tagger, tag hygiene, owner adoption, the
+reasoning backfill, the rebase fold, Pi's fallback adoption, the tool-owner
+backfill, migrations, raw SQL), and commits or rolls back with the write.
+Status, drop-mode, size and token-count writes do not bump it.
+
+Named limitations:
+
+- a connection that never ran `initializeDatabase` (a tool editing
+  `context.db` directly, an older plugin build) does not bump the revision,
+  so its in-place rewrite stays unseen while the count and highest id fit an
+  append. The CLI (`migrate-session`, `doctor repair-db`) does not rewrite tag
+  rows, the dashboard has no tag writer, and Rust-mode tags live in `store.db`
+  (`mc_tags`). Tests: the raw-connection residual tests in
+  `oc-stall-cache-review.test.ts`, `oc-stall-r2-tag-review.test.ts` and
+  `storage-tag-owner-summary.test.ts`;
+- deletes are not counted in the revision (they change the count). A delete
+  and an insert with an explicit `tags.id` below the highest id in one commit
+  cancel out; no writer inserts tags with an explicit id (`tags.id` is
+  AUTOINCREMENT and the clone copies without ids). Witness: `foreign delete and
+  explicit-id reinsertion below max must not retain a deleted owner`
+  (expected failure); reopening restores the full read.
 
 ## Measurements
 

@@ -1271,40 +1271,44 @@ function countCanonicalOrdinalsIndexed(
     if (after) range.push(after.timeCreated, after.id);
     if (through) range.push(through.timeCreated, through.id);
     try {
-        // A retry is needed only when the remembered top row was deleted between
-        // reading the candidates and counting, so a new row could reuse its rowid.
-        for (let attempt = 0; attempt < STABLE_STORE_ATTEMPTS; attempt += 1) {
-            const view = summaryCandidatesOf(db, sessionId);
-            const ids = JSON.stringify(view.ids);
-            const row = db
-                .prepare(canonicalCountStatementText(after !== null, through !== null))
-                .get(
-                    sessionId,
-                    ...range,
-                    ids,
-                    sessionId,
-                    ...range,
-                    view.floorRowid,
-                    sessionId,
-                    ids,
-                    ...range,
-                    view.floorRowid,
-                ) as {
-                stored?: unknown;
-                knownExcluded?: unknown;
-                newExcluded?: unknown;
-                floorId?: unknown;
-            } | null;
-            if (view.floorId !== null && row?.floorId !== view.floorId) continue;
-            const stored = typeof row?.stored === "number" ? row.stored : 0;
-            const excluded =
-                (typeof row?.knownExcluded === "number" ? row.knownExcluded : 0) +
-                (typeof row?.newExcluded === "number" ? row.newExcluded : 0);
-            ordinalRowsVisited += stored;
-            ordinalJsonRowsRead += view.ids.length;
-            return stored - excluded;
-        }
-        return null;
+        return withReadSnapshot(db, () => {
+            // Inside one read snapshot no other connection's commit can land
+            // between validating the remembered rows, reading the rows above
+            // them and counting, so the floor check below can only fail when the
+            // caller's own open transaction wrote in between.
+            for (let attempt = 0; attempt < STABLE_STORE_ATTEMPTS; attempt += 1) {
+                const view = summaryCandidatesOf(db, sessionId);
+                const ids = JSON.stringify(view.ids);
+                const row = db
+                    .prepare(canonicalCountStatementText(after !== null, through !== null))
+                    .get(
+                        sessionId,
+                        ...range,
+                        ids,
+                        sessionId,
+                        ...range,
+                        view.floorRowid,
+                        sessionId,
+                        ids,
+                        ...range,
+                        view.floorRowid,
+                    ) as {
+                    stored?: unknown;
+                    knownExcluded?: unknown;
+                    newExcluded?: unknown;
+                    floorId?: unknown;
+                } | null;
+                if (view.floorId !== null && row?.floorId !== view.floorId) continue;
+                const stored = typeof row?.stored === "number" ? row.stored : 0;
+                const excluded =
+                    (typeof row?.knownExcluded === "number" ? row.knownExcluded : 0) +
+                    (typeof row?.newExcluded === "number" ? row.newExcluded : 0);
+                ordinalRowsVisited += stored;
+                ordinalJsonRowsRead += view.ids.length;
+                return stored - excluded;
+            }
+            return null;
+        });
     } catch (error) {
         // A store without a rowid `message` table or without JSON1's json_each
         // (test fixtures, unusual builds) keeps the JSON-reading count.
@@ -1313,6 +1317,27 @@ function countCanonicalOrdinalsIndexed(
             return null;
         }
         throw error;
+    }
+}
+
+function connectionHasOpenTransaction(db: Database): boolean {
+    const state = db as unknown as { inTransaction?: unknown; isTransaction?: unknown };
+    return state.inTransaction === true || state.isTransaction === true;
+}
+
+/**
+ * Run `read` inside one read transaction, so all its statements see the same
+ * committed state (in WAL mode, one snapshot). A transaction the caller already
+ * holds is used as it is. The transaction only reads, so it is ended with
+ * ROLLBACK, which releases the snapshot without a commit.
+ */
+function withReadSnapshot<T>(db: Database, read: () => T): T {
+    if (connectionHasOpenTransaction(db)) return read();
+    db.exec("BEGIN");
+    try {
+        return read();
+    } finally {
+        if (connectionHasOpenTransaction(db)) db.exec("ROLLBACK");
     }
 }
 

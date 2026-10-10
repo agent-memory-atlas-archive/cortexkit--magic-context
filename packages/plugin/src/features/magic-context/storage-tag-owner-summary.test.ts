@@ -7,6 +7,7 @@ import { Database, mayChangeTagIdentity } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import { initializeDatabase } from "./storage-db";
+import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import {
     backfillTagTokenCounts,
     deleteTagsByMessageId,
@@ -210,9 +211,16 @@ describe("tag owner summary after other connections' commits", () => {
      * another process: a connection without Magic Context's wrapper, whose
      * writes reach this process only as a commit (`data_version` moves).
      */
+    /**
+     * `other` is a Magic Context connection of another process by default: it
+     * installs the identity-revision trigger every Magic Context connection
+     * installs when it opens. `magicContextWriter: false` leaves it a raw
+     * connection that is not Magic Context's.
+     */
     function withForeignWriter(
         count: number,
         run: (db: Database, other: UnwrappedDatabase) => void,
+        magicContextWriter = true,
     ): void {
         const { dir: directory, cleanup } = createTestTempDir("mc-tag-owner-foreign-");
         const path = join(directory, "context.db");
@@ -234,6 +242,7 @@ describe("tag owner summary after other connections' commits", () => {
             expectMatchesFullRead(db, 1);
             other = new UnwrappedDatabase(path);
             other.exec("PRAGMA busy_timeout = 1000");
+            if (magicContextWriter) installTagIdentityRevisionTrigger(other as unknown as Database);
             run(db, other);
         } finally {
             other?.close();
@@ -310,24 +319,63 @@ describe("tag owner summary after other connections' commits", () => {
         });
     });
 
-    it("documents the residual: an in-place re-key by another connection keeps the cached owners", () => {
+    it("rebuilds after another Magic Context connection re-keys or backfills a tag in place", () => {
         withForeignWriter(2_000, (db, other) => {
             other
                 .prepare(
                     "UPDATE tags SET message_id = 'm-rekeyed' WHERE session_id = ? AND tag_number = 1000",
                 )
                 .run(SESSION);
-            // Count and highest id are unchanged, so the summary is kept. Only
-            // the process serving a session re-keys its tags; this process's own
-            // re-keys move the identity-write generation and rebuild.
-            expect(readCost(db)).toEqual({ rows: 0, checks: 1 });
-            expect(getMaxTagNumberByOwnerMessage(db, SESSION).get("m-rekeyed")).toBeUndefined();
-            db.prepare(
-                "UPDATE tags SET message_id = 'm-rekeyed' WHERE session_id = ? AND tag_number = 1000",
-            ).run(SESSION);
-            expect(readCost(db).rows).toBe(2_000);
+            expect(readCost(db)).toEqual({ rows: 2_000, checks: 1 });
+            expectMatchesFullRead(db, 1);
+            other
+                .prepare(
+                    "UPDATE tags SET reasoning_token_count = 5000 WHERE session_id = ? AND tag_number = 10",
+                )
+                .run(SESSION);
+            expect(readCost(db)).toEqual({ rows: 2_000, checks: 1 });
             expectMatchesFullRead(db, 1);
         });
+    });
+
+    it("documents the residual: an in-place re-key by a connection that is not Magic Context's keeps the cached owners", () => {
+        withForeignWriter(
+            2_000,
+            (db, other) => {
+                other
+                    .prepare(
+                        "UPDATE tags SET message_id = 'm-rekeyed' WHERE session_id = ? AND tag_number = 1000",
+                    )
+                    .run(SESSION);
+                // Count and highest id are unchanged, so the summary is kept. Only
+                // the process serving a session re-keys its tags; this process's own
+                // re-keys move the identity-write generation and rebuild.
+                expect(readCost(db)).toEqual({ rows: 0, checks: 1 });
+                expect(getMaxTagNumberByOwnerMessage(db, SESSION).get("m-rekeyed")).toBeUndefined();
+                db.prepare(
+                    "UPDATE tags SET message_id = 'm-rekeyed' WHERE session_id = ? AND tag_number = 1000",
+                ).run(SESSION);
+                expect(readCost(db).rows).toBe(2_000);
+                expectMatchesFullRead(db, 1);
+            },
+            false,
+        );
+    });
+
+    it("installs the identity-revision trigger on every initialized connection", () => {
+        const db = new Database(":memory:");
+        try {
+            initializeDatabase(db);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_temp_master WHERE type = 'trigger' AND name = 'mc_tag_identity_revision_au'",
+                    )
+                    .get(),
+            ).toEqual({ name: "mc_tag_identity_revision_au" });
+        } finally {
+            db.close();
+        }
     });
 
     it("checks the session's shape from the index alone", () => {
@@ -347,7 +395,9 @@ describe("tag owner summary after other connections' commits", () => {
             const shape = statements.find((sql) => sql.includes("COUNT(*)"));
             expect(shape).toBeDefined();
             const plan = (
-                db.prepare(`EXPLAIN QUERY PLAN ${shape}`).all(0, SESSION, SESSION) as Array<{
+                db
+                    .prepare(`EXPLAIN QUERY PLAN ${shape}`)
+                    .all(0, SESSION, `revision:${SESSION}`, SESSION) as Array<{
                     detail: string;
                 }>
             ).map((row) => row.detail);

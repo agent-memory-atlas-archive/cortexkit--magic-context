@@ -145,7 +145,7 @@ function anchorRace(invalidate: boolean): void {
 }
 
 describe("stall r2 ordinal witnesses", () => {
-    test.failing("rowid reuse between anchor validation and incremental scan must not lose a finished summary", () =>
+    test("rowid reuse between anchor validation and incremental scan must not lose a finished summary", () =>
         anchorRace(false));
     test("rowid reuse race: forgetting candidates restores the whole-prefix result", () =>
         anchorRace(true));

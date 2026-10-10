@@ -69,7 +69,7 @@ const ACCEPT_TIMEOUT_MS = 2_000;
 const RESULT_TIMEOUT_MS = 10 * 60_000;
 const FAILURE_BACKOFF_MS = 5 * 60_000;
 
-const inFlight = new Map<string, Promise<RawOrdinalWarmupOutcome>>();
+const inFlight = new Map<string, SharedScan>();
 const failedAt = new Map<string, number>();
 const activeWorkers = new Map<Worker, (reason: RawOrdinalWarmupFailureReason) => void>();
 const failures = new Map<RawOrdinalWarmupFailureReason, number>();
@@ -173,7 +173,8 @@ function runWorker(
  * scanned on this thread, which is bounded. Otherwise a worker scans the
  * session and the result is installed on `db`; rows written while it ran are
  * picked up by the next count. Concurrent calls for one store and session share
- * one worker. "failed" means the scan failed or its result could not be
+ * one worker, and every connection that awaited it installs the result on
+ * itself. "failed" means the scan failed or its result could not be
  * installed; it is logged and counted by reason, and apart from a superseded
  * scan it is not retried for that store and session for FAILURE_BACKOFF_MS.
  */
@@ -196,45 +197,75 @@ export function prewarmRawSessionOrdinalsForDb(
         return Promise.resolve("warm");
     }
     const key = `${path}\0${sessionId}`;
-    const pending = inFlight.get(key);
-    if (pending) return pending;
-    const failed = failedAt.get(key);
-    if (failed !== undefined && Date.now() - failed < FAILURE_BACKOFF_MS)
-        return Promise.resolve("failed");
-    const epoch = getRawSessionSummaryEpoch(sessionId);
-    const started = performance.now();
-    const work = runWorker({ path, sessionId }, options)
-        .then((result): RawOrdinalWarmupOutcome => {
-            let failure: RawOrdinalWarmupFailureReason;
-            let detail: string;
-            if ("scan" in result) {
-                try {
-                    if (installRawSessionSummaryScan(db, sessionId, result.scan, epoch)) {
-                        failedAt.delete(key);
-                        log(
-                            `[magic-context] canonical ordinals of ${sessionId} warmed off-thread (${result.scan.sessionRows} messages, ${Math.round(performance.now() - started)} ms)`,
-                        );
-                        return "warm";
-                    }
-                } catch {
-                    // The connection was closed or replaced while the worker ran.
-                }
-                failure = "superseded";
-                detail =
-                    "the session's summary rows were forgotten, or the connection changed, during the scan";
-            } else {
-                failure = result.failure;
-                detail = result.detail;
+    let shared = inFlight.get(key);
+    if (!shared) {
+        const failed = failedAt.get(key);
+        if (failed !== undefined && Date.now() - failed < FAILURE_BACKOFF_MS)
+            return Promise.resolve("failed");
+        const epoch = getRawSessionSummaryEpoch(sessionId);
+        const started = performance.now();
+        // A worker failure is recorded once, however many connections await it.
+        const result = runWorker({ path, sessionId }, options)
+            .then((outcome) => {
+                if ("failure" in outcome)
+                    recordFailure(key, sessionId, outcome.failure, outcome.detail);
+                return outcome;
+            })
+            .finally(() => {
+                if (inFlight.get(key) === scan) inFlight.delete(key);
+            });
+        const scan: SharedScan = { epoch, started, result };
+        inFlight.set(key, scan);
+        shared = scan;
+    }
+    const awaited = shared;
+    // Every connection that awaited the scan installs it on itself: candidate
+    // sets belong to a connection, so warming one does not warm another.
+    return awaited.result.then((result): RawOrdinalWarmupOutcome => {
+        if ("failure" in result) return "failed";
+        try {
+            if (installRawSessionSummaryScan(db, sessionId, result.scan, awaited.epoch)) {
+                failedAt.delete(key);
+                log(
+                    `[magic-context] canonical ordinals of ${sessionId} warmed off-thread (${result.scan.sessionRows} messages, ${Math.round(performance.now() - awaited.started)} ms)`,
+                );
+                return "warm";
             }
-            failures.set(failure, (failures.get(failure) ?? 0) + 1);
-            // A superseded scan is not a broken worker: the next call may try again.
-            if (failure !== "superseded") failedAt.set(key, Date.now());
-            log(
-                `[magic-context] WARN canonical ordinal warm-up failed for ${sessionId} (${failure}: ${detail}); a count that needs it scans the session on the calling thread`,
-            );
-            return "failed";
-        })
-        .finally(() => inFlight.delete(key));
-    inFlight.set(key, work);
-    return work;
+        } catch {
+            // The connection was closed or replaced while the worker ran.
+        }
+        recordFailure(
+            key,
+            sessionId,
+            "superseded",
+            "the session's summary rows were forgotten, or the connection changed, during the scan",
+        );
+        return "failed";
+    });
+}
+
+type WorkerResult =
+    | { scan: RawSessionSummaryScan }
+    | { failure: RawOrdinalWarmupFailureReason; detail: string };
+
+/** One worker scan of a store and session, shared by every connection that asks meanwhile. */
+interface SharedScan {
+    /** The session's summary epoch when the scan started; a later epoch makes it stale. */
+    epoch: number;
+    started: number;
+    result: Promise<WorkerResult>;
+}
+
+function recordFailure(
+    key: string,
+    sessionId: string,
+    failure: RawOrdinalWarmupFailureReason,
+    detail: string,
+): void {
+    failures.set(failure, (failures.get(failure) ?? 0) + 1);
+    // A superseded scan is not a broken worker: the next call may try again.
+    if (failure !== "superseded") failedAt.set(key, Date.now());
+    log(
+        `[magic-context] WARN canonical ordinal warm-up failed for ${sessionId} (${failure}: ${detail}); a count that needs it scans the session on the calling thread`,
+    );
 }

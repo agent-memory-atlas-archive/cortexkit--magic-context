@@ -8,6 +8,7 @@ import {
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
 import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
 import { removePendingOp } from "./storage-ops";
+import { tagIdentityRevisionKey } from "./storage-tag-identity-revision";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -771,11 +772,15 @@ interface TagOwnerRow {
  * no message. Another process can give them one later (the tool-owner backfill
  * that runs when an OpenCode process opens the store), so their ids are kept
  * and re-read by primary key after each such commit; there are none in
- * sessions created since owners were recorded. Other in-place rewrites of a
- * tag's owner, message id, number or reasoning count by another process are
- * not seen while the session's count and highest id are unchanged: only the
- * process serving a session re-keys its tags, and this process's own re-keys
- * move the generation.
+ * sessions created since owners were recorded.
+ *
+ * In-place rewrites of a tag's id, session, message id, number, type, owner or
+ * reasoning count are counted in the session's tag identity revision by every
+ * Magic Context connection (a connection-local trigger, see
+ * storage-tag-identity-revision.ts), read in the same statement as the count;
+ * a changed revision rebuilds. Rewrites by a connection that never installed
+ * that trigger (a tool editing the file directly) are not seen while the
+ * count and highest id still fit an append.
  *
  * Inside an open transaction it is neither used nor stored, since uncommitted
  * rows can still roll back.
@@ -789,6 +794,8 @@ interface TagOwnerSummary {
     rowCount: number;
     /** Ids of tool tags folded without an owner; another process may still adopt them. */
     unownedToolRows: Set<number>;
+    /** The session's tag identity revision when the summary was built or last checked. */
+    identityRevision: string | null;
     maxTagByOwner: Map<string, number>;
     /** Reasoning estimates per prose ratio, folded exactly as a full read would. */
     reasoningEstimatesByRatio: Map<number, Map<string, number>>;
@@ -872,10 +879,18 @@ function connectionInTransaction(db: Database): boolean {
  * and highest id, from one statement so all three describe the same commit.
  * The count and highest id come from the `(session_id, ...)` index alone.
  */
-const TAG_OWNER_APPENDED_WITH_SHAPE_SQL = `SELECT ${TAG_OWNER_COLUMNS}, 0 AS shape, NULL AS tag_count, NULL AS max_id
+const TAG_OWNER_APPENDED_WITH_SHAPE_SQL = `SELECT ${TAG_OWNER_COLUMNS}, 0 AS shape, NULL AS tag_count, NULL AS max_id, NULL AS revision
     FROM tags WHERE id > ? AND +session_id = ?
     UNION ALL
-    SELECT NULL, NULL, NULL, NULL, NULL, NULL, 1, COUNT(*), MAX(id) FROM tags WHERE session_id = ?`;
+    SELECT NULL, NULL, NULL, NULL, NULL, NULL, 1, COUNT(*), MAX(id), (SELECT value FROM schema_migrations_meta WHERE key = ?)
+    FROM tags WHERE session_id = ?`;
+
+function readTagIdentityRevision(db: Database, sessionId: string): string | null {
+    const row = db
+        .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+        .get(tagIdentityRevisionKey(sessionId)) as { value?: unknown } | null;
+    return typeof row?.value === "string" ? row.value : null;
+}
 
 /**
  * After another connection's commit: the rows it appended to the session, or
@@ -889,14 +904,22 @@ function appendedSinceForeignCommit(
     tagOwnerShapeChecks += 1;
     const rows = db
         .prepare(TAG_OWNER_APPENDED_WITH_SHAPE_SQL)
-        .all(cached.lastRowId, sessionId, sessionId) as Array<
-        TagOwnerRow & { shape: number; tag_count: number | null; max_id: number | null }
+        .all(cached.lastRowId, sessionId, tagIdentityRevisionKey(sessionId), sessionId) as Array<
+        TagOwnerRow & {
+            shape: number;
+            tag_count: number | null;
+            max_id: number | null;
+            revision: string | null;
+        }
     >;
     const shape = rows.find((row) => row.shape === 1);
     const appended = rows.filter((row) => row.shape === 0);
     const highest = appended.reduce((max, row) => Math.max(max, row.id), cached.lastRowId);
     if (
         !shape ||
+        // Another Magic Context connection rewrote a tag's identity or reasoning
+        // count in this session; the count and highest id cannot show that.
+        (shape.revision ?? null) !== cached.identityRevision ||
         shape.tag_count !== cached.rowCount + appended.length ||
         (shape.max_id ?? 0) !== highest
     )
@@ -972,6 +995,9 @@ function readTagOwnerSummary(
         lastRowId: 0,
         rowCount: 0,
         unownedToolRows: new Set(),
+        // Read before the rows: a rewrite landing in between makes the next
+        // check rebuild once more, never miss it.
+        identityRevision: readTagIdentityRevision(db, sessionId),
         maxTagByOwner: new Map(),
         reasoningEstimatesByRatio: new Map(
             ratios.slice(-MAX_CACHED_PROSE_RATIOS).map((ratio) => [ratio, new Map()]),

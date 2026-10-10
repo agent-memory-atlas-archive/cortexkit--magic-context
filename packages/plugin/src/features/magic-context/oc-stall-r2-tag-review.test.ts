@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import { initializeDatabase } from "./storage-db";
+import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import { getMaxTagNumberByOwnerMessage, getReasoningTokenEstimatesByMessage } from "./storage-tags";
 
 const SESSION = "ses-stall-r2-tags";
@@ -43,9 +44,17 @@ function withStore(run: (reader: Database, foreign: ForeignDatabase, path: strin
     }
 }
 
-function backfillAndAppend(local: boolean): void {
+/**
+ * `foreign`: another Magic Context connection (one that ran initializeDatabase
+ * installs the identity-revision trigger), outside this process's identity-write
+ * generation. `raw`: a connection that is not Magic Context's and never
+ * installed the trigger.
+ */
+function backfillAndAppend(writerKind: "local" | "foreign" | "raw"): void {
     withStore((reader, foreign) => {
-        const writer: Connection = local ? reader : foreign;
+        if (writerKind === "foreign")
+            installTagIdentityRevisionTrigger(foreign as unknown as Database);
+        const writer: Connection = writerKind === "local" ? reader : foreign;
         // An append-shaped commit need not consist only of appends: it can also
         // backfill a previously served message's reasoning estimate.
         writer.transaction(() => {
@@ -67,14 +76,20 @@ function backfillAndAppend(local: boolean): void {
             )
             .get(SESSION) as { n: number };
         expect(full.n).toBe(1000);
-        expect(getReasoningTokenEstimatesByMessage(reader, SESSION, 1).get("old")).toBe(full.n);
+        expect(getReasoningTokenEstimatesByMessage(reader, SESSION, 1).get("old")).toBe(
+            writerKind === "raw" ? 40 : full.n,
+        );
     });
 }
 
-test.failing("a foreign append plus reasoning backfill must refresh existing estimates even when count and max both grow", () =>
-    backfillAndAppend(false));
+test("a foreign append plus reasoning backfill must refresh existing estimates even when count and max both grow", () =>
+    backfillAndAppend("foreign"));
 test("append plus reasoning backfill: the same-process identity generation refreshes estimates", () =>
-    backfillAndAppend(true));
+    backfillAndAppend("local"));
+// Named limitation: a writer that is not a Magic Context connection does not
+// bump the identity revision, so an append-shaped commit hides its backfill.
+test("limitation: a raw connection's append plus reasoning backfill is not seen by a warm summary", () =>
+    backfillAndAppend("raw"));
 
 function replaceWithExplicitId(reopen: boolean): void {
     withStore((reader, foreign, path) => {

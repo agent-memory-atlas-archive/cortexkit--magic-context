@@ -99,13 +99,15 @@ test("mixed tuple write: scalar identity assignments refresh the reasoning cutof
 });
 
 /**
- * Another process rewrites a tag's number and reasoning count in place, which
- * leaves the session's tag count and highest id as they were. The summary keeps
- * its cached owners after such a commit: re-reading the session on every
- * foreign commit would cost a whole-session read on nearly every pass of a busy
- * host. No real writer does this to a session another process serves (only the
- * serving process re-keys its tags), so this test records the gap and the ways
- * it closes: a new connection, or any identity write by this process.
+ * A process that is not running Magic Context (here a plain bun:sqlite
+ * connection) rewrites a tag's number and reasoning count in place, which
+ * leaves the session's tag count and highest id as they were. Magic Context
+ * connections bump the session's tag identity revision on such a write (see
+ * storage-tag-identity-revision.ts); this one does not, so the summary keeps its
+ * cached owners. Re-reading the session on every foreign commit instead would
+ * cost a whole-session read on nearly every pass of a busy host. The test
+ * records the gap and the ways it closes: a new connection, or any identity
+ * write by this process.
  */
 test("external process writes (residual): an in-place re-key keeping count and highest id is seen only after invalidation", async () => {
     const { dir, cleanup } = createTestTempDir("mc-stall-cache-review-");

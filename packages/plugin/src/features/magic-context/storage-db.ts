@@ -73,6 +73,7 @@ import {
 } from "./migrations";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
+import { installTagIdentityRevisionTrigger } from "./storage-tag-identity-revision";
 import {
     loadToolDefinitionMeasurements,
     setDatabase as setToolDefinitionDatabase,
@@ -2538,6 +2539,9 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // Fresh stores include the v95 temporal decision table. Older stores wait
     // for the same migration step rather than installing a new schema lane.
     if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
+    // Connection-local: lets other connections' tag caches see this connection's
+    // tag identity and reasoning-count rewrites (see storage-tag-identity-revision.ts).
+    installTagIdentityRevisionTrigger(db);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
@@ -2691,6 +2695,8 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             }
         } else runMigrations(db);
         ensureContextStoreUuid(db);
+        // A migration that rebuilt `tags` would have dropped the connection's trigger.
+        installTagIdentityRevisionTrigger(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
         // The connection is not cached until the open succeeds, so nothing else
@@ -2824,6 +2830,8 @@ export async function openDatabaseAsync(
                 );
             }
             ensureContextStoreUuid(db);
+            // A migration that rebuilt `tags` would have dropped the connection's trigger.
+            installTagIdentityRevisionTrigger(db);
             const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
             migrateMs = performance.now() - migrateStartedAt;
             return opened;

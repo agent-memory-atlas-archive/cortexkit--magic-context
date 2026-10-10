@@ -6,13 +6,13 @@ import { join } from "node:path";
 import { OPENCODE1_MESSAGE_PART_SCHEMA } from "../../features/magic-context/__tests__/opencode1-query-fixture";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
-import { prepareRawSessionOrdinals, setRawMessageProvider } from "./read-session-chunk";
 import {
     getRawOrdinalWarmupFailures,
     prewarmRawSessionOrdinalsForDb,
     resetRawSessionOrdinalWarmupsForTest,
     stopRawSessionOrdinalWarmups,
 } from "./raw-ordinal-warmup";
+import { prepareRawSessionOrdinals, setRawMessageProvider } from "./read-session-chunk";
 import {
     countRawSessionMessageOrdinalsFromDb,
     forgetRawSessionSummaryRows,
@@ -78,7 +78,7 @@ async function coalescedConnections(retrySecond: boolean): Promise<void> {
     });
 }
 
-test.failing("coalesced warm-up must install candidates on every awaiting connection", () =>
+test("coalesced warm-up must install candidates on every awaiting connection", () =>
     coalescedConnections(false));
 test("coalesced warm-up: a second prepare on the other connection actually warms it", () =>
     coalescedConnections(true));

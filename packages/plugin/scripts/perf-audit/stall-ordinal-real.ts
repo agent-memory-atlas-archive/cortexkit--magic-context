@@ -17,6 +17,7 @@ import { join, resolve } from "node:path";
 import { Database as RawDatabase } from "bun:sqlite";
 import { OPENCODE1_MESSAGE_PART_SCHEMA } from "../../src/features/magic-context/__tests__/opencode1-query-fixture";
 import { initializeDatabase } from "../../src/features/magic-context/storage-db";
+import { installTagIdentityRevisionTrigger } from "../../src/features/magic-context/storage-tag-identity-revision";
 import {
     getMaxTagNumberByOwnerMessage,
     getReasoningTokenEstimatesByMessage,
@@ -230,6 +231,26 @@ const targetTime = 1_700_000_000_000 + targetIndex * 10;
     resetRawSessionOrdinalJsonRowsReadForTest();
     const sessionCount = time(() => countRawSessionMessageOrdinalsFromDb(reader, SESSION));
     const sessionCountJson = getRawSessionOrdinalJsonRowsReadForTest();
+    // Cost of the read transaction the indexed count runs in: 2,000 warm session
+    // counts, each in its own BEGIN/ROLLBACK, against the bare statements.
+    const counts = time(() => {
+        for (let step = 0; step < 2_000; step += 1) countRawSessionMessageOrdinalsFromDb(reader, SESSION);
+    });
+    const bare = reader.prepare("SELECT 1 AS one");
+    const wrapped = time(() => {
+        for (let step = 0; step < 2_000; step += 1) {
+            reader.exec("BEGIN");
+            bare.get();
+            reader.exec("ROLLBACK");
+        }
+    });
+    const plain = time(() => {
+        for (let step = 0; step < 2_000; step += 1) bare.get();
+    });
+    results.read_snapshot_overhead = {
+        session_count_warm_mean_ms: Math.round((counts.ms / 2_000) * 1000) / 1000,
+        begin_rollback_mean_us: Math.round(((wrapped.ms - plain.ms) / 2_000) * 1000 * 10) / 10,
+    };
     // Equality with the old statement on the last appended message.
     const lastId = id(SESSION, MESSAGES + 9);
     const lastRow = reader.prepare("SELECT time_created FROM message WHERE id = ?").get(lastId) as {
@@ -306,6 +327,10 @@ async function longestBlock(
     const db = new Database(contextPath);
     const other = new RawDatabase(contextPath);
     other.exec("PRAGMA busy_timeout = 5000");
+    // The other connection stands in for another Magic Context host: it bumps
+    // the session's tag identity revision on identity writes, as every Magic
+    // Context connection does.
+    installTagIdentityRevisionTrigger(other as unknown as Database);
     const pass = () => {
         resetTagOwnerRowsReadForTest();
         const elapsed = time(() => {
