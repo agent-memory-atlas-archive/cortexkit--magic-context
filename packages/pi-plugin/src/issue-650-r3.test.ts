@@ -17,7 +17,10 @@ import { saveSourceContent } from "@magic-context/core/features/magic-context/st
 import { insertTag } from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
-import type { Database } from "@magic-context/core/shared/sqlite";
+import {
+	type Database,
+	getTagIdentityWriteGeneration,
+} from "@magic-context/core/shared/sqlite";
 import {
 	__test,
 	clearContextHandlerSession,
@@ -140,6 +143,48 @@ test("issue 650 r3: a row an older build stored under an index-bearing id moves 
 		expect(isPiContentFallbackId(rows[0]!.message_id)).toBe(true);
 		// The next pass serves the note with the same number again.
 		expect(await serveNote(db, sessionId, [note, hello])).toBe(served);
+	} finally {
+		db.close();
+	}
+});
+
+test("issue 650 r3: re-keying an older build's message row counts as a tag identity write", () => {
+	// Caches built from the tags table (the reasoning-budget and tag summaries)
+	// rebuild only when the identity-write generation moves; a row moving from
+	// `pi-msg-<index>-…` to the position-independent id changes its message id.
+	const db = createTestDb();
+	const sessionId = session("rekey-generation");
+	try {
+		const note = userMessage("Context notes: build is green", 5);
+		const fingerprint = piMessageEntryFingerprint(note)!;
+		insertTag(
+			db,
+			sessionId,
+			"pi-msg-1-5-user:p0",
+			"message",
+			40,
+			42,
+			0,
+			null,
+			0,
+			null,
+			fingerprint,
+		);
+		const [fallbackId] = piContentFallbackIds([note], none);
+		const before = getTagIdentityWriteGeneration();
+		__test.adoptPiFallbackTags(
+			db,
+			sessionId,
+			createTagger(),
+			new Map([[fallbackId!, fingerprint]]),
+			{ allowUnprovenRebuild: true },
+		);
+		expect(
+			db
+				.prepare("SELECT message_id FROM tags WHERE session_id = ?")
+				.get(sessionId),
+		).toEqual({ message_id: `${fallbackId}:p0` });
+		expect(getTagIdentityWriteGeneration()).toBeGreaterThan(before);
 	} finally {
 		db.close();
 	}
