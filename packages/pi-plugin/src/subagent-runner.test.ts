@@ -1303,7 +1303,7 @@ describe("subagent-runner pure helpers", () => {
 });
 
 describe("PiSubagentRunner spawn lifecycle", () => {
-	it("records OMP message_end usage in subagent_invocations", async () => {
+	it("records OMP usage and message provider for an unqualified model ref", async () => {
 		__setPiHarnessKindForTesting("omp");
 		const child = createMockChild();
 		const { runner } = runnerWith(child, {
@@ -1320,7 +1320,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		try {
 			const resultPromise = runner.run({
 				...baseOptions,
-				model: "anthropic/claude-sonnet",
+				model: "gpt-6.1-sol",
 				accountingSessionId: "omp-accounting-session",
 				accountingSubagent: "historian",
 			});
@@ -1347,6 +1347,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 				type: "message_end",
 				message: {
 					role: "assistant",
+					providerID: "openai",
+					modelID: "gpt-6.1-sol",
 					content: [{ type: "text", text: "done" }],
 					stopReason: "stop",
 					usage: {
@@ -1371,6 +1373,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			const [row] = getSubagentInvocations(db, "omp-accounting-session");
 			expect(row).toMatchObject({
 				harness: "omp",
+				providerId: "openai",
+				modelId: "gpt-6.1-sol",
 				inputTokens: 1_600,
 				outputTokens: 110,
 				cacheReadTokens: 400,

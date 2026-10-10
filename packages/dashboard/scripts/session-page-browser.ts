@@ -74,6 +74,66 @@ const compartments = [
     legacy: 0,
   },
 ].map((comp) => ({ ...comp, session_id: "fixture-session" }));
+const historianRows = {
+  "oc-fixture-session": [
+    {
+      id: 101,
+      session_id: "oc-fixture-session",
+      harness: "opencode",
+      subagent: "historian",
+      task: null,
+      provider_id: "anthropic",
+      model_id: "claude-sonnet-4-5",
+      started_at: Date.UTC(2026, 4, 1, 15, 20),
+      ended_at: Date.UTC(2026, 4, 1, 15, 21, 14, 383),
+      status: "completed",
+      input_tokens: 40_200,
+      output_tokens: 2_200,
+      cache_read_tokens: 32_100,
+      cache_write_tokens: 1_800,
+      error: null,
+      parent_invocation_id: null,
+    },
+  ],
+  "pi-fixture-session": [
+    {
+      id: 201,
+      session_id: "pi-fixture-session",
+      harness: "pi",
+      subagent: "historian",
+      task: "fallback",
+      provider_id: "openai",
+      model_id: "gpt-6.1-sol",
+      started_at: Date.UTC(2026, 4, 1, 16, 20),
+      ended_at: Date.UTC(2026, 4, 1, 16, 21, 14, 383),
+      status: "completed",
+      input_tokens: 40_200,
+      output_tokens: 2_200,
+      cache_read_tokens: 32_100,
+      cache_write_tokens: 1_800,
+      error: null,
+      parent_invocation_id: null,
+    },
+    {
+      id: 202,
+      session_id: "pi-fixture-session",
+      harness: "pi",
+      subagent: "historian",
+      task: null,
+      provider_id: null,
+      model_id: "gemini-3.8-flash",
+      started_at: Date.UTC(2026, 4, 1, 15, 20),
+      ended_at: Date.UTC(2026, 4, 1, 15, 22),
+      status: "completed",
+      input_tokens: 14_000,
+      output_tokens: 900,
+      cache_read_tokens: 8_000,
+      cache_write_tokens: 400,
+      error: null,
+      parent_invocation_id: null,
+    },
+  ],
+};
 const longPiPath = "/Users/fixture/.pi/agent/sessions/-Users-fixture-Work-fixture-project/2026-05-01T16-48-44-508Z_019de471-4fdc-762d-9286-624dfad0b5fe.jsonl";
 const sessionDetail = (isPi: boolean) => ({
   harness: isPi ? "pi" : "opencode",
@@ -123,7 +183,6 @@ const responses = {
   list_sessions_paged: { rows: sessionRows, total: sessionRows.length, has_more: false, conditions: [] },
   get_session_messages: [],
   get_smart_notes: [],
-  get_subagent_invocations: [],
   get_subagent_totals_by_subagent: [],
 };
 const preload = (theme: string) => `(() => {
@@ -133,6 +192,7 @@ const preload = (theme: string) => `(() => {
     invoke: async (cmd, args) => {
       if (cmd === 'plugin:updater|check') return null;
       if (cmd.startsWith('plugin:')) return null;
+      if (cmd === 'get_subagent_invocations') return ${JSON.stringify(historianRows)}[args.sessionId] || [];
       if (cmd === 'get_session_detail') return ${JSON.stringify(sessionDetail(false))}.session_id === args.sessionId
         ? ${JSON.stringify(sessionDetail(false))}
         : ${JSON.stringify(sessionDetail(true))};
@@ -255,9 +315,43 @@ try {
         if (!headerAligned) throw new Error("Session header controls do not share a centered row");
       }
       const screenshot = await send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: false }, browserSession);
-      const filename = join(output, `${theme}-900-${kind}.png`);
-      writeFileSync(filename, Buffer.from(screenshot.data, "base64"));
-      console.log(`captured ${filename}`);
+      const sessionFilename = join(output, `${theme}-900-${kind}-session.png`);
+      writeFileSync(sessionFilename, Buffer.from(screenshot.data, "base64"));
+      console.log(`captured ${sessionFilename}`);
+      await evalPage("[...document.querySelectorAll('.tab-pill')].find((button) => button.textContent.includes('Historian'))?.click()");
+      await waitFor(".kv-table");
+      await settle();
+      if (process.env.SESSION_PAGE_EXPECT_PI_DATES) {
+        const historianLooksFormatted = await evalPage(`(() => {
+          const table = document.querySelector('.historian-table');
+          if (!table) return false;
+          const text = table.innerText;
+          return text.includes('Provider / Model') && text.includes('74.4 s') &&
+            text.includes('40.2k in · 2.2k out');
+        })()`);
+        if (!historianLooksFormatted) throw new Error("Historian provider, fallback, duration, or token formatting is missing");
+        const historianFitsViewport = await evalPage(`(() => {
+          const table = document.querySelector('.historian-table');
+          if (!table) return false;
+          const cells = table.querySelector('tbody tr')?.children;
+          if (!cells || cells.length !== 7) return false;
+          return table.scrollWidth <= table.clientWidth + 1 &&
+            table.getBoundingClientRect().right <= innerWidth &&
+            cells[3].textContent.trim() === 'completed' &&
+            cells[4].textContent.trim() === '74.4 s' &&
+            cells[5].getAttribute('title')?.includes('40,200') &&
+            cells[5].getAttribute('title')?.includes('2,200');
+        })()`);
+        if (!historianFitsViewport) throw new Error("Historian columns overflow or omit full token counts at 900px");
+        if (kind === "pi") {
+          const piHistorianLabels = await evalPage("document.querySelector('.historian-table')?.innerText.includes('fallback') && document.querySelector('.historian-table')?.innerText.includes('— / gemini-3.8-flash')");
+          if (!piHistorianLabels) throw new Error("Pi fixture provider placeholder or fallback marker is missing");
+        }
+      }
+      const historianScreenshot = await send<{ data: string }>("Page.captureScreenshot", { format: "png", captureBeyondViewport: false }, browserSession);
+      const historianFilename = join(output, `${theme}-900-${kind}-historian.png`);
+      writeFileSync(historianFilename, Buffer.from(historianScreenshot.data, "base64"));
+      console.log(`captured ${historianFilename}`);
       if (kind === "opencode") {
         await evalPage("document.querySelector('.section-header .btn.sm').click()");
         await waitFor(".project-detail-body .scroll-area button.card");

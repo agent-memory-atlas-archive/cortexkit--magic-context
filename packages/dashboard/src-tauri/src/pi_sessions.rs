@@ -1331,6 +1331,9 @@ mod tests {
         };
         {
             let _guard = set_test_omp_environment(environment.clone());
+            let pi_session_root = home.path().join("isolated-pi-sessions");
+            fs::create_dir_all(&pi_session_root).unwrap();
+            set_test_root_for_tests(pi_session_root);
             assert!(scan_omp_session_dir().is_empty());
             assert!(scan_pi_compatible_session_dir()
                 .iter()

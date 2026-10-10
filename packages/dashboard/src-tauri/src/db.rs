@@ -7744,6 +7744,53 @@ pub fn get_subagent_invocations(
     rows.collect()
 }
 
+#[cfg(test)]
+mod subagent_invocation_reader_tests {
+    use super::*;
+
+    #[test]
+    fn reads_stored_provider_and_preserves_missing_provider() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE subagent_invocations (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                subagent TEXT NOT NULL,
+                task TEXT,
+                provider_id TEXT,
+                model_id TEXT,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                status TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_read_tokens INTEGER NOT NULL,
+                cache_write_tokens INTEGER NOT NULL,
+                error TEXT,
+                parent_invocation_id INTEGER
+            );
+            INSERT INTO subagent_invocations VALUES
+                (1, 'session', 'pi', 'historian', NULL, 'openai', 'gpt-6.1-sol', 10, 20, 'completed', 100, 20, 50, 5, NULL, NULL),
+                (2, 'session', 'pi', 'historian', NULL, NULL, 'gemini-3.8-flash', 30, 40, 'completed', 200, 30, 80, 8, NULL, NULL);",
+        )
+        .unwrap();
+
+        let rows = get_subagent_invocations(&conn, "session").unwrap();
+
+        let openai = rows
+            .iter()
+            .find(|row| row.model_id.as_deref() == Some("gpt-6.1-sol"))
+            .unwrap();
+        let missing = rows
+            .iter()
+            .find(|row| row.model_id.as_deref() == Some("gemini-3.8-flash"))
+            .unwrap();
+        assert_eq!(openai.provider_id.as_deref(), Some("openai"));
+        assert_eq!(missing.provider_id, None);
+    }
+}
+
 pub fn get_subagent_totals_by_subagent(
     conn: &Connection,
     session_id: &str,

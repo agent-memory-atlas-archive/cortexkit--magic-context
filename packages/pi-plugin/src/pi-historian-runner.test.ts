@@ -781,6 +781,16 @@ describe("runPiHistorian", () => {
 				"fallback/model",
 				"session/model",
 			]);
+			const options = (
+				runner.run as unknown as {
+					mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+				}
+			).mock.calls.map(([invocation]) => invocation);
+			expect(options.map((invocation) => invocation.accountingTask)).toEqual([
+				undefined,
+				"fallback",
+				"fallback-session",
+			]);
 			expect(getCompartments(db, "ses-historian")).toEqual([
 				expect.objectContaining({ title: "Initial Pi slice" }),
 			]);

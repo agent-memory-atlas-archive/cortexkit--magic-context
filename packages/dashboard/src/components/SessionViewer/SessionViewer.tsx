@@ -27,6 +27,11 @@ import {
   updateSessionFact,
 } from "../../lib/api";
 import { LoadMoreTrigger } from "../../lib/load-more";
+import {
+  formatHistorianDuration,
+  formatHistorianProviderModel,
+  formatHistorianTokens,
+} from "./historian-format";
 import { formatCompartmentDateSpan } from "./session-dates";
 import type { HarnessFilter } from "./session-filter";
 import { parseStoredHarnessFilter, sessionHarnessOptions } from "./session-filter";
@@ -1738,12 +1743,12 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
               when={historianInvocations().length > 0}
               fallback={<div class="empty-state">No historian invocations recorded</div>}
             >
-              <table class="kv-table">
+              <table class="kv-table historian-table">
                 <thead>
                   <tr>
                     <th>Started</th>
                     <th>Subagent</th>
-                    <th>Model</th>
+                    <th>Provider / Model</th>
                     <th>Status</th>
                     <th>Duration</th>
                     <th>Tokens</th>
@@ -1755,8 +1760,22 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                     {(row) => (
                       <tr style={{ "padding-left": row.parent_invocation_id ? "16px" : undefined }}>
                         <td>{formatDateTime(row.started_at)}</td>
-                        <td>{row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}</td>
-                        <td>{row.model_id ?? row.provider_id ?? "—"}</td>
+                        <td>
+                          {row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}
+                          <Show when={row.task === "fallback" || row.task === "fallback-session"}>
+                            <span
+                              class="pill gray historian-fallback"
+                              title={
+                                row.task === "fallback-session"
+                                  ? "Session model used as the final fallback"
+                                  : "Configured fallback model"
+                              }
+                            >
+                              fallback
+                            </span>
+                          </Show>
+                        </td>
+                        <td>{formatHistorianProviderModel(row.provider_id, row.model_id)}</td>
                         <td>
                           {row.status === "timed_out"
                             ? "Timed out"
@@ -1764,16 +1783,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               ? "Empty output"
                               : row.status}
                         </td>
-                        <td>
-                          {row.ended_at
-                            ? `${Math.max(0, row.ended_at - row.started_at).toLocaleString()}ms`
-                            : "—"}
-                        </td>
+                        <td>{formatHistorianDuration(row.started_at, row.ended_at)}</td>
                         <td
-                          title={`in ${row.input_tokens.toLocaleString()} · out ${row.output_tokens.toLocaleString()} · cache ${row.cache_read_tokens.toLocaleString()}/${row.cache_write_tokens.toLocaleString()}`}
+                          title={`Input: ${row.input_tokens.toLocaleString()} · Output: ${row.output_tokens.toLocaleString()} · Cache read: ${row.cache_read_tokens.toLocaleString()} · Cache write: ${row.cache_write_tokens.toLocaleString()}`}
                         >
-                          input: {row.input_tokens.toLocaleString()} · output:{" "}
-                          {row.output_tokens.toLocaleString()}
+                          {formatHistorianTokens(row.input_tokens, row.output_tokens)}
                         </td>
                         <td>{row.error ?? "—"}</td>
                       </tr>
