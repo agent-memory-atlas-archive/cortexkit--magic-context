@@ -28,7 +28,7 @@ const OPTIONS: UnifiedSearchOptions = {
     measurementDisabled: true,
 };
 
-test.failing("silent worker: the message lane must resolve to fallback within a bounded wait", async () => {
+test("silent worker: the message lane must resolve to fallback within a bounded wait", async () => {
     const { dir, cleanup } = createTestTempDir("mc-stall-search-review-");
     const db = new Database(join(dir, "context.db"));
     const request = {

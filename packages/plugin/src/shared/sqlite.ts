@@ -280,15 +280,52 @@ export function mayChangeTagIdentity(sql: string): boolean {
     }
     const update = /^\s*UPDATE\s+(?:main\.)?["`]?tags["`]?\s+SET\s+([\s\S]*?)\bWHERE\b/i.exec(sql);
     if (update && !/\bSELECT\b/i.test(sql)) {
-        const assigned = [...(update[1] ?? "").matchAll(/(?:^|,)\s*["`]?(\w+)["`]?\s*=/g)].map(
-            (match) => (match[1] ?? "").toLowerCase(),
-        );
-        return (
-            assigned.length === 0 ||
-            assigned.some((column) => !TAG_COLUMNS_OUTSIDE_IDENTITY.has(column))
-        );
+        // Provably identity-free only when every top-level assignment is a plain
+        // `column = ...` naming an allowed column. A tuple assignment such as
+        // `(tag_number, reasoning_token_count) = (...)`, or anything this cannot
+        // read, counts as an identity write.
+        const assignments = topLevelCommaSegments(update[1] ?? "");
+        if (!assignments) return true;
+        return !assignments.every((assignment) => {
+            const column = /^\s*["`]?(\w+)["`]?\s*=(?!=)/.exec(assignment)?.[1];
+            return column !== undefined && TAG_COLUMNS_OUTSIDE_IDENTITY.has(column.toLowerCase());
+        });
     }
     return true;
+}
+
+/**
+ * Split SQL text at commas outside parentheses and quotes. Returns null when
+ * the parentheses or quotes do not balance.
+ */
+function topLevelCommaSegments(text: string): string[] | null {
+    const segments: string[] = [];
+    let depth = 0;
+    let quote: string | null = null;
+    let start = 0;
+    for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (quote) {
+            // A doubled quote inside a quoted run is an escaped quote.
+            if (char === quote) {
+                if (text[index + 1] === quote) index += 1;
+                else quote = null;
+            }
+            continue;
+        }
+        if (char === "'" || char === '"' || char === "`") quote = char;
+        else if (char === "(") depth += 1;
+        else if (char === ")") {
+            depth -= 1;
+            if (depth < 0) return null;
+        } else if (char === "," && depth === 0) {
+            segments.push(text.slice(start, index));
+            start = index + 1;
+        }
+    }
+    if (quote || depth !== 0) return null;
+    segments.push(text.slice(start));
+    return segments;
 }
 
 /**
@@ -360,6 +397,7 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
                         },
                     });
                 }
+                if (changesTagIdentity) wrapRemainingTagWriteForms(statement);
             }
             return statement;
         },
@@ -408,6 +446,43 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             return defaultTransaction;
         },
     });
+}
+
+/**
+ * Count tag identity writes made through the statement forms the transaction
+ * routing does not wrap. `iterate()` runs the statement while its result is
+ * consumed, so the generation moves both when iteration starts and when it
+ * ends: a summary read in between is then rebuilt on its next read.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: statements from both backends share these method names.
+function wrapRemainingTagWriteForms(statement: any): void {
+    if (typeof statement.iterate === "function") {
+        const iterate = statement.iterate.bind(statement);
+        Object.defineProperty(statement, "iterate", {
+            configurable: true,
+            value: function* (...args: unknown[]) {
+                tagIdentityWriteGeneration += 1;
+                try {
+                    yield* iterate(...args);
+                } finally {
+                    tagIdentityWriteGeneration += 1;
+                }
+            },
+        });
+    }
+    if (typeof statement.values === "function") {
+        const values = statement.values.bind(statement);
+        Object.defineProperty(statement, "values", {
+            configurable: true,
+            value: (...args: unknown[]) => {
+                try {
+                    return values(...args);
+                } finally {
+                    tagIdentityWriteGeneration += 1;
+                }
+            },
+        });
+    }
 }
 
 function trackSqliteConnection(

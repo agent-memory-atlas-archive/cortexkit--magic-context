@@ -48,7 +48,7 @@ function expectCommittedProjection(db: Database): void {
 const UPDATE_RETURNING =
     "UPDATE tags SET tag_number = 6, reasoning_token_count = 1000 WHERE session_id = ? AND message_id = 'old' RETURNING tag_number";
 
-test.failing("iterate write: consuming UPDATE RETURNING must refresh the reasoning cutoff", () => {
+test("iterate write: consuming UPDATE RETURNING must refresh the reasoning cutoff", () => {
     const db = new Database(":memory:");
     try {
         seed(db);
@@ -69,7 +69,7 @@ test("iterate write: executing the same UPDATE RETURNING with all refreshes the 
     }
 });
 
-test.failing("mixed tuple write: status plus identity assignments must refresh the reasoning cutoff", () => {
+test("mixed tuple write: status plus identity assignments must refresh the reasoning cutoff", () => {
     const db = new Database(":memory:");
     try {
         seed(db);

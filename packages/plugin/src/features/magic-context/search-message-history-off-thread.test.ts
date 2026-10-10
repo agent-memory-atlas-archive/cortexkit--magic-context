@@ -2,7 +2,10 @@
 
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
-import { searchMessageHistoryOffThread } from "../../hooks/magic-context/auto-search-worker-client";
+import {
+    getMessageSearchWorkerFallbacks,
+    searchMessageHistoryOffThread,
+} from "../../hooks/magic-context/auto-search-worker-client";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDir } from "../../shared/test-temp-dir";
 import { ensureMessagesIndexed } from "./message-index";
@@ -120,6 +123,44 @@ describe("message search off the serving thread", () => {
             cleanup();
         }
     }, 60_000);
+
+    it("falls back to the in-process lane, and counts it, when an accepted worker never answers", async () => {
+        const { dir: directory, cleanup } = createTestTempDir("mc-search-worker-");
+        const db = new Database(join(directory, "context.db"));
+        const silent = new URL(
+            "../../hooks/magic-context/message-search-accepting-silent-worker.fixture.ts",
+            import.meta.url,
+        );
+        try {
+            initializeDatabase(db);
+            seed(db);
+            const before = getMessageSearchWorkerFallbacks().get("no-result") ?? 0;
+            let answered: unknown = "unset";
+            const results = await unifiedSearch(
+                db,
+                SESSION,
+                "git:off-thread",
+                QUERY,
+                options({
+                    searchMessageHistory: async (request) => {
+                        answered = await searchMessageHistoryOffThread(db, request, silent, {
+                            resultMs: 300,
+                        });
+                        return answered as null;
+                    },
+                }),
+            );
+            expect(answered).toBeNull();
+            expect(getMessageSearchWorkerFallbacks().get("no-result") ?? 0).toBe(before + 1);
+            expect(results.length).toBeGreaterThan(3);
+            expect(results).toEqual(
+                await unifiedSearch(db, SESSION, "git:off-thread", QUERY, options()),
+            );
+        } finally {
+            db.close();
+            cleanup();
+        }
+    }, 30_000);
 
     it("runs the lane in process when no worker can open the store", async () => {
         const db = new Database(":memory:");
