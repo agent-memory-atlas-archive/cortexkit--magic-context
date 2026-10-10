@@ -298,7 +298,7 @@ describe("model-resolution", () => {
             primary: { model: "open/cues", qualifier: "low" },
             fallbacks: [{ model: "open/cues-fallback" }],
         });
-        // A task override without its own qualifier borrows the harness default's.
+        // A task override without its own qualifier uses the harness default's qualifier.
         expect(
             resolveDreamerTaskModel({ config, harness: "pi", task: "compress-cues" }),
         ).toMatchObject({

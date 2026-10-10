@@ -48,9 +48,11 @@ const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descrip
  *                   on for an agent whose allow-list intentionally excludes it.
  * Dreamer model/cadence fields are deliberately NOT stripped: a repo may tune
  * its own dreamer overlays and schedules through the user's provider auth.
- * Every dreamer task reads project memory, and compress-cues is no exception:
- * its model comes from dreamer.<harness>.tasks.compress-cues or the harness
- * default, so a project can choose it exactly as it can for any other task.
+ * Every dreamer task sends project memory to its model, so a repository that
+ * sets a dreamer model chooses where that memory goes; the project-tier allowance
+ * above accepts that. compress-cues follows the same rule: its model comes from
+ * dreamer.<harness>.tasks.compress-cues or the harness default, so a project
+ * can choose it exactly as it can for any other task.
  * Historian model selection stays USER-tier only, and compaction thresholds are
  * project raise-only, so a cloned repo cannot force earlier compaction or extra
  * historian spend on the user's dime.
