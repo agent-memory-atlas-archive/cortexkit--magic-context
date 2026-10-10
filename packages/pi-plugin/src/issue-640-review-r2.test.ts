@@ -2,7 +2,11 @@ import { expect, spyOn, test } from "bun:test";
 import * as embedding from "@magic-context/core/features/magic-context/memory/embedding";
 import * as projectIdentity from "@magic-context/core/features/magic-context/memory/project-identity";
 import { getAutoSearchHintDecisions } from "@magic-context/core/features/magic-context/storage-meta-persisted";
-import { adoptPiFallbackMessageTag } from "@magic-context/core/features/magic-context/storage-tags";
+import { getPendingOps } from "@magic-context/core/features/magic-context/storage-ops";
+import {
+	adoptPiFallbackMessageTag,
+	PiTagIdentityConflictError,
+} from "@magic-context/core/features/magic-context/storage-tags";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { autoSearchTestSnapshot } from "@magic-context/core/hooks/magic-context/auto-search-snapshot.fixture";
 import * as search from "@magic-context/core/hooks/magic-context/auto-search-worker-client";
@@ -270,7 +274,7 @@ test("r2: an unserved racing real row is not served evidence merely because user
 	}
 });
 
-test("r2: three-row unserved ordinal collision retains the canonical real number", () => {
+test("r2: three-row unserved ordinal collision refuses without changing any row", () => {
 	const db = createTestDb();
 	const sessionId = "r2-three-way";
 	const raw = userMessage("same identity", 1);
@@ -288,18 +292,21 @@ test("r2: three-row unserved ordinal collision retains the canonical real number
 			db.prepare(
 				"INSERT INTO tags(message_id,type,status,session_id,tag_number,byte_size,entry_fingerprint) VALUES (?,'message','active',?,?,0,?)",
 			).run(id, sessionId, number, fingerprint);
-		__test.adoptPiFallbackTags(
-			db,
-			sessionId,
-			createTagger(),
-			new Map([["real", fingerprint]]),
-		);
+		expect(() =>
+			__test.adoptPiFallbackTags(
+				db,
+				sessionId,
+				createTagger(),
+				new Map([["real", fingerprint]]),
+			),
+		).toThrow(PiTagIdentityConflictError);
 		expect(
 			db
 				.prepare("SELECT message_id,tag_number FROM tags ORDER BY tag_number")
 				.all(),
 		).toEqual([
-			{ message_id: "real:p1", tag_number: 2 },
+			{ message_id: "pi-msg-a:p0", tag_number: 1 },
+			{ message_id: "pi-msg-a:p1", tag_number: 2 },
 			{ message_id: "real:p0", tag_number: 9 },
 		]);
 	} finally {
@@ -371,12 +378,22 @@ test("r2: same-connection revision change discovers a historical fallback drop",
 		});
 		restore = () => spy.mockRestore();
 		const next = [structuredClone(historical), userMessage("tail", 2)];
+		// The changed local revision must discover the dropped alias, preserving
+		// active bytes now and leaving the drop queued for a later execute.
 		const result = await handler(
 			{ messages: next },
 			fakeContext(sessionId, process.cwd(), ["history", "tail"], next),
 		);
 		expect(inserted).toBe(true);
-		expect(textOf(result.messages[0])).toBe("[dropped §1§]");
+		expect(textOf(result.messages[0])).toBe("§1§ historical text");
+		expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([1]);
+		expect(
+			db
+				.prepare(
+					"SELECT tag_number,status FROM tags WHERE session_id=? AND tag_number IN (1,9) ORDER BY tag_number",
+				)
+				.all(sessionId),
+		).toEqual([{ tag_number: 1, status: "active" }]);
 	} finally {
 		restore?.();
 		clearContextHandlerSession(sessionId);

@@ -1702,6 +1702,7 @@ fn transform_decision_reason_label(reason: &str) -> Option<&'static str> {
         "epoch_change" => Some("Epoch change"),
         "coverage_fold" => Some("Coverage fold"),
         "profile_transition" => Some("Profile transition"),
+        "tag_identity_repair" => Some("Tag identity repair"),
         _ => None,
     }
 }
@@ -10868,6 +10869,7 @@ mod cache_turn_tests {
             ("epoch_change", "Epoch change"),
             ("coverage_fold", "Coverage fold"),
             ("profile_transition", "Profile transition"),
+            ("tag_identity_repair", "Tag identity repair"),
         ] {
             let cause = TransformDecisionCause {
                 decision: "execute".to_string(),

@@ -574,7 +574,11 @@ describe("Pi pressure guards", () => {
 			expect(src).toContain("let pendingOpsDidMutate = false");
 			expect(src).toContain("let heuristicOrReasoningDidMutate = false");
 			expect(src).toContain(
-				"const isCacheBustingPass = hasReclaimRide(rideSignals)",
+				"let isCacheBustingPass = hasReclaimRide(rideSignals)",
+			);
+			expect(src).toContain("if (identityRebuild) {");
+			expect(src).toContain(
+				'args.schedulerDecision = "execute"; isCacheBustingPass = true;',
 			);
 			expect(src).toContain(
 				"const toolReclaimApplicationOpportunity = isCacheBustingPass",
@@ -1434,6 +1438,12 @@ describe("Pi fallback tag adoption", () => {
 				},
 			);
 			saveSource(db, sessionId, 20, "duplicate source");
+			updateTagStatus(db, sessionId, 20, "dropped");
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "[dropped §20§]")],
+				{ servedTagNumbers: [20] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 10);
 			tagger.bindToolTag(sessionId, callId, realOwner, 20);
 
@@ -1494,6 +1504,11 @@ describe("Pi fallback tag adoption", () => {
 			insertTag(db, sessionId, callId, "tool", 20, 31, 0, "Read", 0, realOwner);
 			queuePendingOp(db, sessionId, 30, "drop", 100);
 			queuePendingOp(db, sessionId, 31, "drop", 101);
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "§31§ result")],
+				{ servedTagNumbers: [31] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 30);
 			tagger.bindToolTag(sessionId, callId, realOwner, 31);
 
@@ -1766,6 +1781,11 @@ describe("Pi fallback tag adoption", () => {
 			insertTag(db, sessionId, callId, "tool", 10, 90, 0, "Read", 0, piOwner);
 			insertTag(db, sessionId, callId, "tool", 20, 91, 0, "Read", 0, realOwner);
 			queuePendingOp(db, sessionId, 91, "drop", 110);
+			capturePiServedArray(
+				sessionId,
+				[toolResultMessage(callId, "§91§ result")],
+				{ servedTagNumbers: [91] },
+			);
 			tagger.bindToolTag(sessionId, callId, piOwner, 90);
 			tagger.bindToolTag(sessionId, callId, realOwner, 91);
 

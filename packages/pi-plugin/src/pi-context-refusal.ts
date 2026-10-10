@@ -4,6 +4,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { findPiTagIdentityConflict } from "@magic-context/core/features/magic-context/storage-tags";
 import { log } from "@magic-context/core/shared/logger";
 import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
 import { isOmpSideContext } from "./omp-request-kind";
@@ -90,7 +91,10 @@ export function registerPiGuardedContext(
 			budget.recovery === "not attempted"
 				? "no managed result; refused"
 				: budget.recovery;
-		const message = `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
+		const identityConflict = findPiTagIdentityConflict(reason);
+		const message = identityConflict
+			? `${identityConflict.message}. ${budget.diagnostic()}`
+			: `${RETRY_MESSAGE} ${budget.diagnostic()} (${reason instanceof Error ? reason.message : String(reason)})`;
 		try {
 			ctx.ui?.notify(message, "error");
 		} catch (error) {

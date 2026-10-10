@@ -574,7 +574,8 @@ export function applyPiHeuristicCleanup(
 				const strippedSource = stripTagPrefix(stripped);
 
 				if (strippedSource.trim().length === 0) {
-					if (target.thinkingDropProtected) continue;
+					if (target.thinkingDropProtected || target.identityRepairProtected)
+						continue;
 					const dropResult = target.drop?.() ?? "absent";
 					const didReplace =
 						dropResult === "absent"
