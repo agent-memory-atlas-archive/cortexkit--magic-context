@@ -585,6 +585,132 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	describe("native compaction marker under an ordinal offset", () => {
+		// The branch walk lost OFFSET ordinals in front of the stored history:
+		// the newest stored compartment ends on branch message m-4, stored at
+		// OFFSET + 4. Wrapup publishes in the stored numbering, so the marker's
+		// first kept entry is the branch message after the wrapped range.
+		const OFFSET = 62_732;
+		const MESSAGES = 12;
+
+		function offsetBranch() {
+			return branch(MESSAGES).map((entry, index) => ({
+				...entry,
+				message: {
+					role: index % 2 === 0 ? "user" : "assistant",
+					content: [{ type: "text", text: entry.message.content }],
+				},
+			}));
+		}
+
+		function seedShiftedHistory(db: Database, sessionId: string): void {
+			appendCompartments(db, sessionId, [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: OFFSET + 4,
+					startMessageId: "lost-1",
+					endMessageId: "m-4",
+					title: "Older work",
+					content: "Older work.",
+				},
+			]);
+		}
+
+		function wrapupRunner(onRun?: () => void): SubagentRunner {
+			return {
+				harness: "pi",
+				run: mock(async (options: SubagentRunOptions) => {
+					onRun?.();
+					const range = [
+						...options.userMessage.matchAll(/Messages (\d+)-(\d+):/g),
+					].at(-1);
+					if (!range)
+						throw new Error("historian prompt did not include a message range");
+					const start = Number(range[1]);
+					const end = Number(range[2]);
+					const head =
+						start < end
+							? `<compartment start="${start}" end="${end - 1}" title="Pi wrapup"><p1>Summarized.</p1></compartment>`
+							: "";
+					return {
+						ok: true as const,
+						assistantText: `${head}<compartment start="${end}" end="${end}" title="Pi wrapup lookahead"><p1>Summarized the last message.</p1></compartment>`,
+						durationMs: 1,
+					};
+				}),
+			} as SubagentRunner;
+		}
+
+		it("advances the marker to the branch entry after the wrapped range", async () => {
+			const db = createDb();
+			try {
+				const sessionId = "pi-wrapup-offset-marker";
+				seedShiftedHistory(db, sessionId);
+				const result = await runPiWrapup(
+					pi().api,
+					deps(db, {
+						runner: wrapupRunner(),
+						runPiHistorianForWrapup: undefined,
+						historianChunkTokens: 100_000,
+					}),
+					ctx(sessionId, offsetBranch()),
+					sessionId,
+					2,
+				);
+
+				expect(result).toContain("## Magic Wrapup");
+				// Wrapped through branch message m-10, i.e. stored OFFSET + 10.
+				expect(getLastCompartmentEndMessage(db, sessionId)).toBe(OFFSET + 10);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toMatchObject({
+					ordinal: OFFSET + 10,
+					endMessageId: "m-10",
+					firstKeptEntryId: "m-11",
+				});
+			} finally {
+				closeQuietly(db);
+			}
+		});
+
+		it("keeps the marker waiting when the branch it reads is empty", async () => {
+			const db = createDb();
+			try {
+				const sessionId = "pi-wrapup-offset-marker-empty";
+				seedShiftedHistory(db, sessionId);
+				const entries = offsetBranch();
+				// The branch reads normally while the historian summarizes, then
+				// reads empty for the marker step that follows the publish.
+				let branchGone = false;
+				const context = ctx(sessionId, entries) as unknown as {
+					sessionManager: { getBranch: () => unknown[] };
+				};
+				context.sessionManager.getBranch = () => (branchGone ? [] : entries);
+				const result = await runPiWrapup(
+					pi().api,
+					deps(db, {
+						runner: wrapupRunner(() => {
+							branchGone = true;
+						}),
+						runPiHistorianForWrapup: undefined,
+						historianChunkTokens: 100_000,
+					}),
+					context as never,
+					sessionId,
+					2,
+				);
+
+				expect(result).toContain("## Magic Wrapup");
+				expect(getLastCompartmentEndMessage(db, sessionId)).toBe(OFFSET + 10);
+				expect(getPendingPiCompactionMarkerState(db, sessionId)).toMatchObject({
+					ordinal: OFFSET + 10,
+					firstKeptEntryId: null,
+				});
+			} finally {
+				closeQuietly(db);
+			}
+		});
+	});
+
 	it("passes the active session model as the wrapup historian last-resort fallback", async () => {
 		const db = createDb();
 		try {

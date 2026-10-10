@@ -489,7 +489,7 @@ export async function runPiWrapup(
 						userMemoriesEnabled: deps.userMemoriesEnabled,
 						language: deps.language,
 						compartmentLeaseHolderId: leaseHolder,
-						readBranchEntries: () => readBranchEntries(ctx),
+						readBranchEntries: () => readPiWrapupBranchEntries(ctx),
 						notifyIssue: (text) =>
 							sendStatus({
 								title: "/ctx-wrapup",
@@ -626,13 +626,23 @@ function formatExistingWrapup(
 	return `## Magic Wrapup — Skipped\n\nAnother /ctx-wrapup is already compacting this session (chunk ${state.chunkIndex}/${Math.max(state.chunkIndex, state.expectedChunks)}, wrapped through message ${state.lastCompartmentEnd}). Wait for it to finish, then try again.`;
 }
 
-function readBranchEntries(ctx: ExtensionCommandContext): unknown[] {
-	const getBranch = (ctx.sessionManager as { getBranch?: () => unknown })
-		.getBranch;
-	if (typeof getBranch !== "function") return [];
-	const branch = getBranch.call(ctx.sessionManager) as
-		| { entries?: unknown }
-		| null
+/**
+ * The live branch for the native compaction marker step, read fresh on each
+ * call. Pi and Oh My Pi both return `getBranch()` as an array of entries.
+ * An unreadable branch is empty, which keeps the marker waiting (the ordinal
+ * alignment cannot find its anchor in it) instead of guessing a cut.
+ */
+export function readPiWrapupBranchEntries(
+	ctx: Pick<ExtensionCommandContext, "sessionManager">,
+): unknown[] {
+	const sessionManager = ctx.sessionManager as
+		| { getBranch?: () => unknown }
 		| undefined;
-	return Array.isArray(branch?.entries) ? branch.entries : [];
+	if (typeof sessionManager?.getBranch !== "function") return [];
+	try {
+		const branch = sessionManager.getBranch.call(sessionManager);
+		return Array.isArray(branch) ? branch : [];
+	} catch {
+		return [];
+	}
 }
