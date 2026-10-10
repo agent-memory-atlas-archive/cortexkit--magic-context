@@ -119,6 +119,32 @@ export function getPiServedTagNumbers(
 	return numbers;
 }
 
+export function getPiLastServedDigest(
+	sessionId: string,
+	storageDir = getMagicContextStorageDir(),
+): string | undefined {
+	const previous = previousBySession.get(sessionId);
+	if (previous) return previous.digest;
+	try {
+		const lines = readFileSync(
+			getPiServedArrayLedgerPath(sessionId, storageDir),
+			"utf8",
+		)
+			.trim()
+			.split("\n");
+		const last = JSON.parse(lines.at(-1) ?? "") as PiServedArrayDigestRecord;
+		if (
+			last.version === 1 &&
+			last.session_id === sessionId &&
+			/^[a-f0-9]{64}$/.test(last.sha256)
+		)
+			return last.sha256;
+	} catch {
+		// A missing or damaged returned-array digest cannot authorize deleting a
+		// duplicate tag: it does not prove which numbered bytes Pi received.
+	}
+}
+
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }

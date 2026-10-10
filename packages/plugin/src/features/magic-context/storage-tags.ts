@@ -1910,6 +1910,25 @@ export function findPiFallbackToolOwnerTags(
         .filter(isPiFallbackToolOwnerTag);
 }
 
+export class PiTagIdentityConflictError extends Error {
+    readonly code = "PI_TAG_IDENTITY_CONFLICT";
+    constructor(detail: string) {
+        super(
+            `Magic Context tool-tag identity conflict: ${detail}. This turn was refused without sending raw history; resending alone will not repair it`,
+        );
+        this.name = "PiTagIdentityConflictError";
+    }
+}
+
+export function findPiTagIdentityConflict(error: unknown): PiTagIdentityConflictError | undefined {
+    const seen = new Set<unknown>();
+    while (error instanceof Error && !seen.has(error)) {
+        if (error instanceof PiTagIdentityConflictError) return error;
+        seen.add(error);
+        error = error.cause;
+    }
+}
+
 export function adoptPiFallbackToolOwnerTag(
     db: Database,
     sessionId: string,
@@ -1918,6 +1937,7 @@ export function adoptPiFallbackToolOwnerTag(
     oldOwnerMessageId: string,
     newOwnerMessageId: string,
     servedTagNumbers: ReadonlySet<number> = new Set(),
+    cachedSurvivor?: number,
 ): PiFallbackTagAdoptionResult {
     const survivor = getPiFallbackFoldTagRowByNumber(db, sessionId, tagNumber);
     if (
@@ -1950,10 +1970,33 @@ export function adoptPiFallbackToolOwnerTag(
         return { action: "skipped" };
     }
 
-    if (servedTagNumbers.has(survivor.tagNumber)) {
-        if (servedTagNumbers.has(existing.tagNumber)) {
-            throw new Error("Conflicting served Pi tool tag numbers; refusing identity adoption");
-        }
+    const bothServed =
+        servedTagNumbers.has(survivor.tagNumber) && servedTagNumbers.has(existing.tagNumber);
+    if (
+        bothServed &&
+        cachedSurvivor !== survivor.tagNumber &&
+        cachedSurvivor !== existing.tagNumber
+    ) {
+        throw new PiTagIdentityConflictError(
+            "Conflicting served Pi tool tag numbers; no byte-safe cached survivor is proven",
+        );
+    }
+    const keepFallback =
+        cachedSurvivor !== undefined
+            ? cachedSurvivor === survivor.tagNumber
+            : servedTagNumbers.has(survivor.tagNumber);
+    const kept = keepFallback ? survivor : existing;
+    const removed = keepFallback ? existing : survivor;
+    if (
+        (servedTagNumbers.has(kept.tagNumber) || cachedSurvivor === kept.tagNumber) &&
+        kept.status !== "dropped" &&
+        removed.status === "dropped"
+    ) {
+        throw new PiTagIdentityConflictError(
+            "a duplicate's dropped status would change the served tool bytes",
+        );
+    }
+    if (keepFallback) {
         foldDuplicateIntoSurvivor(db, sessionId, survivor, existing);
         db.prepare(
             "UPDATE tags SET tool_owner_message_id = ? WHERE session_id = ? AND tag_number = ?",

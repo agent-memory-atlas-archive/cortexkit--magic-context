@@ -130,8 +130,11 @@ import {
 import { getNativeReplayState } from "@magic-context/core/features/magic-context/storage-native-replay";
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import {
+	findPiTagIdentityConflict,
+	getToolTagNumberByOwner,
 	hasPiFallbackMessageTags as hasPersistedPiFallbackMessageTags,
 	hasPiFallbackToolOwnerTags as hasPersistedPiFallbackToolOwnerTags,
+	PiTagIdentityConflictError,
 } from "@magic-context/core/features/magic-context/storage-tags";
 import {
 	createTagger,
@@ -361,6 +364,10 @@ import {
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
 import { injectSyntheticTodowriteForPi } from "./pi-todo-inject";
+import {
+	piAssistantToolIdentity,
+	piCachedToolSurvivor,
+} from "./pi-tool-identity";
 import { loadPiToolWireSchema } from "./pi-tool-wire-schema";
 import {
 	applyPiProactiveThinkingStrip,
@@ -490,6 +497,7 @@ export const __test = {
 	updateSessionProjectTracking,
 	isPiHardCacheExpired,
 	adoptPiFallbackTags,
+	guardPiToolAllocations,
 	buildEntryFingerprintMap,
 	readPiEntryFingerprintCount: () => piEntryFingerprintCount,
 	resolvePiEventEntryIds,
@@ -827,6 +835,7 @@ function buildPiTextIdentityPlan(
 interface PiBranchEntryLookup {
 	entryIdByMessageRef: Map<object, string>;
 	entryIdsByFingerprint: Map<string, string[]>;
+	entryIdsByToolIdentity: Map<string, string[]>;
 	alignedEntryIds: (string | undefined)[];
 	/**
 	 * The same projection without system-role slots. Pi 0.87+ withholds system
@@ -1752,7 +1761,7 @@ export function collectMessageEntryIdsByRef(
 	// SessionManager clones context messages before this handler runs, so the
 	// fingerprint index is the production alignment path. The reference index is
 	// retained for test doubles and older Pi runtimes that do not clone.
-	const { entryIdByMessageRef, entryIdsByFingerprint } =
+	const { entryIdByMessageRef, entryIdsByFingerprint, entryIdsByToolIdentity } =
 		getPiBranchEntryLookup(entries);
 
 	const result: (string | undefined)[] = new Array(messages.length);
@@ -1772,9 +1781,10 @@ export function collectMessageEntryIdsByRef(
 			continue;
 		}
 		const fingerprint = piMessageEntryFingerprint(msg);
-		const fingerprintBucket = fingerprint
-			? entryIdsByFingerprint.get(fingerprint)
-			: undefined;
+		const toolIdentity = piAssistantToolIdentity(msg);
+		const fingerprintBucket =
+			(fingerprint ? entryIdsByFingerprint.get(fingerprint) : undefined) ??
+			(toolIdentity ? entryIdsByToolIdentity.get(toolIdentity) : undefined);
 		// A fingerprint is only a safe fallback when it uniquely identifies a
 		// branch entry. Repeated/cloned messages can share timestamp/role/text;
 		// consuming the "next" bucket item would silently anchor to the wrong
@@ -2144,6 +2154,12 @@ function addPiBranchEntryToLookup(
 		return;
 	}
 	lookup.entryIdByMessageRef.set(row.message as object, row.id);
+	const toolIdentity = piAssistantToolIdentity(row.message);
+	if (toolIdentity) {
+		const owners = lookup.entryIdsByToolIdentity.get(toolIdentity);
+		if (owners) owners.push(row.id);
+		else lookup.entryIdsByToolIdentity.set(toolIdentity, [row.id]);
+	}
 	const fingerprint = piMessageEntryFingerprint(row.message);
 	if (check) check.fingerprint = fingerprint;
 	if (!fingerprint) return;
@@ -2358,6 +2374,7 @@ function getPiBranchEntryLookup(
 		alignmentChecks: new Map(),
 		alignmentHeaderCounts: new Map(),
 		alignmentEntryIdByHeader: new Map(),
+		entryIdsByToolIdentity: new Map(),
 	};
 	for (const entry of entries) addPiBranchEntryToLookup(lookup, entry);
 	piBranchLookupByProjection.set(entries, lookup);
@@ -2669,8 +2686,8 @@ function buildPiToolOwnerMap(
 			continue;
 		}
 		if (!Array.isArray(msg.content)) continue;
-		const ownerRealId = resolveStableId(message, i);
-		if (!ownerRealId || ownerRealId.startsWith("pi-msg-")) continue;
+		const ownerId = resolveStableId(message, i);
+		if (!ownerId) continue;
 		for (const part of msg.content) {
 			if (!part || typeof part !== "object") continue;
 			const p = part as { type?: unknown; id?: unknown };
@@ -2682,7 +2699,7 @@ function buildPiToolOwnerMap(
 				owners = new Set<string>();
 				map.set(key, owners);
 			}
-			owners.add(ownerRealId);
+			owners.add(ownerId);
 		}
 	}
 	return map;
@@ -2696,6 +2713,51 @@ function parsePiFallbackToolOwnerId(
 	const timestamp = Number(match[1]);
 	if (!Number.isFinite(timestamp)) return null;
 	return { timestamp, role: match[2] ?? "" };
+}
+
+function guardPiToolAllocations(
+	db: ContextDatabase,
+	sessionId: string,
+	messages: readonly PiAgentMessage[],
+	resolveId: (msg: unknown, index: number) => string | undefined,
+): void {
+	const hasFallback = hasPersistedPiFallbackToolOwnerTags(db, sessionId);
+	for (let index = 0; index < messages.length; index++) {
+		const message = messages[index];
+		if (message?.role !== "assistant" || !Array.isArray(message.content))
+			continue;
+		const owner = resolveId(message, index);
+		if (!owner) continue;
+		if (!owner.startsWith("pi-msg-") && !hasFallback) continue;
+		for (const part of message.content) {
+			if (part.type !== "toolCall") continue;
+			const rows = db
+				.prepare(
+					"SELECT tool_owner_message_id AS owner FROM tags WHERE session_id = ? AND type = 'tool' AND message_id = ? AND tool_owner_message_id IS NOT NULL",
+				)
+				.all(sessionId, part.id) as { owner: string }[];
+			if (rows.some((row) => row.owner === owner)) continue;
+			// A temporary assistant id can mean the same persisted call was moved
+			// or edited by another extension. Until its timestamp proves a distinct
+			// invocation, a new assignment could give that call two model-visible tags.
+			if (
+				rows.some((row) => {
+					if (!row.owner.startsWith("pi-msg-"))
+						return owner.startsWith("pi-msg-");
+					const parsed = parsePiFallbackToolOwnerId(row.owner);
+					return (
+						!parsed ||
+						typeof message.timestamp !== "number" ||
+						parsed.timestamp === message.timestamp
+					);
+				})
+			) {
+				throw new PiTagIdentityConflictError(
+					"the tool call's existing owner cannot be safely resolved; no second tag was allocated",
+				);
+			}
+		}
+	}
 }
 
 function databaseIsInTransaction(db: ContextDatabase): boolean {
@@ -2834,7 +2896,8 @@ function pairPiFallbackBases(
 }
 
 /**
- * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids.
+ * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids,
+ * or when an unresolved assistant moves to a different visible array index.
  * Match message tags by raw content fingerprint and tool tags by their owning
  * assistant's `(timestamp, callId)`. If both identities have rows, merge them
  * without changing the actually served number or losing dropped status, queued
@@ -2997,7 +3060,36 @@ function adoptPiFallbackTags(
 				);
 				if (owners?.size !== 1) continue;
 				const [realOwnerId] = owners;
-				if (!realOwnerId || realOwnerId.startsWith("pi-msg-")) continue;
+				if (!realOwnerId || realOwnerId === row.toolOwnerMessageId) continue;
+				const existingNumber = getToolTagNumberByOwner(
+					db,
+					sessionId,
+					row.callId,
+					realOwnerId,
+				);
+				const served = getPiServedTagNumbers(sessionId);
+				const cachedSurvivor =
+					existingNumber === null
+						? undefined
+						: piCachedToolSurvivor(
+								sessionId,
+								row.callId,
+								parsed.timestamp,
+								getTagsByNumbers(db, sessionId, [
+									row.tagNumber,
+									existingNumber,
+								]),
+							);
+				if (
+					existingNumber !== null &&
+					!served.has(existingNumber) &&
+					!served.has(row.tagNumber) &&
+					cachedSurvivor === undefined
+				) {
+					throw new PiTagIdentityConflictError(
+						"duplicate tool identities have no proven served-byte survivor",
+					);
+				}
 				const adoption = adoptPiFallbackToolOwnerTag(
 					db,
 					sessionId,
@@ -3005,7 +3097,10 @@ function adoptPiFallbackTags(
 					row.callId,
 					row.toolOwnerMessageId,
 					realOwnerId,
-					getPiServedTagNumbers(sessionId),
+					served.size === 0 && cachedSurvivor !== undefined
+						? new Set([cachedSurvivor])
+						: served,
+					cachedSurvivor,
 				);
 				if (adoption.action !== "skipped") {
 					tagger.unbindToolTag(sessionId, row.toolOwnerMessageId, row.callId);
@@ -5120,6 +5215,12 @@ export function registerPiContextHandler(
 			budget.failureReason = message;
 			const stack = err instanceof Error ? err.stack : undefined;
 			const transientStorageFailure = isTransientPiStorageError(err);
+			const identityConflict = findPiTagIdentityConflict(err);
+			if (identityConflict) {
+				if (sessionIdForError)
+					taggersBySession.get(sessionIdForError)?.cleanup(sessionIdForError);
+				throw identityConflict;
+			}
 			// Every failed managed pass is handled like a busy store: Pi's own
 			// messages lack the session's persisted reductions, even if they fit.
 			const degradedPass = !lkgCompactionOff;
@@ -6766,7 +6867,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const transcript = createPiTranscript(
 		args.messages,
 		args.sessionId,
-		args.entryIds,
+		// Reusing a stored tag and assigning a new one must see the same assistant
+		// entry id. A branch message reference can resolve even when an extension
+		// edit made its positional entry-id slot unavailable.
+		args.messages.map(stableIdResolver),
 		{
 			preserveReasoningToolArcs:
 				args.reasoningClearing?.preserveReasoningToolArcs,
@@ -7164,6 +7268,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					}
 				: undefined,
 		},
+	);
+	guardPiToolAllocations(
+		args.db,
+		args.sessionId,
+		args.messages as PiAgentMessage[],
+		stableIdResolver,
 	);
 	logTransformTiming(
 		args.sessionId,
