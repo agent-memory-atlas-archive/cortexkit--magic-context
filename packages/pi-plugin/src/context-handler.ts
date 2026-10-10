@@ -3140,7 +3140,9 @@ function piPairingKeepsServedNumbers(
 
 /**
  * Replace temporary `pi-msg-*` identities when Pi supplies real entry ids,
- * or when an unresolved assistant moves to a different visible array index.
+ * or when an unresolved assistant moves to a different visible array index,
+ * or when a message row an older build keyed by array index now has a
+ * position-independent fallback id.
  * Match message tags by raw content fingerprint and tool tags by their owning
  * assistant's `(timestamp, callId)`. If both identities have rows, merge them
  * without changing the actually served number or losing dropped status, queued
@@ -3413,8 +3415,8 @@ function adoptPiFallbackTags(
 				return positions;
 			};
 			for (const [realMessageId, fingerprint] of targets) {
-				// Only real ids can be adoption targets; a pi-msg-* id has no fallback
-				// predecessor to migrate from.
+				// This loop adopts onto real ids only; position-independent fallback
+				// targets are handled by the loop after it.
 				if (realMessageId.startsWith("pi-msg-")) continue;
 				// Several real ids sharing one fingerprint (identical messages stamped
 				// in the same millisecond) can only adopt through an order-proven
@@ -3434,8 +3436,8 @@ function adoptPiFallbackTags(
 				// message carried this fingerprint → safe to adopt. Several bases, or
 				// several real ids, are ambiguous unless pairPiFallbackBases matches them
 				// in order and the served-number ledger agrees with that pairing;
-				// otherwise skip, and guardPiMessageAllocations refuses the pass rather
-				// than allocating a second number for an already tagged message.
+				// otherwise skip: guardPiMessageAllocations reports the id, and tagging
+				// allocates a new number for it (one logged cache change, no refusal).
 				const baseIds = new Set(
 					candidates.map((c) => piFallbackBaseId(c.messageId)),
 				);
