@@ -184,6 +184,57 @@ export interface UnifiedSearchOptions {
     measurementDisabled?: boolean;
     embeddingModelIdOverride?: string;
     chunkModelIdOverride?: string;
+    /**
+     * Run the message-history lane somewhere other than the calling thread,
+     * typically a worker with its own read-only connection. It must answer with
+     * {@link searchMessageHistory} on the same store, so results and ranking are
+     * those of the in-process lane. Resolving null (no file-backed store, or the
+     * worker failed) runs the lane in process instead.
+     */
+    searchMessageHistory?: (
+        request: MessageHistorySearchRequest,
+    ) => Promise<MessageHistorySearchOutcome | null>;
+}
+
+/** Everything the message-history lane needs, in a form a worker can receive. */
+export interface MessageHistorySearchRequest {
+    sessionId: string;
+    query: string;
+    limit: number;
+    maxOrdinal?: number;
+    probes: string[];
+    relaxedRecall?: boolean;
+    /** The caller wants diagnostics; this also selects the diagnostic statements. */
+    collectDiagnostics: boolean;
+    dateRange: { from: number; to: number } | null;
+}
+
+export interface MessageHistorySearchOutcome {
+    results: MessageSearchResult[];
+    suppressedLiveMessageMatches: number;
+}
+
+/** The message-history lane of {@link unifiedSearch}, callable from a worker. */
+export function searchMessageHistory(
+    db: Database,
+    request: MessageHistorySearchRequest,
+): MessageHistorySearchOutcome {
+    const diagnostics = request.collectDiagnostics ? createUnifiedSearchDiagnostics() : undefined;
+    const results = searchMessages({
+        db,
+        sessionId: request.sessionId,
+        query: request.query,
+        limit: request.limit,
+        maxOrdinal: request.maxOrdinal,
+        probes: request.probes,
+        relaxedRecall: request.relaxedRecall,
+        diagnostics,
+        dateRange: request.dateRange,
+    });
+    return {
+        results,
+        suppressedLiveMessageMatches: diagnostics?.suppressedLiveMessageMatches ?? 0,
+    };
 }
 
 export interface MemorySearchResult {
@@ -2120,19 +2171,35 @@ export async function unifiedSearch(
     // Multi-probe recall is opt-in for explicit searches only. NL queries
     // yield no probes, so this is a no-op for them regardless of the flag.
     const messageProbes = options.explicitSearch ? extractLiteralProbes(trimmedQuery) : [];
-    const messageResults: MessageSearchResult[] = runMessages
-        ? searchMessages({
-              db,
-              sessionId,
-              query: trimmedQuery,
-              limit: tierLimit,
-              maxOrdinal: options.maxMessageOrdinal,
-              probes: messageProbes,
-              relaxedRecall: options.explicitSearch,
-              diagnostics: options.diagnostics,
-              dateRange,
-          })
-        : [];
+    let messageResults: MessageSearchResult[] = [];
+    if (runMessages) {
+        const messageRequest: MessageHistorySearchRequest = {
+            sessionId,
+            query: trimmedQuery,
+            limit: tierLimit,
+            maxOrdinal: options.maxMessageOrdinal,
+            probes: messageProbes,
+            relaxedRecall: options.explicitSearch,
+            collectDiagnostics: options.diagnostics !== undefined,
+            dateRange,
+        };
+        // Explicit searches with literal probes count every probe's matches
+        // across the session; a caller can move that work off its thread.
+        const delegated = options.searchMessageHistory
+            ? await options.searchMessageHistory(messageRequest).catch((error) => {
+                  log(
+                      `[search] off-thread message search failed: ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                  return null;
+              })
+            : null;
+        if (delegated && options.signal?.aborted) return [];
+        const outcome = delegated ?? searchMessageHistory(db, messageRequest);
+        if (options.diagnostics) {
+            options.diagnostics.suppressedLiveMessageMatches = outcome.suppressedLiveMessageMatches;
+        }
+        messageResults = outcome.results;
+    }
 
     // Wait for the single embed call (if any) and then run the two
     // embedding-dependent searches in parallel using the same vector.

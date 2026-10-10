@@ -69,10 +69,6 @@ interface RawPartRow {
 export const RAW_MESSAGE_PARTS_BY_ID_SQL =
     "SELECT message_id, data, time_updated FROM part WHERE +session_id = ? AND likelihood(message_id = ?, 0.000001) ORDER BY time_created ASC, id ASC";
 
-interface OrdinalRow {
-    ordinal?: number;
-}
-
 function isRawMessageRow(row: unknown): row is RawMessageRow {
     if (row === null || typeof row !== "object") return false;
     const candidate = row as Record<string, unknown>;
@@ -783,6 +779,247 @@ export function readRawSessionMessagePartsByIdFromDb(
 }
 
 /**
+ * Flags for the canonical ordinal predicate. A row is excluded from the ordinal
+ * space when both flags are 1: a compaction summary (`summary` true or numeric
+ * 1) that finished with `stop`. Malformed JSON has neither flag, so it counts,
+ * as it does in {@link readRawSessionMessagesFromDb}.
+ */
+const ORDINAL_SUMMARY_FLAG_SQL = `(CASE WHEN json_valid(data) = 1
+        THEN COALESCE(json_extract(data, '$.summary'), 0)
+        ELSE 0 END = 1)`;
+const ORDINAL_STOP_FLAG_SQL = `(CASE WHEN json_valid(data) = 1
+        THEN COALESCE(json_extract(data, '$.finish'), '')
+        ELSE '' END = 'stop')`;
+
+/**
+ * Count one `(time_created, id)` range of a session. The row-value bounds seek
+ * the `(session_id, time_created, id)` index, so only rows inside the range are
+ * visited. `eligible` is the number of ordinal-bearing rows in the range.
+ */
+function ordinalRangeSql(lowerBound: boolean): string {
+    return `SELECT COUNT(*) AS visited,
+                   COALESCE(SUM(CASE WHEN ${ORDINAL_SUMMARY_FLAG_SQL} AND ${ORDINAL_STOP_FLAG_SQL}
+                                     THEN 0 ELSE 1 END), 0) AS eligible
+            FROM message
+            WHERE session_id = ?
+              ${lowerBound ? "AND (time_created, id) > (?, ?)" : ""}
+              AND (time_created, id) <= (?, ?)`;
+}
+
+const ORDINAL_RANGE_FROM_START_SQL = ordinalRangeSql(false);
+const ORDINAL_RANGE_BETWEEN_SQL = ordinalRangeSql(true);
+
+interface OrdinalKey {
+    timeCreated: number;
+    id: string;
+}
+
+/**
+ * What this connection can observe about changes to the whole store: commits by
+ * any other connection or process move `data_version`, this connection's own
+ * writes move `total_changes()`, and schema changes move `schema_version`.
+ * While all three are unchanged, nothing in the store has changed.
+ */
+interface StoreStamp {
+    dataVersion: number;
+    totalChanges: number;
+    schemaVersion: number;
+}
+
+function readStoreStamp(db: Database): StoreStamp | null {
+    try {
+        const row = db
+            .prepare(
+                `SELECT data_version AS dataVersion, total_changes() AS totalChanges,
+                        (SELECT schema_version FROM pragma_schema_version) AS schemaVersion
+                 FROM pragma_data_version`,
+            )
+            .get() as Partial<StoreStamp> | null;
+        if (
+            typeof row?.dataVersion !== "number" ||
+            typeof row.totalChanges !== "number" ||
+            typeof row.schemaVersion !== "number"
+        )
+            return null;
+        return {
+            dataVersion: row.dataVersion,
+            totalChanges: row.totalChanges,
+            schemaVersion: row.schemaVersion,
+        };
+    } catch {
+        return null;
+    }
+}
+
+function sameStoreStamp(left: StoreStamp | null, right: StoreStamp | null): boolean {
+    return (
+        left !== null &&
+        right !== null &&
+        left.dataVersion === right.dataVersion &&
+        left.totalChanges === right.totalChanges &&
+        left.schemaVersion === right.schemaVersion
+    );
+}
+
+/**
+ * A message whose canonical ordinal this connection counted while the store
+ * was in the state `stamp` describes. It is only reused while the stamp is
+ * unchanged, which proves no row at or before it can have changed.
+ */
+interface OrdinalWatermark extends OrdinalKey {
+    ordinal: number;
+    stamp: StoreStamp;
+    epoch: number;
+}
+
+/**
+ * Watermarks are per connection: tests and tools open several stores that reuse
+ * the same session ids, and a count proven in one store says nothing about another.
+ */
+const ordinalWatermarks = new WeakMap<Database, Map<string, OrdinalWatermark>>();
+/** Bumped by {@link forgetRawSessionOrdinalWatermark}; older watermarks are not reused. */
+const ordinalWatermarkEpochs = new Map<string, number>();
+let ordinalRowsVisited = 0;
+/** Attempts to get one count while the store holds still before giving up on reuse. */
+const STABLE_STORE_ATTEMPTS = 3;
+
+/**
+ * Stop reusing every ordinal watermark of a session. The store stamp already
+ * catches every write; this lets a removal event drop the watermark early.
+ */
+export function forgetRawSessionOrdinalWatermark(sessionId: string): void {
+    ordinalWatermarkEpochs.set(sessionId, (ordinalWatermarkEpochs.get(sessionId) ?? 0) + 1);
+}
+
+/** @internal Rows the canonical ordinal statements have visited since the last reset. */
+export function getRawSessionOrdinalRowsVisitedForTest(): number {
+    return ordinalRowsVisited;
+}
+
+/** @internal */
+export function resetRawSessionOrdinalRowsVisitedForTest(): void {
+    ordinalRowsVisited = 0;
+}
+
+/** Order two keys the way SQLite's BINARY collation orders `(time_created, id)`. */
+function compareOrdinalKeys(left: OrdinalKey, right: OrdinalKey): number {
+    if (left.timeCreated !== right.timeCreated)
+        return left.timeCreated < right.timeCreated ? -1 : 1;
+    if (left.id === right.id) return 0;
+    return Buffer.compare(Buffer.from(left.id, "utf8"), Buffer.from(right.id, "utf8"));
+}
+
+function countEligibleOrdinals(
+    db: Database,
+    sessionId: string,
+    after: OrdinalKey | null,
+    through: OrdinalKey,
+): number {
+    const row = (
+        after
+            ? db
+                  .prepare(ORDINAL_RANGE_BETWEEN_SQL)
+                  .get(sessionId, after.timeCreated, after.id, through.timeCreated, through.id)
+            : db
+                  .prepare(ORDINAL_RANGE_FROM_START_SQL)
+                  .get(sessionId, through.timeCreated, through.id)
+    ) as { visited?: unknown; eligible?: unknown } | null;
+    ordinalRowsVisited += typeof row?.visited === "number" ? row.visited : 0;
+    return typeof row?.eligible === "number" ? row.eligible : 0;
+}
+
+function reusableWatermark(
+    db: Database,
+    sessionId: string,
+    stamp: StoreStamp | null,
+): OrdinalWatermark | null {
+    const watermark = ordinalWatermarks.get(db)?.get(sessionId);
+    if (
+        !watermark ||
+        watermark.epoch !== (ordinalWatermarkEpochs.get(sessionId) ?? 0) ||
+        !sameStoreStamp(watermark.stamp, stamp)
+    )
+        return null;
+    return watermark;
+}
+
+function rememberOrdinalWatermark(
+    db: Database,
+    sessionId: string,
+    key: OrdinalKey,
+    ordinal: number,
+    stamp: StoreStamp,
+): void {
+    let sessions = ordinalWatermarks.get(db);
+    if (!sessions) {
+        sessions = new Map();
+        ordinalWatermarks.set(db, sessions);
+    }
+    const current = sessions.get(sessionId);
+    // Within one store state keep the latest proven point: lookups of later
+    // messages then count only the rows after it.
+    if (current && sameStoreStamp(current.stamp, stamp) && compareOrdinalKeys(current, key) >= 0)
+        return;
+    sessions.set(sessionId, {
+        timeCreated: key.timeCreated,
+        id: key.id,
+        ordinal,
+        stamp,
+        epoch: ordinalWatermarkEpochs.get(sessionId) ?? 0,
+    });
+}
+
+/**
+ * Canonical ordinal of one stored message: the number of ordinal-bearing rows
+ * of the session at or before it in `(time_created, id)` order. Returns the raw
+ * count, which is 0 when nothing at or before the target bears an ordinal.
+ *
+ * `readTarget` reads the target's key. It runs between two readings of the
+ * store stamp together with the count, so a result is only reused, or used to
+ * leave a watermark, when no commit or local write happened while it was
+ * computed. A watermark is used only while the stamp it was proven under is
+ * unchanged; then a lookup counts just the rows between the watermark and the
+ * target. Any write anywhere in the store (an append, a delete, a moved
+ * timestamp, a rewritten summary, another process's commit) changes the stamp,
+ * and the whole prefix is counted again, which costs one indexed range scan
+ * that reads each earlier message's JSON.
+ */
+function canonicalOrdinalOf<T extends OrdinalKey>(
+    db: Database,
+    sessionId: string,
+    readTarget: () => T | null,
+): { target: T; ordinal: number } | null {
+    for (let attempt = 1; ; attempt += 1) {
+        const before = readStoreStamp(db);
+        const target = readTarget();
+        if (!target) return null;
+        const watermark =
+            attempt < STABLE_STORE_ATTEMPTS ? reusableWatermark(db, sessionId, before) : null;
+        if (!watermark) {
+            // One statement over the whole prefix is consistent on its own.
+            const ordinal = countEligibleOrdinals(db, sessionId, null, target);
+            if (before && sameStoreStamp(before, readStoreStamp(db)))
+                rememberOrdinalWatermark(db, sessionId, target, ordinal, before);
+            return { target, ordinal };
+        }
+        const order = compareOrdinalKeys(target, watermark);
+        const ordinal =
+            order === 0
+                ? watermark.ordinal
+                : order < 0
+                  ? // ordinal(target) = ordinal(watermark) - eligible rows in (target, watermark].
+                    watermark.ordinal - countEligibleOrdinals(db, sessionId, target, watermark)
+                  : watermark.ordinal + countEligibleOrdinals(db, sessionId, watermark, target);
+        if (sameStoreStamp(before, readStoreStamp(db))) {
+            rememberOrdinalWatermark(db, sessionId, target, ordinal, before as StoreStamp);
+            return { target, ordinal };
+        }
+        // The store changed while counting, so the answer may mix two states.
+        // Try again; the last attempt counts the whole prefix.
+    }
+}
+
+/**
  * Resolve one message ID in the canonical raw-message ordinal space. Synthetic
  * compaction summaries are excluded so this count matches every module wire
  * ordinal and does not depend on the stored compartment basis.
@@ -792,36 +1029,23 @@ export function readRawSessionMessageOrdinalByIdFromDb(
     sessionId: string,
     messageId: string,
 ): number | null {
-    const row = db
-        .prepare(
-            `SELECT COUNT(candidate.id) AS ordinal
-             FROM message AS target
-             JOIN message AS candidate
-               ON candidate.session_id = target.session_id
-              AND NOT (
-                  CASE WHEN json_valid(candidate.data) = 1
-                       THEN COALESCE(json_extract(candidate.data, '$.summary'), 0)
-                       ELSE 0 END = 1
-                  AND CASE WHEN json_valid(candidate.data) = 1
-                           THEN COALESCE(json_extract(candidate.data, '$.finish'), '')
-                           ELSE '' END = 'stop'
-              )
-              AND (candidate.time_created < target.time_created
-                   OR (candidate.time_created = target.time_created AND candidate.id <= target.id))
-             WHERE target.session_id = ?
-               AND target.id = ?
-               AND NOT (
-                   CASE WHEN json_valid(target.data) = 1
-                        THEN COALESCE(json_extract(target.data, '$.summary'), 0)
-                        ELSE 0 END = 1
-                   AND CASE WHEN json_valid(target.data) = 1
-                            THEN COALESCE(json_extract(target.data, '$.finish'), '')
-                            ELSE '' END = 'stop'
-               )`,
-        )
-        .get(sessionId, messageId) as OrdinalRow | null;
-    const ordinal = row?.ordinal;
-    return typeof ordinal === "number" && ordinal > 0 ? ordinal : null;
+    const counted = canonicalOrdinalOf(db, sessionId, () => {
+        const row = db
+            .prepare(
+                `SELECT id, time_created, ${ORDINAL_SUMMARY_FLAG_SQL} AND ${ORDINAL_STOP_FLAG_SQL} AS excluded
+                 FROM message WHERE session_id = ? AND id = ?`,
+            )
+            .get(sessionId, messageId) as {
+            id?: unknown;
+            time_created?: unknown;
+            excluded?: unknown;
+        } | null;
+        if (typeof row?.id !== "string" || typeof row.time_created !== "number") return null;
+        return { id: row.id, timeCreated: row.time_created, excluded: row.excluded === 1 };
+    });
+    // An excluded target has no ordinal of its own.
+    if (!counted || counted.target.excluded) return null;
+    return counted.ordinal > 0 ? counted.ordinal : null;
 }
 
 export function readRawSessionMessageByIdFromDb(
@@ -829,30 +1053,21 @@ export function readRawSessionMessageByIdFromDb(
     sessionId: string,
     messageId: string,
 ): RawMessage | null {
-    const row = db
-        .prepare(
-            "SELECT id, data, time_created, time_updated FROM message WHERE session_id = ? AND id = ?",
-        )
-        .get(sessionId, messageId) as RawMessageRow | null;
-    if (!row || !isRawMessageRow(row) || typeof row.time_created !== "number") {
-        return null;
-    }
-
-    const info = parseJsonRecord(row.data);
-    if (!info || isRawCompactionSummaryInfo(info)) {
-        return null;
-    }
-
-    const ordinalRow = db
-        .prepare(
-            `SELECT COUNT(*) AS ordinal FROM message
-             WHERE session_id = ?
-               AND NOT (COALESCE(json_extract(data, '$.summary'), 0) = 1
-                        AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
-               AND (time_created < ? OR (time_created = ? AND id <= ?))`,
-        )
-        .get(sessionId, row.time_created, row.time_created, messageId) as OrdinalRow | null;
-    const ordinal = typeof ordinalRow?.ordinal === "number" ? ordinalRow.ordinal : 0;
+    const counted = canonicalOrdinalOf(db, sessionId, () => {
+        const row = db
+            .prepare(
+                "SELECT id, data, time_created, time_updated FROM message WHERE session_id = ? AND id = ?",
+            )
+            .get(sessionId, messageId) as RawMessageRow | null;
+        if (!row || !isRawMessageRow(row) || typeof row.time_created !== "number") return null;
+        // Unreadable messages and compaction summaries are not served; skip the count.
+        const parsed = parseJsonRecord(row.data);
+        if (!parsed || isRawCompactionSummaryInfo(parsed)) return null;
+        return { ...row, timeCreated: row.time_created, info: parsed };
+    });
+    if (!counted) return null;
+    const { target: row, ordinal } = counted;
+    const info = row.info;
     if (ordinal <= 0) {
         return null;
     }

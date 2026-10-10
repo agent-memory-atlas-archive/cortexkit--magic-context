@@ -234,6 +234,110 @@ export interface SqliteMemoryStats {
 const trackedSqliteConnections = new Map<number, TrackedSqliteConnection>();
 let nextSqliteConnectionSequence = 1;
 
+/**
+ * Columns of Magic Context's `tags` table (context.db) that never decide which
+ * message a tag belongs to, its number, its type, or its reasoning token estimate.
+ */
+const TAG_COLUMNS_OUTSIDE_IDENTITY = new Set([
+    "status",
+    "drop_mode",
+    "byte_size",
+    "input_byte_size",
+    "reasoning_byte_size",
+    "token_count",
+    "input_token_count",
+    "caveman_depth",
+    "entry_fingerprint",
+    "tool_name",
+    "harness",
+]);
+
+let tagIdentityWriteGeneration = 0;
+
+/**
+ * Whether a write statement may change an existing `tags` row's identity
+ * (session, number, type, owner message, reasoning token count) or remove a
+ * row. Plain appends without an explicit `id`, and updates that assign only
+ * columns in {@link TAG_COLUMNS_OUTSIDE_IDENTITY}, cannot; everything else that
+ * names the table is treated as if it could, including DDL and multi-statement
+ * scripts. Erring towards true only costs a cache rebuild.
+ */
+export function mayChangeTagIdentity(sql: string): boolean {
+    if (!/\btags\b/i.test(sql) || /^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql)) return false;
+    if (/^\s*WITH\b/i.test(sql) && !/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql)) return false;
+    // One statement only: a script can hide a DELETE behind a harmless first statement.
+    if (/;\s*\S/.test(sql) || /\bREPLACE\b/i.test(sql) || /\bON\s+CONFLICT\b/i.test(sql))
+        return true;
+    const insert = /^\s*INSERT\s+INTO\s+(?:main\.)?["`]?tags["`]?\s*\(([^)]*)\)/i.exec(sql);
+    if (insert) {
+        const columns = (insert[1] ?? "").split(",").map((column) =>
+            column
+                .trim()
+                .replace(/["`[\]]/g, "")
+                .toLowerCase(),
+        );
+        return columns.includes("id") || columns.includes("rowid");
+    }
+    const update = /^\s*UPDATE\s+(?:main\.)?["`]?tags["`]?\s+SET\s+([\s\S]*?)\bWHERE\b/i.exec(sql);
+    if (update && !/\bSELECT\b/i.test(sql)) {
+        // Provably identity-free only when every top-level assignment is a plain
+        // `column = ...` naming an allowed column. A tuple assignment such as
+        // `(tag_number, reasoning_token_count) = (...)`, or anything this cannot
+        // read, counts as an identity write.
+        const assignments = topLevelCommaSegments(update[1] ?? "");
+        if (!assignments) return true;
+        return !assignments.every((assignment) => {
+            const column = /^\s*["`]?(\w+)["`]?\s*=(?!=)/.exec(assignment)?.[1];
+            return column !== undefined && TAG_COLUMNS_OUTSIDE_IDENTITY.has(column.toLowerCase());
+        });
+    }
+    return true;
+}
+
+/**
+ * Split SQL text at commas outside parentheses and quotes. Returns null when
+ * the parentheses or quotes do not balance.
+ */
+function topLevelCommaSegments(text: string): string[] | null {
+    const segments: string[] = [];
+    let depth = 0;
+    let quote: string | null = null;
+    let start = 0;
+    for (let index = 0; index < text.length; index += 1) {
+        const char = text[index];
+        if (quote) {
+            // A doubled quote inside a quoted run is an escaped quote.
+            if (char === quote) {
+                if (text[index + 1] === quote) index += 1;
+                else quote = null;
+            }
+            continue;
+        }
+        if (char === "'" || char === '"' || char === "`") quote = char;
+        else if (char === "(") depth += 1;
+        else if (char === ")") {
+            depth -= 1;
+            if (depth < 0) return null;
+        } else if (char === "," && depth === 0) {
+            segments.push(text.slice(start, index));
+            start = index + 1;
+        }
+    }
+    if (quote || depth !== 0) return null;
+    segments.push(text.slice(start));
+    return segments;
+}
+
+/**
+ * Counts executions, on any connection this process opened, of statements for
+ * which {@link mayChangeTagIdentity} is true. A cache built from `tags` stays
+ * valid for this process's own writes while the count is unchanged; commits by
+ * other connections show up in `PRAGMA data_version` instead.
+ */
+export function getTagIdentityWriteGeneration(): number {
+    return tagIdentityWriteGeneration;
+}
+
 /** Route native Bun and Node transaction entry through the same acquisition retry.
  * Native Bun transaction wrappers execute BEGIN internally, bypassing an exec override,
  * so both runtimes use this small synchronous wrapper instead. Writable handles
@@ -257,8 +361,15 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             }
             if (WRITER_TRANSACTION_END.test(sql) && openWriterTransactions.has(db))
                 return endWriterTransaction(db, () => nativeExec(sql), sql);
-            if (!/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql))
-                return withAutocommitTimeout(db, () => nativeExec(sql));
+            if (
+                !/^\s*(?:SELECT|EXPLAIN|PRAGMA|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql)
+            ) {
+                try {
+                    return withAutocommitTimeout(db, () => nativeExec(sql));
+                } finally {
+                    if (mayChangeTagIdentity(sql)) tagIdentityWriteGeneration += 1;
+                }
+            }
             return nativeExec(sql);
         },
     });
@@ -271,15 +382,22 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             // SELECT/EXPLAIN cannot acquire a writer. Treat CTEs conservatively:
             // WITH can introduce INSERT/UPDATE/DELETE as well as a read query.
             if (!readonly && !/^\s*(?:SELECT|EXPLAIN|PRAGMA)\b/i.test(sql)) {
+                const changesTagIdentity = mayChangeTagIdentity(sql);
                 for (const method of ["run", "get", "all"] as const) {
                     const execute = statement[method].bind(statement);
                     Object.defineProperty(statement, method, {
                         configurable: true,
                         // biome-ignore lint/suspicious/noExplicitAny: retain SQLite's native binding overloads.
-                        value: (...args: any[]) =>
-                            withAutocommitTimeout(db, () => execute(...args)),
+                        value: (...args: any[]) => {
+                            try {
+                                return withAutocommitTimeout(db, () => execute(...args));
+                            } finally {
+                                if (changesTagIdentity) tagIdentityWriteGeneration += 1;
+                            }
+                        },
                     });
                 }
+                if (changesTagIdentity) wrapRemainingTagWriteForms(statement);
             }
             return statement;
         },
@@ -328,6 +446,43 @@ function installTransactionRouting(db: BetterSqlite3.Database, readonly: boolean
             return defaultTransaction;
         },
     });
+}
+
+/**
+ * Count tag identity writes made through the statement forms the transaction
+ * routing does not wrap. `iterate()` runs the statement while its result is
+ * consumed, so the generation moves both when iteration starts and when it
+ * ends: a summary read in between is then rebuilt on its next read.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: statements from both backends share these method names.
+function wrapRemainingTagWriteForms(statement: any): void {
+    if (typeof statement.iterate === "function") {
+        const iterate = statement.iterate.bind(statement);
+        Object.defineProperty(statement, "iterate", {
+            configurable: true,
+            value: function* (...args: unknown[]) {
+                tagIdentityWriteGeneration += 1;
+                try {
+                    yield* iterate(...args);
+                } finally {
+                    tagIdentityWriteGeneration += 1;
+                }
+            },
+        });
+    }
+    if (typeof statement.values === "function") {
+        const values = statement.values.bind(statement);
+        Object.defineProperty(statement, "values", {
+            configurable: true,
+            value: (...args: unknown[]) => {
+                try {
+                    return values(...args);
+                } finally {
+                    tagIdentityWriteGeneration += 1;
+                }
+            },
+        });
+    }
 }
 
 function trackSqliteConnection(

@@ -266,15 +266,32 @@ export function lkgContentFields(value: unknown): LkgContentField[] | null {
     }
 }
 
-export function lkgContentDigestFromFields(fields: readonly LkgContentField[]): string {
-    const hash = createHash("sha256");
+/**
+ * The exact text {@link lkgContentDigestFromFields} hashes: each token as
+ * `<type>:<length>:<value>\0`. Type and length prefixes make it unambiguous, so
+ * two token lists with the same key always have the same digest.
+ */
+export function lkgContentKey(fields: readonly LkgContentField[]): string {
+    let key = "";
     for (const field of fields) {
         const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
-        hash.update(`${typeof field}:${value.length}:`)
-            .update(value)
-            .update("\0");
+        key += `${typeof field}:${value.length}:${value}\0`;
     }
-    return hash.digest("base64url");
+    return key;
+}
+
+/**
+ * sha256 of {@link lkgContentKey}. Hashing the joined text in one update gives
+ * the same bytes as the three updates per token this used to make: every token
+ * value is bracketed by ASCII, so no surrogate pair can straddle a boundary.
+ */
+export function lkgContentDigestFromFields(fields: readonly LkgContentField[]): string {
+    return lkgContentDigestFromKey(lkgContentKey(fields));
+}
+
+function lkgContentDigestFromKey(key: string): string {
+    lkgDigestsComputed += 1;
+    return createHash("sha256").update(key).digest("base64url");
 }
 
 export interface LkgInputSnapshot {
@@ -611,25 +628,143 @@ export function noteEntry(sessionId: string, messages: MessageLike[]): LkgEntryN
     });
     const anchorIndex = entryInputIds.indexOf(slot.lastInputMessageId);
     if (anchorIndex < 0) return null;
-    const entryContentDigests = messages.slice(0, anchorIndex + 1).map((message, index) => {
-        const fields = lkgContentFields(message);
-        return fields
-            ? memoizedLkgContentDigestFromFields(entryInputIds[index] ?? "", fields)
-            : null;
-    });
-    if (entryContentDigests.some((digest) => digest === null)) return null;
+    const entryContentDigests = digestEntryPrefix(
+        sessionId,
+        messages.slice(0, anchorIndex + 1),
+        entryInputIds,
+    );
+    if (!entryContentDigests) return null;
     const pristineTail = structuredClone(messages.slice(anchorIndex + 1)) as MessageLike[];
     return {
         pristineTail,
         entryInputIds,
-        entryContentDigests: entryContentDigests as string[],
+        entryContentDigests,
         anchorIndex,
     };
+}
+
+interface NotedEntryMessage {
+    /**
+     * {@link lkgContentCompareKey} of the message. Equal keys mean equal
+     * {@link lkgContentKey} text, and so an equal digest.
+     */
+    key: string;
+    digest: string;
+}
+
+/**
+ * A compact, unambiguous encoding of what a digest hashes: per token a one
+ * letter type tag, then the length and `String()` form of its value (the
+ * description, for a symbol). Two token lists have equal keys exactly when
+ * their {@link lkgContentKey} texts are equal, but the key is a fraction of
+ * that text's size, so a whole session's prefix can be kept for comparison.
+ */
+function lkgContentCompareKey(fields: readonly LkgContentField[]): string {
+    let key = "";
+    for (const field of fields) {
+        if (typeof field === "boolean") {
+            key += field ? "T" : "F";
+            continue;
+        }
+        const value = typeof field === "symbol" ? (field.description ?? "") : String(field);
+        const tag = typeof field === "string" ? "s" : typeof field === "number" ? "n" : "y";
+        key += `${tag}${value.length}:${value}`;
+    }
+    return key;
+}
+
+/** Bytes a retained key holds: one per character when Latin-1, two otherwise. */
+function retainedStringBytes(value: string): number {
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: the range is the Latin-1 test.
+    return /[^\u0000-\u00ff]/.test(value) ? value.length * 2 : value.length;
+}
+
+/**
+ * The prefix each session's last {@link noteEntry} digested, keyed by message id.
+ * The shared digest memo is bounded per message (20,000 entries, 16 MiB), so a
+ * session whose prefix is larger than the memo (or several sessions together)
+ * evicted its own entries on every pass and every message was hashed again.
+ * Keeping each session's prefix whole, and evicting whole sessions, lets an
+ * ordinary pass hash only the messages it has not seen. Each message keeps one
+ * compact comparison key, so a 150k-message session fits within the budget.
+ */
+const notedEntryPrefixes = new Map<
+    string,
+    { messages: Map<string, NotedEntryMessage>; bytes: number }
+>();
+let notedEntryPrefixBytes = 0;
+const NOTED_ENTRY_PREFIX_MAX_BYTES = 128 * 1024 * 1024;
+const NOTED_ENTRY_PREFIX_MAX_SESSIONS = 1_000;
+let lkgDigestsComputed = 0;
+
+/**
+ * Digest each message of the entry prefix. A message whose id and comparison
+ * key match the session's previous note reuses that digest, which is the value
+ * a recompute would give. Anything else is hashed through the shared memo as
+ * before.
+ */
+function digestEntryPrefix(
+    sessionId: string,
+    prefix: readonly MessageLike[],
+    ids: readonly string[],
+): string[] | null {
+    const prior = notedEntryPrefixes.get(sessionId)?.messages;
+    const noted = new Map<string, NotedEntryMessage>();
+    const digests: string[] = [];
+    let bytes = 0;
+    for (let index = 0; index < prefix.length; index += 1) {
+        const fields = lkgContentFields(prefix[index]);
+        if (!fields) return null;
+        const id = ids[index] ?? "";
+        const key = lkgContentCompareKey(fields);
+        const previous = prior?.get(id);
+        const digest =
+            previous?.key === key
+                ? previous.digest
+                : memoizedLkgContentDigestFromFields(id, fields);
+        digests.push(digest);
+        noted.set(id, { key, digest });
+        bytes += 96 + (id.length + digest.length) * 2 + retainedStringBytes(key);
+    }
+    rememberNotedEntryPrefix(sessionId, noted, bytes);
+    return digests;
+}
+
+function rememberNotedEntryPrefix(
+    sessionId: string,
+    messages: Map<string, NotedEntryMessage>,
+    bytes: number,
+): void {
+    const prior = notedEntryPrefixes.get(sessionId);
+    if (prior) {
+        notedEntryPrefixes.delete(sessionId);
+        notedEntryPrefixBytes -= prior.bytes;
+    }
+    if (bytes > NOTED_ENTRY_PREFIX_MAX_BYTES) return;
+    while (
+        notedEntryPrefixBytes + bytes > NOTED_ENTRY_PREFIX_MAX_BYTES ||
+        notedEntryPrefixes.size >= NOTED_ENTRY_PREFIX_MAX_SESSIONS
+    ) {
+        const oldest = notedEntryPrefixes.entries().next().value;
+        if (!oldest) break;
+        notedEntryPrefixes.delete(oldest[0]);
+        notedEntryPrefixBytes -= oldest[1].bytes;
+    }
+    notedEntryPrefixes.set(sessionId, { messages, bytes });
+    notedEntryPrefixBytes += bytes;
+}
+
+/** @internal sha256 digests computed since the last reset. */
+export function getLkgDigestsComputedForTest(): number {
+    return lkgDigestsComputed;
 }
 
 export function resetLkgSlotsForTest(): void {
     digestMemo.clear();
     digestMemoBytes = 0;
+    notedEntryPrefixes.clear();
+    notedEntryPrefixBytes = 0;
+    lkgDigestsComputed = 0;
     lkgHeapHolder.entries.clear();
     totalBytes = 0;
     persistenceBackend = undefined;

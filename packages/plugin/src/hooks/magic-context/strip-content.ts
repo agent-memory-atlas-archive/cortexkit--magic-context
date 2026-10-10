@@ -1,4 +1,5 @@
 import {
+    type FrozenReasoningPart,
     MERGED_REASONING_PARTS_PREFIX,
     readFrozenMergedReasoningParts,
 } from "../../features/magic-context/merged-reasoning-decisions";
@@ -914,6 +915,14 @@ export function stripReasoningFromMergedAssistants(
     options?: {
         mutationExemptMessage?: MessageLike;
         frozenMessageIds?: ReadonlySet<string>;
+        /**
+         * `readFrozenMergedReasoningParts(frozenMessageIds)` and its key set,
+         * when the caller already decoded them. A caller that strips one message
+         * at a time passes these so each call does not decode every frozen
+         * decision again. They must describe the same `frozenMessageIds`.
+         */
+        frozenParts?: ReadonlyMap<string, readonly FrozenReasoningPart[]>;
+        frozenPartMessageIds?: ReadonlySet<string>;
         protectedMessages?: ReadonlySet<MessageLike>;
         restoreMessages?: ReadonlySet<MessageLike>;
     },
@@ -927,7 +936,9 @@ export function stripReasoningFromMergedAssistants(
     if (providerID !== "anthropic") return 0;
 
     let stripped = 0;
-    const frozenParts = readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
+    const frozenParts =
+        options?.frozenParts ??
+        readFrozenMergedReasoningParts(options?.frozenMessageIds ?? new Set());
     // Replay the exact persisted selection without reconsidering adjacency.
     // Dropping empty preceding assistants can make a stripped thinking part
     // look eligible to keep on the next request. Only legacy bare ids still
@@ -952,7 +963,7 @@ export function stripReasoningFromMergedAssistants(
     for (const entry of planMergedAssistantReasoningStrip(
         messages,
         options?.mutationExemptMessage,
-        new Set(frozenParts.keys()),
+        options?.frozenPartMessageIds ?? new Set(frozenParts.keys()),
         options?.frozenMessageIds ? options.restoreMessages : options?.protectedMessages,
     )) {
         if (options?.frozenMessageIds) {

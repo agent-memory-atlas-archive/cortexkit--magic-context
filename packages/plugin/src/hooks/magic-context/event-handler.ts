@@ -88,6 +88,7 @@ import {
     findLastAssistantModelFromOpenCodeDb,
     observeOpenCodeTurnEvent,
 } from "./read-session-db";
+import { forgetRawSessionOrdinalWatermark } from "./read-session-raw";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute } from "./sentinel";
@@ -1168,6 +1169,8 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             dropSlot(info.sessionID, "message.removed");
+            // A removal can shift the canonical ordinal of every later message.
+            forgetRawSessionOrdinalWatermark(info.sessionID);
             deps.onRustWireInvalidated?.(info.sessionID);
             sessionLog(
                 info.sessionID,

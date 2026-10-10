@@ -7,6 +7,8 @@ import {
 import type { EmbeddingPurpose } from "../../features/magic-context/memory/embedding-provider";
 import type {
     CapturedQueryEmbedding,
+    MessageHistorySearchOutcome,
+    MessageHistorySearchRequest,
     UnifiedSearchOptions,
     UnifiedSearchResult,
 } from "../../features/magic-context/search";
@@ -110,7 +112,7 @@ export function persistAutoSearchDecision(
 }
 
 export interface AutoSearchWorkerInput {
-    job?: "search" | "backfill";
+    job?: "search" | "backfill" | "messages";
     path: string;
     harness: HarnessId;
     sessionId: string;
@@ -118,15 +120,24 @@ export interface AutoSearchWorkerInput {
     query: string;
     options: Omit<
         UnifiedSearchOptions,
-        "embedQuery" | "isEmbeddingRuntimeEnabled" | "signal" | "readMessages"
+        | "embedQuery"
+        | "isEmbeddingRuntimeEnabled"
+        | "signal"
+        | "readMessages"
+        | "searchMessageHistory"
     >;
     embeddingRuntimeEnabled: boolean;
     embeddingHostBusy: boolean;
     snapshot: ReturnType<typeof getProjectEmbeddingSnapshot>;
     deadlineUnixMs?: number;
+    /** The message-history lane to run, for the "messages" job. */
+    messageRequest?: MessageHistorySearchRequest;
 }
 export type AutoSearchWorkerReply =
     | { kind: "result"; results: UnifiedSearchResult[] }
+    | { kind: "messages"; outcome: MessageHistorySearchOutcome }
+    /** Sent by a "messages" job as soon as its thread runs, before loading search code. */
+    | { kind: "accepted" }
     | { kind: "error"; error: string }
     | { kind: "query"; id: number; text: string }
     | { kind: "batch"; id: number; texts: string[]; purpose: EmbeddingPurpose };
@@ -244,6 +255,7 @@ async function executeAutoSearchWorker(
         isEmbeddingRuntimeEnabled,
         signal: deadlineSignal,
         readMessages: _readMessages,
+        searchMessageHistory: _searchMessageHistory,
         ...serializable
     } = options;
     const lifecycle = registerAutoSearchWork(sessionId);
@@ -305,6 +317,8 @@ async function executeAutoSearchWorker(
                 finish([], new Error(reply.error));
                 return;
             }
+            // Only the "messages" job answers with these.
+            if (reply.kind === "messages" || reply.kind === "accepted") return;
             const response: AutoSearchEmbeddingReply = { id: reply.id };
             try {
                 if (reply.kind === "query")
@@ -341,5 +355,131 @@ async function executeAutoSearchWorker(
             if (!settled && !signal?.aborted) worker.postMessage(response);
         });
         if (signal?.aborted) abort();
+    });
+}
+
+function defaultAutoSearchWorkerEntry(): URL {
+    return new URL(
+        new URL(import.meta.url).pathname.endsWith(".ts")
+            ? "./auto-search-worker.ts"
+            : "./auto-search-worker.js",
+        import.meta.url,
+    );
+}
+
+/**
+ * How long a message-search worker may take to report that its thread is
+ * running. It does so before loading any search code, so this covers only
+ * thread start.
+ */
+const MESSAGE_WORKER_ACCEPT_TIMEOUT_MS = 400;
+/** How long an accepted message-search worker may take to answer. */
+const MESSAGE_WORKER_RESULT_TIMEOUT_MS = 30_000;
+
+export type MessageSearchWorkerFallbackReason =
+    | "no-file"
+    | "start-failed"
+    | "not-accepted"
+    | "no-result"
+    | "worker-error"
+    | "exited";
+
+const messageSearchWorkerFallbacks = new Map<MessageSearchWorkerFallbackReason, number>();
+
+/** How often each reason sent a message search back to the calling thread. */
+export function getMessageSearchWorkerFallbacks(): ReadonlyMap<
+    MessageSearchWorkerFallbackReason,
+    number
+> {
+    return messageSearchWorkerFallbacks;
+}
+
+/**
+ * Run the message-history lane of a search on a worker with its own read-only
+ * connection, so its FTS statements (the per-probe match counts of an explicit
+ * `ctx_search` in particular) never run on the serving thread. The worker calls
+ * the same `searchMessageHistory`, so results and ranking are unchanged.
+ *
+ * Resolves null when the store has no file a worker can open, the worker fails
+ * or exits, does not report that it is running within
+ * MESSAGE_WORKER_ACCEPT_TIMEOUT_MS, or does not answer within
+ * MESSAGE_WORKER_RESULT_TIMEOUT_MS after that. The caller then runs the lane
+ * in process as before. Each fallback is logged and counted by reason (see
+ * {@link getMessageSearchWorkerFallbacks}).
+ */
+export function searchMessageHistoryOffThread(
+    db: Database,
+    request: MessageHistorySearchRequest,
+    entry: URL = defaultAutoSearchWorkerEntry(),
+    deadlines: { acceptMs?: number; resultMs?: number } = {},
+): Promise<MessageHistorySearchOutcome | null> {
+    const fallback = (reason: MessageSearchWorkerFallbackReason, detail?: unknown) => {
+        messageSearchWorkerFallbacks.set(
+            reason,
+            (messageSearchWorkerFallbacks.get(reason) ?? 0) + 1,
+        );
+        log(
+            `[search] message search runs in process (${reason})${
+                detail === undefined
+                    ? ""
+                    : `: ${detail instanceof Error ? detail.message : String(detail)}`
+            }`,
+        );
+    };
+    const path = getSqliteDatabasePath(db);
+    if (!path) {
+        fallback("no-file");
+        return Promise.resolve(null);
+    }
+    const input: AutoSearchWorkerInput = {
+        job: "messages",
+        path,
+        harness: getHarness(),
+        sessionId: request.sessionId,
+        projectPath: "",
+        query: request.query,
+        options: {},
+        embeddingRuntimeEnabled: false,
+        embeddingHostBusy: false,
+        snapshot: null,
+        messageRequest: request,
+    };
+    return new Promise((resolve) => {
+        let settled = false;
+        let worker: Worker | undefined;
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        const finish = (
+            outcome: MessageHistorySearchOutcome | null,
+            reason?: MessageSearchWorkerFallbackReason,
+            detail?: unknown,
+        ) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(deadline);
+            if (reason) fallback(reason, detail);
+            void worker?.terminate();
+            worker?.unref();
+            resolve(outcome);
+        };
+        const arm = (reason: MessageSearchWorkerFallbackReason, ms: number) => {
+            clearTimeout(deadline);
+            deadline = setTimeout(() => finish(null, reason, `no reply within ${ms} ms`), ms);
+            deadline.unref?.();
+        };
+        try {
+            worker = new Worker(entry, { workerData: input });
+        } catch (error) {
+            finish(null, "start-failed", error);
+            return;
+        }
+        arm("not-accepted", deadlines.acceptMs ?? MESSAGE_WORKER_ACCEPT_TIMEOUT_MS);
+        worker.on("message", (reply: AutoSearchWorkerReply) => {
+            if (reply.kind === "accepted")
+                arm("no-result", deadlines.resultMs ?? MESSAGE_WORKER_RESULT_TIMEOUT_MS);
+            else if (reply.kind === "messages") finish(reply.outcome);
+            else if (reply.kind === "error") finish(null, "worker-error", reply.error);
+        });
+        worker.on("error", (error) => finish(null, "worker-error", error));
+        worker.on("exit", (code) => finish(null, "exited", `exit code ${code}`));
     });
 }
